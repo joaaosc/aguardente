@@ -20,7 +20,7 @@ from .state import FINGERPRINT, RunState, run_lock
 
 Reporter = Callable[[str], None]
 
-STAGES = ("fetch", "prune", "logits", "recover", "export")
+STAGES = ("fetch", "extract", "prune", "logits", "recover", "export")
 
 # Folga exigida sobre a estimativa antes de começar a escrever em disco.
 DISK_MARGIN = 1.15
@@ -30,6 +30,8 @@ DISK_MARGIN = 1.15
 # na retomada, para que uma etapa concluída nunca seja reaproveitada sob uma
 # configuração que não a produziu.
 FINGERPRINT_FIELDS: dict[str, tuple[str, ...]] = {
+    # A extração depende apenas do modelo de origem.
+    "extract": ("model",),
     "prune": ("model", "target_params", "calib_batches", "batch_size", "seq_len",
               "calib_dataset", "calib_file"),
     "logits": ("model", "top_k", "seq_len", "batch_size", "logit_batches",
@@ -125,6 +127,10 @@ class RunOptions:
     @property
     def teacher_dir(self) -> Path:
         return self.out_dir / "teacher"
+
+    @property
+    def text_dir(self) -> Path:
+        return self.out_dir / "teacher-text"
 
     @property
     def pruned_dir(self) -> Path:
@@ -325,6 +331,10 @@ def make_plan(ctx: Context) -> tuple[ModelProbe, PrunePlan | None]:
     ]
     ctx.events.plan(stages_info)
 
+    if p.layout is not None and p.layout.is_multimodal:
+        ctx.say(f"modelo       multimodal: {p.dropped_params/1e9:.2f} B de visão e "
+                f"projetor serão descartados")
+
     total = count_params(p.arch).total
     if total <= target:
         ctx.say(f"plano        modelo atende ao alvo de {target/1e9:.2f} B — sem poda necessária")
@@ -392,6 +402,105 @@ def stage_fetch(ctx: Context) -> Path:
     return dest
 
 
+def stage_extract(ctx: Context, teacher_dir: Path) -> Path:
+    """Etapa 2: extração do decoder causal de um checkpoint multimodal.
+
+    Para um modelo de texto puro a etapa é pulada e o diretório segue direto, de
+    modo que o caminho de sempre não muda em nada.
+    """
+    import json
+
+    from . import textonly
+    from .arch import text_config
+
+    opts, state = ctx.opts, ctx.state
+    p = ctx.probe
+
+    if p is None or p.layout is None or not p.layout.needs_extraction:
+        ctx.say("extração     não necessária: o decoder já está na raiz canônica")
+        state.skip("extract", "decoder já é causal denso")
+        state.stage("extract").outputs["dir"] = str(teacher_dir)
+        state.save()
+        return teacher_dir
+
+    out = opts.text_dir
+    if _resume(ctx, "extract"):
+        ctx.say(f"extração     já concluída: {out}")
+        return out
+
+    descartado = p.layout.dropped_params
+    ctx.say(f"extração     decoder em {p.layout.prefix!r} → raiz canônica")
+    ctx.say(f"             descartando {descartado/1e9:.2f} B parâmetros "
+            f"({descartado/max(1, p.stored_params):.1%}) de visão e projetor")
+    _ensure_disk(ctx, p.text_params * 2, "a extração do decoder de texto")
+
+    state.begin("extract")
+    ctx.events.stage_start("extract", 2, len(STAGES))
+    t0 = time.perf_counter()
+    try:
+        cfg = json.loads((teacher_dir / "config.json").read_text())
+        relatorio = textonly.extract_weights(
+            teacher_dir, out, p.layout,
+            reuse_shards=opts.discard_source_weights)
+        emitido = textonly.build_config(cfg, p.arch, p.layout)
+        (out / "config.json").write_text(
+            json.dumps(emitido.config, indent=2, ensure_ascii=False) + "\n")
+        textonly.copy_auxiliary(teacher_dir, out)
+        textonly.verify_extraction(out, p.arch)
+    except Exception as e:
+        state.fail("extract", str(e))
+        raise
+
+    dt = time.perf_counter() - t0
+    ctx.say(f"             {emitido.source_type} → {emitido.emitted_type} "
+            f"({emitido.config['architectures'][0]})")
+    if emitido.defaults_used:
+        ctx.say(f"             campos preenchidos pelo default da classe: "
+                f"{', '.join(emitido.defaults_used)}")
+    if relatorio.reused:
+        ctx.say(f"             {len(relatorio.reused)} shard(s) reaproveitados, "
+                f"{relatorio.saved_bytes/GB:.2f} GB não copiados")
+    ctx.say(f"             {relatorio.tensors} tensores em {len(relatorio.shards)} "
+            f"shard(s), {relatorio.total_bytes/GB:.2f} GB em {dt:.0f}s")
+
+    _conferir_exportador(ctx, out)
+
+    state.finish("extract", outputs={"dir": out, FINGERPRINT: fingerprint(opts, "extract")},
+                 metrics={"params": float(p.text_params), "seconds": dt})
+    ctx.metrics["text_params"] = float(p.text_params)
+    ctx.events.stage_end("extract", True, int(dt * 1000))
+    return out
+
+
+def _conferir_exportador(ctx: Context, model_dir: Path) -> None:
+    """Valida a configuração de exportação logo após extrair.
+
+    Custa segundos e descobre no início o que só apareceria na última etapa,
+    depois de horas de poda e treino. Falha aqui é aviso, não interrupção: o
+    diagnóstico pode ser de ambiente, e o resto do pipeline ainda tem valor.
+    """
+    from .export import available, build_command, run_export
+
+    if ctx.opts.skip_export or not available():
+        return
+    cmd = build_command(model_dir, ctx.opts.out_dir / "dry-run",
+                        platform=ctx.opts.platform, compression=ctx.opts.compression,
+                        compute_precision=ctx.opts.compute_precision,
+                        max_context_length=ctx.opts.max_context_length, dry_run=True)
+    linhas: list[str] = []
+    try:
+        codigo = run_export(cmd, on_line=linhas.append)
+    except Exception as e:  # noqa: BLE001 — a conferência não pode derrubar a etapa
+        ctx.say(f"             aviso: não foi possível validar a exportação: {e}")
+        return
+    if codigo == 0:
+        ctx.say("             exportação validada (--dry-run)")
+        return
+    ctx.say(f"             aviso: o exportador recusou o modelo extraído (código {codigo})")
+    for linha in linhas[-3:]:
+        ctx.say(f"             {linha}")
+
+
 def stage_prune(ctx: Context, teacher_dir: Path) -> Path:
     """Etapa 2: Avaliação de importância e poda estruturada."""
     from .calibration import load_texts, load_texts_from_file, make_batches
@@ -413,7 +522,7 @@ def stage_prune(ctx: Context, teacher_dir: Path) -> Path:
         return out
 
     state.begin("prune")
-    ctx.events.stage_start("prune", 2, len(STAGES),
+    ctx.events.stage_start("prune", 3, len(STAGES),
                            rationale="Corta camadas e canais do próprio modelo até o tamanho-alvo.")
     t0 = time.perf_counter()
 
@@ -493,7 +602,7 @@ def stage_logits(ctx: Context, teacher_dir: Path) -> Path | None:
     _ensure_disk(ctx, size, "a pré-computação de logits")
 
     state.begin("logits")
-    ctx.events.stage_start("logits", 3, len(STAGES),
+    ctx.events.stage_start("logits", 4, len(STAGES),
                            rationale="Gera saídas de calibração do modelo professor para orientar o processo de destilação.")
     t0 = time.perf_counter()
     device = pick_device(opts.device)
@@ -552,7 +661,7 @@ def stage_recover(ctx: Context, pruned_dir: Path, logits_dir: Path | None) -> Pa
         return out
 
     state.begin("recover")
-    ctx.events.stage_start("recover", 4, len(STAGES),
+    ctx.events.stage_start("recover", 5, len(STAGES),
                            rationale="Treino de destilação para recuperar a perplexidade perdida na poda estruturada.")
     t0 = time.perf_counter()
 
@@ -640,7 +749,7 @@ def stage_export(ctx: Context, model_dir: Path) -> Path | None:
     ctx.say(f"export       {' '.join(cmd)}")
 
     state.begin("export")
-    ctx.events.stage_start("export", 5, len(STAGES),
+    ctx.events.stage_start("export", 6, len(STAGES),
                            rationale="Converte e quantiza o modelo para execução acelerada via Apple Core AI no Neural Engine / GPU.")
     t0 = time.perf_counter()
     code = run_export(cmd, on_line=lambda line: ctx.say(f"             {line}"))
@@ -710,8 +819,9 @@ def run_pipeline(opts: RunOptions, *, report: Reporter = print,
                 ctx.say()
 
         teacher = stage_fetch(ctx)
-        pruned = stage_prune(ctx, teacher)
-        logits = stage_logits(ctx, teacher)
+        texto = stage_extract(ctx, teacher)
+        pruned = stage_prune(ctx, texto)
+        logits = stage_logits(ctx, texto)
         student = stage_recover(ctx, pruned, logits)
         stage_export(ctx, student)
     return ctx

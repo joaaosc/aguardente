@@ -17,7 +17,8 @@ from .budget import (BPW_FP16, BPW_INT4_EMBED_FP16, GB, Budget, Machine,
 from . import effort
 from .errors import AguardenteError
 from .events import stdout_log
-from .plan import plan_for_target
+from .errors import PlanImpossible
+from .plan import plan_for_target, shrink
 from .pipeline import RunOptions, run_pipeline
 from .preflight import Status, blocking, run_all
 from .probe import probe
@@ -114,6 +115,32 @@ def cmd_plan(args: argparse.Namespace) -> int:
         ui.warn("modelo de acesso restrito",
                 "Aceite a licença na página do modelo e execute `hf auth login`.")
 
+    from .textonly import emitted_model_type
+    try:
+        alvo_export = emitted_model_type(p.text_model_type)
+        if alvo_export != p.text_model_type:
+            ui.field("exporta como", alvo_export, note=f"de {p.text_model_type}")
+    except AguardenteError as e:
+        ui.blank()
+        ui.warn(e.message, e.hint or "")
+        alvo_export = None
+
+    if p.is_multimodal:
+        ui.header("Multimodalidade")
+        ui.explain(
+            "O pipeline poda e destila um decoder causal de texto. A torre de visão "
+            "e o projetor são descartados: o modelo resultante não enxerga imagens.",
+        )
+        ui.blank()
+        ui.field("decoder de texto", p.layout.prefix or "raiz",
+                 note=f"{p.layout.num_layers} camadas")
+        ui.field("mantido", _fmt_params(p.text_params),
+                 note=f"{p.text_params / p.stored_params:.1%} do checkpoint")
+        ui.field("descartado", _fmt_params(p.dropped_params),
+                 note=f"{p.dropped_params / p.stored_params:.1%}")
+        if alvo_export:
+            ui.field("arquitetura emitida", alvo_export, note=f"de {p.text_model_type}")
+
     err = p.count_error()
     if abs(err) > 0.01:
         ui.warn(f"a contagem diverge {err:+.2%} do total publicado",
@@ -162,16 +189,31 @@ def cmd_plan(args: argparse.Namespace) -> int:
             "Nenhuma poda estruturada é necessária.",
         )
     else:
-        plan = plan_for_target(a, target)
-        ui.field("alvo solicitado", _fmt_params(target))
-        ui.field("alvo calculado", _fmt_params(plan.target_params),
-                 note=f"{plan.ratio:.2f}× menor")
-        ui.blank()
-        ui.table(
-            ["dimensão", "de", "para"],
-            [(nome, f"{de:,}", f"{para:,}") for nome, de, para in plan.changes()],
-            align_right=(1, 2),
-        )
+        try:
+            plan = plan_for_target(a, target)
+        except PlanImpossible as e:
+            # O piso de poda é imposto pelas embeddings e pelos limites por eixo.
+            # Quando ele excede o que a máquina treina, dizer isso aqui vale mais
+            # do que abortar: o modelo ainda pode ser podado e exportado.
+            piso = count_params(shrink(a, 1.0)).total
+            ui.field("alvo solicitado", _fmt_params(target))
+            ui.field("piso de poda", _fmt_params(piso),
+                     note="limite das embeddings e dos cortes por eixo")
+            ui.blank()
+            ui.warn(e.message.split("\n")[0],
+                    "A recuperação por destilação não é executável nesta máquina para "
+                    "este modelo. Use --skip-recover para podar e exportar sem treinar, "
+                    "ou escolha um modelo base menor.")
+        else:
+            ui.field("alvo solicitado", _fmt_params(target))
+            ui.field("alvo calculado", _fmt_params(plan.target_params),
+                     note=f"{plan.ratio:.2f}× menor")
+            ui.blank()
+            ui.table(
+                ["dimensão", "de", "para"],
+                [(nome, f"{de:,}", f"{para:,}") for nome, de, para in plan.changes()],
+                align_right=(1, 2),
+            )
 
     final = plan.target if plan else a
     final_params = plan.target_params if plan else count_params(a).total
@@ -313,6 +355,77 @@ def cmd_fetch(args: argparse.Namespace) -> int:
           on_line=lambda line: ui.step(line))
     ui.done(f"concluído em {_fmt_seconds(time.perf_counter() - t0)}",
             hint=str(fp.dest))
+    return 0
+
+
+# ----------------------------------------------------------------- extract
+
+
+def cmd_extract(args: argparse.Namespace) -> int:
+    """Extrai o decoder causal de texto de um checkpoint multimodal."""
+    import json
+
+    from . import textonly
+    from .fetch import fetch, plan_fetch, require_aria2
+
+    origem = Path(args.model).expanduser()
+    destino = Path(args.out).expanduser()
+
+    if not origem.is_dir():
+        require_aria2()
+        origem = destino / "teacher"
+        fp = plan_fetch(args.model, origem)
+        ui.title(f"Extração de {args.model}")
+        ui.field("download", _fmt_bytes(fp.pending_bytes),
+                 note=f"de {_fmt_bytes(fp.total_bytes)}")
+        if fp.missing():
+            fetch(fp, on_line=lambda linha: ui.step(linha))
+    else:
+        ui.title(f"Extração de {origem.name}")
+
+    p = probe(str(origem))
+    if p.layout is None or not p.layout.needs_extraction:
+        ui.done("o decoder já está na raiz canônica — nada a extrair",
+                hint=str(origem))
+        return 0
+
+    ui.blank()
+    ui.field("decoder", p.layout.prefix or "raiz", note=f"{p.layout.num_layers} camadas")
+    ui.field("mantido", _fmt_params(p.text_params))
+    ui.field("descartado", _fmt_params(p.dropped_params),
+             note=f"{p.dropped_params / p.stored_params:.1%} do checkpoint")
+
+    saida = destino / "teacher-text"
+    cfg = json.loads((origem / "config.json").read_text())
+    emitido = textonly.build_config(cfg, p.arch, p.layout)
+
+    ui.blank()
+    ui.field("arquitetura emitida", emitido.emitted_type,
+             note=emitido.config["architectures"][0])
+    if emitido.defaults_used:
+        ui.field("preenchido por default", ", ".join(emitido.defaults_used))
+    ui.blank()
+
+    t0 = time.perf_counter()
+    relatorio = textonly.extract_weights(origem, saida, p.layout,
+                                         reuse_shards=args.discard_source_weights)
+    saida.mkdir(parents=True, exist_ok=True)
+    (saida / "config.json").write_text(
+        json.dumps(emitido.config, indent=2, ensure_ascii=False) + "\n")
+    textonly.copy_auxiliary(origem, saida)
+    textonly.verify_extraction(saida, p.arch)
+
+    ui.field("tensores", f"{relatorio.tensors:,}",
+             note=f"{len(relatorio.shards)} shard(s)")
+    if relatorio.reused:
+        ui.field("shards reaproveitados", str(len(relatorio.reused)),
+                 note=f"{_fmt_bytes(relatorio.saved_bytes)} não copiados")
+    ui.blank()
+    ui.rule()
+    ui.done(f"extraído em {_fmt_seconds(time.perf_counter() - t0)}", hint=str(saida))
+    ui.blank()
+    ui.command(f"aguardente run {saida} -o run/ --measure",
+               label="para podar e converter o decoder")
     return 0
 
 
@@ -605,6 +718,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="ignora verificações de pré-requisitos de ambiente")
     rn.add_argument("--restart", action="store_true",
                     help="descarta o estado e os artefatos do diretório antes de começar")
+    rn.add_argument("--discard-source-weights", action="store_true",
+                    help="consome os pesos multimodais durante a extração, reduzindo o "
+                         "pico de disco; exige novo download para refazer a etapa")
     rn.add_argument("--allow-oversized", action="store_true",
                     help="aceita alvo de parâmetros acima do teto de treino da máquina")
     _add_pipeline_args(rn)
@@ -615,6 +731,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="lote usado para estimar o disco dos logits (padrão: 2)")
     ef.add_argument("--no-anim", action="store_true", help="não anima os medidores")
     ef.set_defaults(func=cmd_effort)
+
+    ex = sub.add_parser("extract",
+                        help="extrai o decoder de texto de um modelo multimodal")
+    ex.add_argument("model", help="identificador do Hugging Face ou diretório local")
+    ex.add_argument("-o", "--out", required=True, help="diretório de destino")
+    ex.add_argument("--discard-source-weights", action="store_true",
+                    help="consome os shards de origem, reduzindo o pico de disco")
+    ex.set_defaults(func=cmd_extract)
 
     st = sub.add_parser("status", help="exibe o estado e progresso de uma execução")
     st.add_argument("-o", "--out", required=True, help="diretório da execução")
