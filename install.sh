@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 #
-# Instalador do aguardente para macOS.
+# Script de instalação do aguardente para macOS.
 #
 #   curl -fsSL https://raw.githubusercontent.com/joaaosc/aguardente/main/install.sh | bash
 #
-# Resolve tudo: interpretador Python correto, gerenciador de pacotes,
-# acelerador de download, e o proprio programa. Reexecutar e seguro.
+# Configura o interpretador Python, dependências do sistema e instala o pacote.
 
 set -euo pipefail
 
@@ -21,22 +20,22 @@ ok()    { printf "    %s✓%s %s\n" "$green" "$reset" "$1"; }
 warn()  { printf "    %s!%s %s\n" "$yellow" "$reset" "$1"; }
 die()   { printf "\n%serro:%s %s\n" "$red" "$reset" "$1" >&2; [ $# -gt 1 ] && printf "  %s\n" "$2" >&2; exit 1; }
 
-printf "%s\n" "${bold}aguardente${reset} ${dim}— instalacao${reset}"
+printf "%s\n" "${bold}aguardente${reset} ${dim}— instalação${reset}"
 
 # ---------------------------------------------------------------- 1. sistema
 step "Verificando o sistema"
 
-[ "$(uname -s)" = "Darwin" ] || die "este instalador e para macOS" \
-  "O Core AI da Apple nao existe em outras plataformas."
+[ "$(uname -s)" = "Darwin" ] || die "este instalador é exclusivo para macOS" \
+  "O framework Core AI está disponível apenas no macOS."
 
-[ "$(uname -m)" = "arm64" ] || die "e necessario um Mac com Apple Silicon" \
-  "O runtime Core AI nao publica binarios para Intel."
+[ "$(uname -m)" = "arm64" ] || die "é necessário um Mac com Apple Silicon" \
+  "O runtime Core AI requer arquitetura arm64."
 ok "macOS em Apple Silicon"
 
 macos_major=$(sw_vers -productVersion | cut -d. -f1)
 if [ "$macos_major" -lt 27 ]; then
-  warn "macOS $(sw_vers -productVersion) — a conversao final exige 27 ou superior"
-  warn "As etapas de poda e destilacao funcionam mesmo assim."
+  warn "macOS $(sw_vers -productVersion) detectado — exportação para .aimodel requer macOS 27+"
+  warn "As etapas de poda e destilação continuam operacionais."
 else
   ok "macOS $(sw_vers -productVersion)"
 fi
@@ -44,16 +43,16 @@ fi
 # ---------------------------------------------------------------- 2. homebrew
 step "Verificando o Homebrew"
 if command -v brew >/dev/null 2>&1; then
-  ok "ja instalado"
+  ok "Homebrew instalado"
 else
-  warn "ausente — instalando"
+  warn "Homebrew não encontrado — instalando"
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
   for p in /opt/homebrew/bin /usr/local/bin; do
     [ -x "$p/brew" ] && eval "$("$p/brew" shellenv)"
   done
-  command -v brew >/dev/null 2>&1 || die "Homebrew instalou mas nao entrou no PATH" \
-    "Abra um terminal novo e rode este script de novo."
-  ok "instalado"
+  command -v brew >/dev/null 2>&1 || die "Homebrew instalado mas não localizado no PATH" \
+    "Abra uma nova sessão de terminal e execute novamente."
+  ok "Homebrew instalado"
 fi
 
 # ---------------------------------------------------------------- 3. aria2
@@ -61,9 +60,9 @@ step "Verificando o aria2"
 if command -v aria2c >/dev/null 2>&1; then
   ok "$(aria2c --version | head -1)"
 else
-  warn "ausente — instalando (downloads retomaveis)"
+  warn "aria2c não encontrado — instalando via brew"
   brew install aria2
-  ok "instalado"
+  ok "aria2 instalado"
 fi
 
 # ---------------------------------------------------------------- 4. uv
@@ -71,24 +70,23 @@ step "Verificando o uv"
 if command -v uv >/dev/null 2>&1; then
   ok "$(uv --version)"
 else
-  warn "ausente — instalando"
+  warn "uv não encontrado — instalando"
   curl -LsSf https://astral.sh/uv/install.sh | sh
   export PATH="$HOME/.local/bin:$PATH"
-  command -v uv >/dev/null 2>&1 || die "uv instalou mas nao entrou no PATH" \
-    "Adicione ~/.local/bin ao PATH e rode de novo."
-  ok "instalado"
+  command -v uv >/dev/null 2>&1 || die "uv instalado mas não localizado no PATH" \
+    "Adicione ~/.local/bin ao PATH e execute novamente."
+  ok "uv instalado"
 fi
 
 # ---------------------------------------------------------------- 5. python
-step "Preparando o Python ${PYTHON_VERSION}"
-# O python3 do sistema costuma ser 3.13/3.14, fora da faixa que o stack aceita.
+step "Configurando Python ${PYTHON_VERSION}"
 uv python install "$PYTHON_VERSION" >/dev/null 2>&1 || true
-ok "interpretador ${PYTHON_VERSION} disponivel"
+ok "interpretador Python ${PYTHON_VERSION} configurado"
 
 # ---------------------------------------------------------------- 6. programa
 step "Instalando o aguardente"
 if [ -f "pyproject.toml" ] && grep -q 'name = "aguardente"' pyproject.toml 2>/dev/null; then
-  ok "instalando a partir deste diretorio"
+  ok "instalando a partir do repositório local"
   uv tool install --python "$PYTHON_VERSION" --force --with-editable . "aguardente[pipeline] @ ."
 else
   ok "instalando a partir de ${REPO_URL}"
@@ -96,23 +94,23 @@ else
 fi
 
 export PATH="$HOME/.local/bin:$PATH"
-command -v aguardente >/dev/null 2>&1 || die "o comando 'aguardente' nao entrou no PATH" \
-  "Rode: export PATH=\"\$HOME/.local/bin:\$PATH\" e adicione ao seu ~/.zshrc"
+command -v aguardente >/dev/null 2>&1 || die "comando 'aguardente' não encontrado no PATH" \
+  "Adicione export PATH=\"\$HOME/.local/bin:\$PATH\" ao seu ~/.zshrc"
 ok "$(aguardente --version)"
 
 # ---------------------------------------------------------------- 7. conferir
-step "Conferindo o ambiente"
+step "Executando diagnóstico inicial"
 aguardente doctor || true
 
 cat <<FIM
 
-${bold}Pronto.${reset}
+${bold}Instalação concluída.${reset}
 
-  Comece por aqui — nao baixa nada, so mostra o plano:
+  Inspecione o modelo antes de baixar pesos:
     ${bold}aguardente plan Qwen/Qwen3-4B${reset}
 
-  Ensaio completo com um modelo pequeno (poucos minutos):
+  Ou execute um ensaio rápido com modelo leve:
     ${bold}aguardente run HuggingFaceTB/SmolLM2-135M-Instruct -o ensaio --target-params 90e6${reset}
 
-  Guia detalhado: ${dim}usage.md${reset}
+  Consulte ${dim}usage.md${reset} para opções detalhadas.
 FIM

@@ -1,3 +1,0 @@
-# Mídia da documentação
-
-todo

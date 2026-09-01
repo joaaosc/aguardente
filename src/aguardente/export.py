@@ -1,12 +1,4 @@
-"""Ponte para o exportador da Apple.
-
-`coreai.llm.export` já faz o caminho de PyTorch até `.aimodel` comprimido, com
-presets, YAMLs de compressão e bundle com tokenizer. Reimplementá-lo seria
-retrabalho — aqui só se monta a invocação e se lê o resultado.
-
-Aceita um diretório local no formato transformers, que é exatamente o que a
-etapa de poda grava.
-"""
+"""Integração com coreai.llm.export para conversão em formato .aimodel."""
 
 from __future__ import annotations
 
@@ -19,7 +11,7 @@ from typing import Any, Callable, Iterator
 
 from .errors import AguardenteError
 
-DEFAULT_COMPRESSION = "4bit"          # preset macOS: int4 per-block(32), ~4,50 BPW
+DEFAULT_COMPRESSION = "4bit"          # preset macOS: int4 per-block(32), ~4.50 BPW
 DEFAULT_PRECISION = "float16"
 
 
@@ -37,25 +29,19 @@ class ExportResult:
 
 
 def _resolve(name: str) -> list[str] | None:
-    """`coreai.llm.export` é um console script instalado pelo `coreai-models`.
-
-    Procura o executável no PATH. Não cai para `uv run` quando o pacote não
-    está instalado — isso produziria um `Failed to spawn` no meio do pipeline,
-    depois de horas de trabalho, em vez de um erro claro no início.
-    """
+    """Localiza o executável coreai.llm.export no PATH ou via módulo uv."""
     direct = shutil.which(name)
     if direct:
         return [direct]
 
     import importlib.util
     if importlib.util.find_spec("coreai_models") is not None and shutil.which("uv"):
-        # Instalado como biblioteca mas sem console script no PATH.
         return ["uv", "run", name]
     return None
 
 
 def available() -> bool:
-    """Se o exportador da Apple está instalado e invocável."""
+    """Verifica se o exportador da Apple está disponível no ambiente."""
     return _resolve("coreai.llm.export") is not None
 
 
@@ -74,7 +60,7 @@ def build_command(
     overwrite: bool = False,
     dry_run: bool = False,
 ) -> list[str]:
-    """Monta o argv. `--compression` e `--compression-config` são exclusivos."""
+    """Monta a lista de argumentos para invocação do coreai.llm.export."""
     base = _resolve("coreai.llm.export")
     if base is None:
         raise AguardenteError(
@@ -99,8 +85,7 @@ def build_command(
     if include_debug_info:
         cmd.append("--include-debug-info")
     if experimental:
-        # Exigido para modelos fora do registry — um diretório local nunca casa
-        # com um preset, e a flag traz junto a obrigação de --compute-precision.
+        # Necessário para diretórios locais de modelos
         cmd.append("--experimental")
     if overwrite:
         cmd.append("--overwrite")
@@ -111,7 +96,7 @@ def build_command(
 
 def run_export(cmd: list[str], *, on_line: Callable[[str], None] | None = None,
                timeout: float | None = None) -> int:
-    """Executa, repassando a saída linha a linha enquanto acontece."""
+    """Executa o comando de exportação repassando as linhas de saída."""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1)
     try:
@@ -129,7 +114,7 @@ def run_export(cmd: list[str], *, on_line: Callable[[str], None] | None = None,
 
 
 def find_bundle(out_dir: str | Path) -> ExportResult:
-    """Localiza o bundle produzido e lê o `metadata.json` (schema 0.2)."""
+    """Localiza o bundle gerado e carrega o arquivo metadata.json."""
     out = Path(out_dir)
     candidates = sorted(out.glob("**/metadata.json"), key=lambda p: p.stat().st_mtime)
     if not candidates:
@@ -148,11 +133,7 @@ def find_bundle(out_dir: str | Path) -> ExportResult:
 
 def inspect_asset(aimodel: str | Path, *, storage: bool = True, compute: bool = True,
                   ops: bool = True) -> dict[str, Any]:
-    """`xcrun coreai-build inspect --json`.
-
-    O caminho mais barato para o relatório: tamanho, tipos de storage e compute,
-    distribuição de operações e assinaturas de função — sem escrever Swift.
-    """
+    """Inspeciona o arquivo .aimodel utilizando `xcrun coreai-build inspect --json`."""
     cmd = ["xcrun", "coreai-build", "inspect", str(aimodel), "--json"]
     if storage:
         cmd.append("--storage")
@@ -177,7 +158,7 @@ def inspect_asset(aimodel: str | Path, *, storage: bool = True, compute: bool = 
 
 def compile_aot(aimodel: str | Path, out_dir: str | Path, *, platform: str = "macOS",
                 min_version: str = "27.0") -> list[Path]:
-    """`xcrun coreai-build compile` — um `.aimodelc` por arquitetura."""
+    """Compila o modelo AOT utilizando `xcrun coreai-build compile`."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     cmd = ["xcrun", "coreai-build", "compile", str(aimodel),

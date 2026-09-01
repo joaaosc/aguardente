@@ -1,4 +1,4 @@
-"""O estado sustenta a retomada: se ele mentir, o pipeline repete ou pula errado."""
+"""Testes de persistência de estado e retomada."""
 
 import json
 
@@ -22,7 +22,6 @@ def test_round_trips(tmp_path):
 
 
 def test_running_stage_is_reset_on_load(tmp_path):
-    """Uma etapa 'running' no disco e orfa: o processo anterior morreu."""
     st = RunState.load_or_create(tmp_path / "r")
     st.begin("prune")
     assert st.stage("prune").status is StageStatus.RUNNING
@@ -32,7 +31,6 @@ def test_running_stage_is_reset_on_load(tmp_path):
 
 
 def test_is_done_requires_outputs_to_exist(tmp_path):
-    """Se alguem apagou a pasta, confiar no JSON produziria erro confuso adiante."""
     st = RunState.load_or_create(tmp_path / "r")
     out = tmp_path / "artefato"
     out.mkdir()
@@ -64,7 +62,6 @@ def test_fail_records_error(tmp_path):
 
 
 def test_save_is_atomic(tmp_path):
-    """Grava em .tmp e renomeia — um Ctrl-C nao deixa JSON pela metade."""
     st = RunState.load_or_create(tmp_path / "r")
     st.begin("fetch")
     assert not st.path.with_suffix(".tmp").exists()

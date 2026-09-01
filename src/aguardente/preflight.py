@@ -1,4 +1,4 @@
-"""Checagens de ambiente. Falhar aqui custa segundos; falhar tarde custa horas."""
+"""Verificação de pré-requisitos do ambiente de execução."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def check_macos() -> CheckResult:
     v = _version_tuple(_run("sw_vers", "-productVersion"))
     if platform.system() != "Darwin":
         return CheckResult("macOS", Status.FAIL, platform.system(),
-                           "Core AI só existe em plataformas Apple.")
+                           "Core AI está disponível apenas no macOS.")
     if not v:
         return CheckResult("macOS", Status.WARN, "versão desconhecida")
     txt = ".".join(map(str, v))
@@ -66,7 +66,7 @@ def check_xcode() -> CheckResult:
     v = _version_tuple(out.splitlines()[0] if out else None)
     if not v:
         return CheckResult("Xcode", Status.FAIL, "ausente",
-                           "Instale o Xcode 27+ e rode `xcode-select --install`.")
+                           "Instale o Xcode 27+ e execute `xcode-select --install`.")
     txt = ".".join(map(str, v))
     if v[0] < 27:
         return CheckResult("Xcode", Status.FAIL, txt, "Core AI exige Xcode 27.0 ou superior.")
@@ -83,8 +83,7 @@ def check_coreai_build() -> CheckResult:
 
 
 def check_aria2() -> CheckResult:
-    """Downloads retomáveis. Um teacher de 4 B são ~7,5 GB — perder isso aos
-    90 % por uma queda de rede é a diferença entre minutos e uma tarde."""
+    """Verifica a disponibilidade do aria2c para download de arquivos."""
     path = shutil.which("aria2c")
     if not path:
         return CheckResult("aria2c", Status.FAIL, "ausente",
@@ -112,13 +111,13 @@ def check_arch() -> CheckResult:
 
 
 def check_pipeline_deps() -> CheckResult:
-    """As dependências pesadas são opcionais: o planejamento roda sem elas."""
+    """Verifica se os pacotes opcionais de execução do pipeline estão instalados."""
     import importlib.util
     missing = [m for m in ("torch", "transformers", "coreai_torch", "coreai_opt")
                if importlib.util.find_spec(m) is None]
     if missing:
         return CheckResult("stack do pipeline", Status.WARN, f"faltam: {', '.join(missing)}",
-                           "Só o planejamento funciona. Instale com: uv pip install 'aguardente[pipeline]'")
+                           "Instale as dependências completas com: uv pip install 'aguardente[pipeline]'")
     import torch  # noqa: PLC0415
     return CheckResult("stack do pipeline", Status.OK, f"torch {torch.__version__}")
 
@@ -131,8 +130,7 @@ def check_resources(required_disk_bytes: int = 0) -> list[CheckResult]:
     if required_disk_bytes and m.free_disk_bytes < required_disk_bytes * 1.3:
         out.append(CheckResult("disco", Status.WARN,
                                f"{free:.0f} GB livres, estimativa {required_disk_bytes / GB:.0f} GB",
-                               "Margem apertada. O cache do Hugging Face cresce sem limite "
-                               "(~/.cache/huggingface); HF_HOME redireciona para outro volume."))
+                               "Espaço livre reduzido para os arquivos do modelo e cache."))
     else:
         out.append(CheckResult("disco", Status.OK, f"{free:.0f} GB livres"))
     return out

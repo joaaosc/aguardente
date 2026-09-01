@@ -1,7 +1,4 @@
-"""A cirurgia precisa produzir um modelo que carrega, roda e tem o shape certo.
-
-Usa um Llama minusculo criado do zero — segundos, nao gigabytes.
-"""
+"""Testes de aplicação de poda estruturada e sincronização de configurações."""
 
 import pytest
 
@@ -52,7 +49,6 @@ def test_baseline_runs():
 def test_prune_mlp_only_runs_and_shrinks():
     m = tiny_model()
     a = arch_of(m)
-    plan = type("P", (), {})()  # plano manual: so o MLP
     from aguardente.plan import PrunePlan
     plan = PrunePlan(source=a, target=a.with_(intermediate_size=128), requested_params=0)
 
@@ -85,7 +81,6 @@ def test_prune_layers_runs_and_reindexes():
                       keep_layers=[0, 3, 5])
     assert m.config.num_hidden_layers == 3
     assert len(m.model.layers) == 3
-    # layer_idx precisa ser reindexado, senao o cache de KV escreve na posicao errada
     assert [l.self_attn.layer_idx for l in m.model.layers] == [0, 1, 2]
     forward_ok(m)
 
@@ -105,7 +100,6 @@ def test_prune_all_three_axes_together():
 
 
 def test_pruned_model_round_trips_through_disk(tmp_path):
-    """Sem config sincronizado, save/load falha ao casar os shapes."""
     m = tiny_model()
     a = arch_of(m)
     from aguardente.plan import PrunePlan
@@ -135,12 +129,11 @@ def test_keep_layers_protects_boundaries():
     m = tiny_model()
     scores = score_model(m, batches(), max_batches=2)
     kept = scores.keep_layers(3)
-    assert 0 in kept and 5 in kept, "primeira e ultima precisam sobreviver"
+    assert 0 in kept and 5 in kept
     assert len(kept) == 3
 
 
 def test_scored_prune_end_to_end():
-    """O caminho real: pontuar, planejar, cortar, rodar."""
     m = tiny_model()
     a = arch_of(m)
     scores = score_model(m, batches(), max_batches=3)

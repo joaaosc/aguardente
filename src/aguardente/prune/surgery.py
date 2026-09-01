@@ -1,14 +1,4 @@
-"""O corte.
-
-Fatia as matrizes de peso in-place e reconstrói a lista de camadas. Só toca em
-três eixos — `intermediate_size`, cabeças de atenção (em grupos GQA inteiros) e
-número de camadas. `hidden_size` fica intacto de propósito: podá-lo obrigaria a
-fatiar embeddings, lm_head, todas as projeções e normalizações de forma
-coerente, e é a maior fonte de bugs sutis do método.
-
-`torch` é importado dentro das funções para que o planejamento continue a
-funcionar sem o stack pesado instalado.
-"""
+"""Aplicação de poda estruturada nos tensores do modelo."""
 
 from __future__ import annotations
 
@@ -38,7 +28,7 @@ class PruneReport:
 
 
 def _slice_linear_out(linear: "nn.Linear", keep: "torch.Tensor") -> "nn.Linear":
-    """Mantém apenas as linhas `keep` do peso — reduz `out_features`."""
+    """Mantém apenas as linhas selecionadas na matriz de pesos (reduz out_features)."""
     import torch
     from torch import nn
 
@@ -52,7 +42,7 @@ def _slice_linear_out(linear: "nn.Linear", keep: "torch.Tensor") -> "nn.Linear":
 
 
 def _slice_linear_in(linear: "nn.Linear", keep: "torch.Tensor") -> "nn.Linear":
-    """Mantém apenas as colunas `keep` do peso — reduz `in_features`."""
+    """Mantém apenas as colunas selecionadas na matriz de pesos (reduz in_features)."""
     import torch
     from torch import nn
 
@@ -66,19 +56,19 @@ def _slice_linear_in(linear: "nn.Linear", keep: "torch.Tensor") -> "nn.Linear":
 
 
 def _expand_groups_to_heads(groups: Sequence[int], heads_per_group: int) -> list[int]:
-    """Grupo KV g cobre as cabeças de query [g*hpg, (g+1)*hpg)."""
+    """Expande os índices de grupos KV para os índices das cabeças de query correspondentes."""
     return [g * heads_per_group + i for g in groups for i in range(heads_per_group)]
 
 
 def _head_slice_indices(heads: Sequence[int], head_dim: int) -> "torch.Tensor":
-    """Converte índices de cabeça em índices de coluna/linha do peso."""
+    """Converte índices de cabeças em índices contínuos de tensores."""
     import torch
     return torch.tensor([h * head_dim + i for h in heads for i in range(head_dim)],
                         dtype=torch.long)
 
 
 def _find_layers(model: Any) -> "nn.ModuleList":
-    """Localiza a ModuleList de blocos. Cobre os layouts usuais."""
+    """Localiza o módulo ModuleList contendo as camadas do modelo."""
     for path in ("model.layers", "model.model.layers", "transformer.h", "model.decoder.layers"):
         obj = model
         try:
@@ -114,8 +104,6 @@ def _prune_attention(layer: Any, keep_groups: Sequence[int], src: Arch, dst: Arc
     attn.v_proj = _slice_linear_out(attn.v_proj, kv_idx)
     attn.o_proj = _slice_linear_in(attn.o_proj, q_idx)
 
-    # Atributos cacheados no módulo. Nem toda versão do transformers tem todos,
-    # e um deles desatualizado produz erro de shape só na hora do forward.
     for name, value in (
         ("num_heads", dst.num_attention_heads),
         ("num_attention_heads", dst.num_attention_heads),
@@ -127,9 +115,6 @@ def _prune_attention(layer: Any, keep_groups: Sequence[int], src: Arch, dst: Arc
         if hasattr(attn, name):
             setattr(attn, name, value)
 
-    # q_norm/k_norm do Qwen3 têm shape [head_dim] e são partilhados entre
-    # cabeças — não são fatiados ao remover cabeças.
-
 
 def prune_model(
     model: Any,
@@ -139,12 +124,7 @@ def prune_model(
     keep_groups: Sequence[int] | None = None,
     keep_layers: Sequence[int] | None = None,
 ) -> PruneReport:
-    """Aplica o plano ao modelo, in-place.
-
-    Os índices vêm da pontuação de importância. Quando omitidos, cai para uma
-    seleção determinística por posição — útil só para testes, porque cortar sem
-    medir importância desperdiça qualidade.
-    """
+    """Aplica o plano de poda estruturada ao modelo in-place."""
     import torch
 
     src, dst = plan.source, plan.target
@@ -176,7 +156,6 @@ def prune_model(
     if dst.num_hidden_layers != src.num_hidden_layers:
         from torch import nn
         kept = nn.ModuleList([layers[i] for i in keep_layers])
-        # Reindexar: o cache de KV e o rope usam layer_idx para se posicionar.
         for new_idx, layer in enumerate(kept):
             if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "layer_idx"):
                 layer.self_attn.layer_idx = new_idx
@@ -211,11 +190,7 @@ def _replace_layers(model: Any, new_layers: Any) -> None:
 
 
 def _default_layer_selection(total: int, keep: int) -> list[int]:
-    """Distribui os cortes uniformemente, sempre preservando primeira e última.
-
-    Camadas de fronteira são desproporcionalmente sensíveis — vale para poda
-    tanto quanto para quantização.
-    """
+    """Distribui os cortes uniformemente, preservando a primeira e a última camada."""
     if keep >= total:
         return list(range(total))
     if keep <= 2:
@@ -225,11 +200,7 @@ def _default_layer_selection(total: int, keep: int) -> list[int]:
 
 
 def _sync_config(model: Any, dst: Arch) -> None:
-    """Atualiza o config do modelo.
-
-    Sem isto, `save_pretrained` grava um `config.json` com as dimensões antigas
-    e qualquer carregamento posterior falha ao casar os shapes dos pesos.
-    """
+    """Atualiza o objeto de configuração do modelo com as novas dimensões."""
     cfg = getattr(model, "config", None)
     if cfg is None:
         return
@@ -241,7 +212,6 @@ def _sync_config(model: Any, dst: Arch) -> None:
     ):
         if hasattr(cfg, name):
             setattr(cfg, name, value)
-    # Alguns configs guardam uma cópia aninhada (ex.: modelos multimodais).
     inner = getattr(cfg, "text_config", None)
     if inner is not None:
         for name, value in (

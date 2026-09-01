@@ -1,11 +1,4 @@
-"""Dados de calibração.
-
-Usados para pontuar importância antes de podar. Entradas **reais** importam:
-ruído aleatório não exercita a estrutura aprendida dos pesos, e a pontuação
-resultante não distingue nada.
-
-Poucos lotes bastam — o sinal é grosseiro por natureza.
-"""
+"""Carregamento e processamento de textos para calibração."""
 
 from __future__ import annotations
 
@@ -14,13 +7,10 @@ from typing import TYPE_CHECKING, Any, Iterator
 if TYPE_CHECKING:  # pragma: no cover
     import torch
 
-# O `huggingface_hub` recente exige identificadores no formato `namespace/name`;
-# o antigo "wikitext" solto falha com HfUriError. O canónico agora é este.
 DEFAULT_DATASET = "Salesforce/wikitext"
 DEFAULT_CONFIG = "wikitext-2-raw-v1"
 
-# Tentados em ordem quando o principal falha — versões diferentes de `datasets`
-# e espelhos movidos são comuns o bastante para justificar o fallback.
+# Datasets alternativos para fallback caso o padrão falhe
 _FALLBACKS: tuple[tuple[str, str | None], ...] = (
     ("Salesforce/wikitext", "wikitext-2-raw-v1"),
     ("wikitext", "wikitext-2-raw-v1"),
@@ -51,12 +41,7 @@ def load_texts(
     limit: int = 256,
     min_chars: int = 200,
 ) -> list[str]:
-    """Amostras de texto não vazias. Linhas curtas do WikiText são cabeçalhos.
-
-    Entradas **reais** importam: ruído aleatório não exercita a estrutura
-    aprendida dos pesos, e a pontuação de importância resultante não distingue
-    nada.
-    """
+    """Carrega amostras de texto não vazias para calibração."""
     from .errors import AguardenteError
 
     attempts = [(dataset, config)] if dataset else list(_FALLBACKS)
@@ -64,7 +49,7 @@ def load_texts(
     for name, cfg in attempts:
         try:
             out = _stream_texts(name, cfg, split, limit, min_chars)
-        except Exception as e:  # noqa: BLE001 — qualquer falha justifica o próximo
+        except Exception as e:  # noqa: BLE001
             errors.append(f"{name}: {type(e).__name__}: {e}")
             continue
         if out:
@@ -74,13 +59,12 @@ def load_texts(
     raise AguardenteError(
         "não foi possível carregar dados de calibração:\n    "
         + "\n    ".join(errors),
-        hint="Passe --calib-dataset com um identificador no formato namespace/name, "
-             "ou use --calib-file com um .txt local.",
+        hint="Informe --calib-dataset no formato namespace/nome ou utilize --calib-file com um arquivo .txt local.",
     )
 
 
 def load_texts_from_file(path: str, *, limit: int = 256, min_chars: int = 200) -> list[str]:
-    """Alternativa offline: um arquivo de texto, dividido em parágrafos."""
+    """Carrega amostras de calibração a partir de um arquivo de texto local."""
     from pathlib import Path
 
     from .errors import AguardenteError
@@ -89,8 +73,8 @@ def load_texts_from_file(path: str, *, limit: int = 256, min_chars: int = 200) -
     out = [p.strip() for p in raw.split("\n\n") if len(p.strip()) >= min_chars][:limit]
     if not out:
         raise AguardenteError(
-            f"{path} não tem parágrafos com >= {min_chars} caracteres",
-            hint="Separe os trechos por linha em branco.",
+            f"{path} não contém parágrafos com >= {min_chars} caracteres",
+            hint="Separe os blocos de texto por linhas em branco.",
         )
     return out
 
@@ -103,7 +87,7 @@ def make_batches(
     seq_len: int = 512,
     device: str | None = None,
 ) -> Iterator[dict[str, "torch.Tensor"]]:
-    """Tokeniza e agrupa em lotes de shape fixo."""
+    """Tokeniza e agrupa as amostras em batches de tamanho fixo."""
     import torch
 
     for i in range(0, len(texts), batch_size):
@@ -121,7 +105,7 @@ def make_batches(
 
 
 def ensure_pad_token(tokenizer: Any) -> Any:
-    """Muitos tokenizers de LLM causal não definem pad; sem isso o batching falha."""
+    """Configura o token de preenchimento (pad) caso não esteja definido no tokenizer."""
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     return tokenizer

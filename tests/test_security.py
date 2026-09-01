@@ -1,15 +1,10 @@
-"""Defesas contra dados hostis vindos da rede.
-
-O indice de arquivos de um repositorio remoto e controlado por quem o publica.
-Tratar esses caminhos como confiaveis permite escrita fora do destino.
-"""
+"""Testes de segurança e validação de entradas."""
 
 import pytest
 
 from aguardente.errors import AguardenteError
 from aguardente.fetch import RemoteFile, _wanted, safe_join
 
-# Cada entrada e um caminho que um repositorio malicioso poderia declarar.
 TRAVESSIAS = [
     "../../../../etc/cron.d/pwned.safetensors",
     "../../.ssh/authorized_keys.safetensors",
@@ -29,7 +24,6 @@ LEGITIMOS = [
 
 @pytest.mark.parametrize("path", TRAVESSIAS)
 def test_wanted_rejeita_travessia(path):
-    """O filtro de selecao e a primeira linha de defesa."""
     assert not _wanted(path), f"{path} passou pelo filtro"
 
 
@@ -40,7 +34,6 @@ def test_wanted_aceita_legitimos(path):
 
 @pytest.mark.parametrize("path", TRAVESSIAS)
 def test_safe_join_rejeita_travessia(tmp_path, path):
-    """Defesa em profundidade: mesmo que o filtro falhe, a juncao recusa."""
     with pytest.raises(AguardenteError):
         safe_join(tmp_path, path)
 
@@ -52,12 +45,10 @@ def test_safe_join_aceita_subdiretorio(tmp_path):
 
 
 def test_safe_join_normaliza_sem_escapar(tmp_path):
-    """Um './' redundante e inofensivo e deve passar normalizado."""
     assert safe_join(tmp_path, "./config.json") == tmp_path / "config.json"
 
 
 def test_remote_file_valida_na_construcao():
-    """Construir um RemoteFile com caminho hostil deve falhar de imediato."""
     with pytest.raises(AguardenteError):
         RemoteFile(path="../fora.safetensors", size=10)
 
@@ -68,7 +59,6 @@ def test_remote_file_aceita_legitimo():
 
 
 def test_url_nao_permite_injecao_de_host():
-    """O caminho nao pode redirecionar o download para outro servidor."""
     with pytest.raises(AguardenteError):
         RemoteFile(path="https://malicioso.example/x.safetensors", size=1)
 
@@ -82,7 +72,7 @@ IDS_HOSTIS = [
     "modelo?token=roubado",
     "http://outro.example/x",
     "espaco no meio",
-    "a/b/c/d",          # profundidade inválida no formato do Hugging Face
+    "a/b/c/d",
     "",
 ]
 
@@ -97,7 +87,6 @@ IDS_VALIDOS = [
 
 @pytest.mark.parametrize("model_id", IDS_HOSTIS)
 def test_identificador_hostil_recusado(model_id):
-    """Um identificador com '..', '?' ou '#' reescreve a URL da API."""
     from aguardente.fetch import validate_model_id
     with pytest.raises(AguardenteError):
         validate_model_id(model_id)
@@ -112,7 +101,6 @@ def test_identificador_valido_aceito(model_id):
 # ------------------------------------------------ desserializacao
 
 def test_logits_carregam_sem_executar_pickle(tmp_path):
-    """torch.load sem weights_only executa codigo arbitrario ao desserializar."""
     torch = pytest.importorskip("torch")
     import inspect
 
@@ -124,13 +112,6 @@ def test_logits_carregam_sem_executar_pickle(tmp_path):
 
 
 def test_shard_com_objeto_arbitrario_e_recusado(tmp_path):
-    """Prova pratica: um shard com objeto de classe arbitraria nao carrega.
-
-    `weights_only=True` permite tipos de dado (tensores, dicts, strings) e
-    recusa a reconstrucao de classes — que e por onde um pickle hostil executa
-    codigo. `argparse.Namespace` serve de sentinela por ser inofensivo e estar
-    fora da lista permitida.
-    """
     torch = pytest.importorskip("torch")
     import argparse
     import json as _json
@@ -147,7 +128,6 @@ def test_shard_com_objeto_arbitrario_e_recusado(tmp_path):
 
 
 def test_shard_legitimo_continua_carregando(tmp_path):
-    """A defesa nao pode quebrar o caminho normal."""
     torch = pytest.importorskip("torch")
     import json as _json
 
@@ -173,10 +153,9 @@ def test_shard_legitimo_continua_carregando(tmp_path):
     {"concurrent": 0},
     {"max_tries": 10_000},
     {"retry_wait": -5},
-    {"connections": "8"},        # string onde se espera inteiro
+    {"connections": "8"},
 ])
 def test_parametros_absurdos_recusados(tmp_path, kwargs):
-    """Valores fora de faixa fazem o aria2 falhar com mensagem obscura."""
     from aguardente.fetch import FetchPlan, RemoteFile, fetch
 
     plan = FetchPlan(model_id="org/m", revision="main", dest=tmp_path,
@@ -186,17 +165,15 @@ def test_parametros_absurdos_recusados(tmp_path, kwargs):
 
 
 def test_checkpoint_e_gravado_atomicamente(tmp_path):
-    """Escrever direto sobre best.pt destroi o unico checkpoint bom se cair no meio."""
     import inspect
 
     from aguardente.distill import train
 
     fonte = inspect.getsource(train._save_checkpoint)
-    assert ".replace(" in fonte, "o checkpoint precisa ser renomeado, nao escrito direto"
+    assert ".replace(" in fonte
     assert "tmp" in fonte
 
 
 def test_historico_de_perdas_tem_teto():
-    """Um treino de horas acumularia centenas de milhares de floats sem uso."""
     from aguardente.distill.train import _MAX_LOSS_HISTORY
     assert 0 < _MAX_LOSS_HISTORY <= 10_000

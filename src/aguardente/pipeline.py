@@ -1,12 +1,4 @@
-"""Orquestração das etapas.
-
-Cada etapa é idempotente e declara o que produziu. Ao retomar, o que já está
-pronto no disco é pulado — um pipeline que baixa 7,5 GB e treina por horas não
-pode recomeçar do zero por causa de um Ctrl-C.
-
-As etapas vivem aqui, e não na CLI, para poderem ser testadas e reutilizadas
-sem passar por `argparse`.
-"""
+"""Orquestração das etapas do pipeline."""
 
 from __future__ import annotations
 
@@ -29,12 +21,7 @@ STAGES = ("fetch", "prune", "logits", "recover", "export")
 
 
 class _ProgressFilter:
-    """Condensa a saída do aria2c.
-
-    A ferramenta emite uma linha de progresso por segundo — num download de
-    7,5 GB isso são centenas de linhas idênticas. Aqui só passa o que informa:
-    saltos de percentual e mensagens que não são progresso (erros, avisos).
-    """
+    """Filtra e formata a saída de progresso do aria2c."""
 
     _PCT = __import__("re").compile(r"\((\d+)%\)")
 
@@ -46,7 +33,6 @@ class _ProgressFilter:
     def __call__(self, line: str) -> None:
         m = self._PCT.search(line)
         if not m:
-            # Não é linha de progresso: erro, aviso ou resumo. Sempre passa.
             if line.strip() and not line.startswith(("***", "===", "---", "FILE:")):
                 self.report(f"             {line.strip()}")
             return
@@ -58,6 +44,8 @@ class _ProgressFilter:
 
 @dataclass
 class RunOptions:
+    """Opções de configuração para execução do pipeline."""
+
     model: str
     out_dir: Path
     target_params: int | None = None
@@ -66,7 +54,7 @@ class RunOptions:
     connections: int = 8
     concurrent: int = 4
 
-    # calibração (usada na poda e na pré-computação de logits)
+    # calibração
     calib_batches: int = 32
     batch_size: int = 2
     seq_len: int = 512
@@ -119,6 +107,8 @@ class RunOptions:
 
 @dataclass
 class Context:
+    """Contexto de execução compartilhado entre as etapas do pipeline."""
+
     opts: RunOptions
     state: RunState
     report: Reporter = print
@@ -135,7 +125,7 @@ class Context:
 
 
 def make_plan(ctx: Context) -> tuple[ModelProbe, PrunePlan | None]:
-    """Sonda o modelo e dimensiona o alvo. Nada é baixado aqui."""
+    """Inspeciona o modelo e calcula o dimensionamento do plano."""
     opts = ctx.opts
     p = probe(opts.model)
     ctx.probe = p
@@ -143,11 +133,11 @@ def make_plan(ctx: Context) -> tuple[ModelProbe, PrunePlan | None]:
     target = opts.target_params
     if target is None:
         target = Budget.for_machine(Machine.detect()).max_params_for_training()
-        ctx.say(f"alvo         derivado da RAM: {target/1e9:.2f} B parâmetros")
+        ctx.say(f"alvo         sugerido pela RAM: {target/1e9:.2f} B parâmetros")
 
     total = count_params(p.arch).total
     if total <= target:
-        ctx.say(f"plano        modelo já cabe em {target/1e9:.2f} B — sem poda")
+        ctx.say(f"plano        modelo atende ao alvo de {target/1e9:.2f} B — sem poda necessária")
         ctx.plan = None
         return p, None
 
@@ -164,7 +154,7 @@ def make_plan(ctx: Context) -> tuple[ModelProbe, PrunePlan | None]:
 
 
 def stage_fetch(ctx: Context) -> Path:
-    """Baixa o teacher com aria2c. Retomável por construção."""
+    """Etapa 1: Download dos arquivos do modelo."""
     from .fetch import fetch, plan_fetch, require_aria2
 
     opts, state = ctx.opts, ctx.state
@@ -186,9 +176,9 @@ def stage_fetch(ctx: Context) -> Path:
     fp = plan_fetch(opts.model, dest)
     pending = fp.pending_bytes
     if pending == 0:
-        ctx.say(f"fetch        completo em disco: {fp.total_bytes/GB:.2f} GB")
+        ctx.say(f"fetch        presente em disco: {fp.total_bytes/GB:.2f} GB")
     else:
-        ctx.say(f"fetch        {len(fp.missing())} arquivo(s), {pending/GB:.2f} GB "
+        ctx.say(f"fetch        {len(fp.missing())} arquivo(s) pendente(s), {pending/GB:.2f} GB "
                 f"de {fp.total_bytes/GB:.2f} GB")
 
     state.begin("fetch")
@@ -208,7 +198,7 @@ def stage_fetch(ctx: Context) -> Path:
 
 
 def stage_prune(ctx: Context, teacher_dir: Path) -> Path:
-    """Pontua importância, corta, verifica que roda e grava."""
+    """Etapa 2: Avaliação de importância e poda estruturada."""
     from .calibration import load_texts, load_texts_from_file, make_batches
     from .loading import load_causal_lm, pick_device, save_pruned
     from .prune import prune_model, score_model
@@ -217,7 +207,7 @@ def stage_prune(ctx: Context, teacher_dir: Path) -> Path:
     out = opts.pruned_dir
 
     if ctx.plan is None:
-        ctx.say("poda         desnecessária")
+        ctx.say("poda         não necessária")
         state.skip("prune", "modelo já cabe no alvo")
         state.stage("prune").outputs["dir"] = str(teacher_dir)
         state.save()
@@ -232,7 +222,7 @@ def stage_prune(ctx: Context, teacher_dir: Path) -> Path:
     t0 = time.perf_counter()
 
     device = pick_device(opts.device)
-    ctx.say(f"poda         carregando (device={device})")
+    ctx.say(f"poda         carregando modelo (device={device})")
     model, tokenizer = load_causal_lm(str(teacher_dir), device=device)
 
     n_texts = opts.calib_batches * opts.batch_size + 8
@@ -241,7 +231,7 @@ def stage_prune(ctx: Context, teacher_dir: Path) -> Path:
     batches = make_batches(tokenizer, texts, batch_size=opts.batch_size,
                            seq_len=opts.seq_len, device=device)
 
-    ctx.say(f"             pontuando em {opts.calib_batches} lotes reais")
+    ctx.say(f"             calculando scores em {opts.calib_batches} lotes")
     try:
         scores = score_model(model, batches, max_batches=opts.calib_batches)
         t = ctx.plan.target
@@ -255,7 +245,6 @@ def stage_prune(ctx: Context, teacher_dir: Path) -> Path:
         ctx.say(f"             {report.params_before/1e9:.2f} B → "
                 f"{report.params_after/1e9:.2f} B ({report.ratio:.2f}× menor)")
 
-        # Sanidade imediata: gravar um modelo que não roda é desperdício.
         import torch
         with torch.no_grad():
             ids = torch.randint(0, model.config.vocab_size, (1, 16), device=device)
@@ -265,7 +254,7 @@ def stage_prune(ctx: Context, teacher_dir: Path) -> Path:
                 "o modelo podado produz NaN ou Inf",
                 hint="Tente um alvo menos agressivo com --target-params.",
             )
-        ctx.say(f"             forward ok {tuple(logits.shape)}")
+        ctx.say(f"             validação forward ok: {tuple(logits.shape)}")
         save_pruned(model, tokenizer, out)
     except Exception as e:
         state.fail("prune", str(e))
@@ -283,7 +272,7 @@ def stage_prune(ctx: Context, teacher_dir: Path) -> Path:
 
 
 def stage_logits(ctx: Context, teacher_dir: Path) -> Path | None:
-    """Pré-computa o top-k do teacher e descarrega-o da memória."""
+    """Etapa 3: Pré-computação dos top-k logits do modelo original."""
     from .calibration import load_texts, load_texts_from_file, make_batches
     from .distill import precompute_logits
     from .distill.teacher import estimate_logit_bytes
@@ -294,7 +283,7 @@ def stage_logits(ctx: Context, teacher_dir: Path) -> Path | None:
     out = opts.logits_dir
 
     if opts.skip_recover:
-        state.skip("logits", "recuperação desligada")
+        state.skip("logits", "recuperação desativada")
         return None
 
     if state.is_done("logits", require=("dir",)):
@@ -332,7 +321,6 @@ def stage_logits(ctx: Context, teacher_dir: Path) -> Path | None:
         state.fail("logits", str(e))
         raise
     finally:
-        # Descarregar o teacher: o pico passa a ser max(teacher, student).
         del teacher
         _free(device)
 
@@ -343,7 +331,7 @@ def stage_logits(ctx: Context, teacher_dir: Path) -> Path | None:
 
 
 def stage_recover(ctx: Context, pruned_dir: Path, logits_dir: Path | None) -> Path:
-    """Destila o teacher no modelo podado."""
+    """Etapa 4: Treinamento de destilação para recuperação de qualidade."""
     from .distill import RecoveryConfig, recover
     from .distill.teacher import TeacherLogits
     from .loading import load_causal_lm, pick_device, save_pruned
@@ -353,8 +341,8 @@ def stage_recover(ctx: Context, pruned_dir: Path, logits_dir: Path | None) -> Pa
     out = opts.student_dir
 
     if opts.skip_recover or logits_dir is None:
-        ctx.say("recuperação  desligada")
-        state.skip("recover", "desligada por opção")
+        ctx.say("recuperação  desativada")
+        state.skip("recover", "desativada por opção")
         state.stage("recover").outputs["dir"] = str(pruned_dir)
         state.save()
         return pruned_dir
@@ -394,7 +382,7 @@ def stage_recover(ctx: Context, pruned_dir: Path, logits_dir: Path | None) -> Pa
                       on_step=lambda s, l: ctx.say(f"\r             passo {s} loss {l:.4f}")
                       if s and s % 25 == 0 else None)
         ctx.say(f"             {res.steps} passos em {res.seconds:.0f}s "
-                f"(parou por: {res.stopped_by})")
+                f"(critério de parada: {res.stopped_by})")
 
         save_pruned(student, tokenizer, out)
 
@@ -422,15 +410,15 @@ def stage_recover(ctx: Context, pruned_dir: Path, logits_dir: Path | None) -> Pa
 
 
 def stage_export(ctx: Context, model_dir: Path) -> Path | None:
-    """Converte para `.aimodel` delegando ao exportador da Apple."""
+    """Etapa 5: Exportação para o formato .aimodel."""
     from .export import build_command, find_bundle, run_export
 
     opts, state = ctx.opts, ctx.state
     out = opts.bundle_dir
 
     if opts.skip_export:
-        ctx.say("export       desligado")
-        state.skip("export", "desligado por opção")
+        ctx.say("export       desativado")
+        state.skip("export", "desativado por opção")
         return None
 
     if state.is_done("export", require=("dir",)):
@@ -483,7 +471,7 @@ def _free(device: str) -> None:
             torch.mps.empty_cache()
         elif device == "cuda":
             torch.cuda.empty_cache()
-    except Exception:  # noqa: BLE001 — liberar memória nunca deve derrubar o pipeline
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -492,7 +480,7 @@ def _free(device: str) -> None:
 
 def run_pipeline(opts: RunOptions, *, report: Reporter = print,
                  events: EventLog | None = None) -> Context:
-    """Executa o pipeline inteiro, retomando o que já estiver pronto."""
+    """Executa o pipeline completo com suporte a retomada."""
     state = RunState.load_or_create(opts.out_dir, model=opts.model,
                                     target_params=opts.target_params)
     ctx = Context(opts=opts, state=state, report=report,
@@ -500,14 +488,12 @@ def run_pipeline(opts: RunOptions, *, report: Reporter = print,
 
     make_plan(ctx)
 
-    # Avisar AGORA, não depois de horas de download e treino.
     if not opts.skip_export:
         from .export import available
         if not available():
-            ctx.say("aviso        coreai.llm.export não está instalado — o export "
-                    "vai falhar no fim")
-            ctx.say("             instale com: uv pip install -e '.[pipeline]'")
-            ctx.say("             ou rode com --skip-export para parar antes dele")
+            ctx.say("aviso        coreai.llm.export não está disponível no ambiente")
+            ctx.say("             instale via: uv pip install -e '.[pipeline]'")
+            ctx.say("             ou use --skip-export para desativar a exportação")
             ctx.say()
 
     teacher = stage_fetch(ctx)

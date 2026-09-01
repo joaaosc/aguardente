@@ -1,4 +1,4 @@
-"""Selecao de arquivos e deteccao de download incompleto."""
+"""Testes de seleção de arquivos e download via aria2c."""
 
 import pytest
 
@@ -22,12 +22,10 @@ def test_wanted_files(path):
     "openvino/openvino_model.xml",
 ])
 def test_unwanted_files(path):
-    """Baixar .bin quando ha .safetensors dobra o trafego a troco de nada."""
     assert not _wanted(path), f"{path} nao deveria ser baixado"
 
 
 def test_onnx_safetensors_still_excluded():
-    """Um .safetensors dentro de onnx/ nao e o peso que queremos."""
     assert not _wanted("onnx/model.safetensors")
 
 
@@ -43,7 +41,6 @@ def test_missing_detects_absent_file(tmp_path):
 
 
 def test_missing_detects_truncated_file(tmp_path):
-    """Um download morto no meio deixa o arquivo com tamanho errado."""
     (tmp_path / "model.safetensors").write_bytes(b"x" * 50)
     plan = plan_with(tmp_path, [("model.safetensors", 100)])
     assert len(plan.missing()) == 1

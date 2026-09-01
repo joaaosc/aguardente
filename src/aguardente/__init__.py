@@ -1,3 +1,3 @@
-"""aguardente — poda estruturada, destilação de recuperação e conversão para Core AI."""
+"""aguardente — poda estruturada, destilação e conversão para Core AI."""
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"

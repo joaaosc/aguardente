@@ -1,4 +1,4 @@
-"""Carregamento de modelos, com as escolhas que importam em máquina pequena."""
+"""Carregamento de modelos e tokenizers."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from .errors import AguardenteError
 
 
 def pick_device(prefer: str | None = None) -> str:
-    """MPS quando existe. Em Apple Silicon, `cuda` nunca é opção."""
+    """Seleciona o dispositivo de execução (MPS quando disponível, ou CPU)."""
     import torch
 
     if prefer:
@@ -20,14 +20,14 @@ def pick_device(prefer: str | None = None) -> str:
 
 
 def pick_dtype(device: str) -> Any:
-    """float16, não bfloat16: o suporte a bf16 em MPS é irregular."""
+    """Seleciona o tipo de precisão para o dispositivo (float16 para MPS, float32 para CPU)."""
     import torch
 
     return torch.float16 if device == "mps" else torch.float32
 
 
 def load_causal_lm(ref: str, *, device: str | None = None, dtype: Any = None) -> tuple[Any, Any]:
-    """Carrega modelo e tokenizer de um identificador do Hugging Face ou diretório."""
+    """Carrega o modelo causal e tokenizer a partir de um identificador do Hub ou diretório local."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from .calibration import ensure_pad_token
@@ -40,10 +40,10 @@ def load_causal_lm(ref: str, *, device: str | None = None, dtype: Any = None) ->
             ref, dtype=dt, low_cpu_mem_usage=True,
         )
         tokenizer = ensure_pad_token(AutoTokenizer.from_pretrained(ref))
-    except Exception as e:  # noqa: BLE001 — a mensagem do transformers é o que importa
+    except Exception as e:  # noqa: BLE001
         raise AguardenteError(
             f"não foi possível carregar {ref}: {e}",
-            hint="Para um diretório local, confira config.json, os .safetensors e o tokenizer.",
+            hint="Para diretórios locais, certifique-se de que config.json, os arquivos .safetensors e o tokenizer estão presentes.",
         ) from e
 
     model.to(dev)
@@ -52,7 +52,7 @@ def load_causal_lm(ref: str, *, device: str | None = None, dtype: Any = None) ->
 
 
 def save_pruned(model: Any, tokenizer: Any, out_dir: Path) -> Path:
-    """Grava no formato transformers — o que o `coreai.llm.export` consome."""
+    """Salva o modelo e o tokenizer no formato transformers."""
     out_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(out_dir)
     tokenizer.save_pretrained(out_dir)

@@ -1,4 +1,4 @@
-"""A ponte para o exportador da Apple: argv correto e erros uteis."""
+"""Testes de montagem de comandos e exportação para Core AI."""
 
 import pytest
 
@@ -8,7 +8,6 @@ from aguardente.export import build_command, find_bundle
 
 @pytest.fixture(autouse=True)
 def exporter_present(monkeypatch):
-    """build_command exige o exportador resolvivel; aqui simulamos que esta la."""
     import aguardente.export as mod
     monkeypatch.setattr(mod, "_resolve", lambda _: ["/usr/bin/coreai.llm.export"])
 
@@ -18,19 +17,16 @@ def cmd(**kw):
 
 
 def test_experimental_is_on_by_default():
-    """Diretorio local nunca casa com um preset do registry — a flag e obrigatoria."""
     assert "--experimental" in cmd()
 
 
 def test_compute_precision_always_present():
-    """--experimental traz junto a obrigacao de --compute-precision."""
     c = cmd()
     assert "--compute-precision" in c
     assert c[c.index("--compute-precision") + 1] == "float16"
 
 
 def test_compression_and_config_are_mutually_exclusive():
-    """O exportador da Apple sai com erro se receber os dois."""
     preset = cmd()
     assert "--compression" in preset and "--compression-config" not in preset
 
@@ -74,7 +70,6 @@ def test_find_bundle_reads_metadata(tmp_path):
 
 
 def test_available_reflects_resolution(monkeypatch):
-    """Sem o exportador instalado, o pipeline precisa avisar ANTES de horas de trabalho."""
     import aguardente.export as mod
 
     monkeypatch.setattr(mod, "_resolve", lambda _: None)
@@ -85,7 +80,6 @@ def test_available_reflects_resolution(monkeypatch):
 
 
 def test_missing_exporter_error_warns_about_pypi_squat(monkeypatch):
-    """O 'coreai-models' do PyPI e de terceiro — a mensagem tem de dizer isso."""
     import aguardente.export as mod
 
     monkeypatch.setattr(mod, "_resolve", lambda _: None)

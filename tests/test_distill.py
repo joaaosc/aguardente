@@ -1,4 +1,4 @@
-"""A recuperacao precisa realmente melhorar o modelo podado, nao so rodar."""
+"""Testes de funções de perda e treinamento de recuperação."""
 
 import math
 
@@ -33,11 +33,6 @@ def fixed_batches(n=6, bs=2, seq=16, vocab=256, seed=1):
 
 
 def train_briefly(model, batches, *, steps=40, lr=1e-3):
-    """Da estrutura real a um modelo aleatorio.
-
-    Sem isto a saida e quase uniforme, a poda nao tem o que degradar, e um
-    teste de "a recuperacao melhora" nao mede nada.
-    """
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     model.train()
     for _ in range(steps):
@@ -53,7 +48,6 @@ def train_briefly(model, batches, *, steps=40, lr=1e-3):
 # ---------------------------------------------------------------- loss
 
 def test_kd_loss_is_zero_when_student_matches_teacher():
-    """Sanidade: a KL de uma distribuicao com ela mesma e zero."""
     torch.manual_seed(0)
     logits = torch.randn(2, 5, 64)
     vals, idx = logits.topk(8, dim=-1)
@@ -73,7 +67,6 @@ def test_kd_loss_grows_with_divergence():
 
 
 def test_temperature_squared_keeps_gradient_scale():
-    """Sem o fator T^2 o termo de KD encolheria com 1/T^2 e alpha mentiria."""
     torch.manual_seed(0)
     teacher = torch.randn(2, 5, 64)
     student = (teacher + 0.5 * torch.randn_like(teacher)).requires_grad_(True)
@@ -84,7 +77,6 @@ def test_temperature_squared_keeps_gradient_scale():
         s = student.detach().clone().requires_grad_(True)
         kd_loss(s, vals, idx, alpha=1.0, temperature=T).backward()
         grads.append(float(s.grad.abs().mean()))
-    # Mesma ordem de grandeza: sem T^2 haveria fator ~16 entre eles.
     assert 0.1 < grads[1] / grads[0] < 10.0
 
 
@@ -101,11 +93,10 @@ def test_alpha_blends_both_terms():
 # ---------------------------------------------------------------- teacher
 
 def test_topk_storage_is_orders_of_magnitude_smaller():
-    """A justificativa do top-k, em numeros."""
     topk, full = estimate_logit_bytes(10_000, 512, top_k=128, vocab_size=151_936)
     assert full / topk > 200
-    assert full > 1e12          # ~1,4 TB com vocabulario completo
-    assert topk < 5e10          # poucos GB com top-k
+    assert full > 1e12
+    assert topk < 5e10
 
 
 def test_precompute_writes_shards_and_manifest(tmp_path):
@@ -119,7 +110,6 @@ def test_precompute_writes_shards_and_manifest(tmp_path):
 
 
 def test_precompute_resumes_without_recomputing(tmp_path):
-    """Shards existentes sao pulados — retomar nao refaz trabalho."""
     teacher = tiny_model()
     precompute_logits(teacher, fixed_batches(n=3), tmp_path / "l", top_k=8)
     mtimes = {p.name: p.stat().st_mtime_ns for p in (tmp_path / "l").glob("*.pt")}
@@ -141,24 +131,22 @@ def _mean_kd(model, logits) -> float:
 
 
 def test_pruning_degrades_a_trained_model(tmp_path):
-    """Pre-condicao do teste seguinte: a poda TEM de custar qualidade."""
     batches = fixed_batches(n=6)
     teacher = train_briefly(tiny_model(seed=0), batches)
     logits = precompute_logits(teacher, batches, tmp_path / "logits", top_k=16)
 
     intact = _mean_kd(teacher, logits)
-    assert intact == pytest.approx(0.0, abs=1e-4), "o teacher tem de casar consigo mesmo"
+    assert intact == pytest.approx(0.0, abs=1e-4)
 
-    student = train_briefly(tiny_model(seed=0), batches)   # mesmos pesos do teacher
+    student = train_briefly(tiny_model(seed=0), batches)
     a = Arch.from_hf_config(student.config.to_dict())
     prune_model(student, PrunePlan(source=a, target=a.with_(intermediate_size=128),
                                    requested_params=0),
                 keep_ffn=torch.arange(128))
-    assert _mean_kd(student, logits) > 0.01, "a poda nao degradou nada — teste sem valor"
+    assert _mean_kd(student, logits) > 0.01
 
 
 def test_recovery_reduces_loss_on_pruned_student(tmp_path):
-    """O teste central: podar degrada, recuperar traz de volta."""
     batches = fixed_batches(n=8)
     teacher = train_briefly(tiny_model(seed=0), batches)
     logits = precompute_logits(teacher, batches, tmp_path / "logits", top_k=16)
@@ -191,7 +179,7 @@ def test_recovery_stops_on_plateau(tmp_path):
                   RecoveryConfig(epochs=10, grad_accum=1, eval_every=2,
                                  plateau_patience=1, plateau_threshold=0.99,
                                  gradient_checkpointing=False),
-                  device="cpu", evaluate=lambda: 42.0)   # metrica constante = plato
+                  device="cpu", evaluate=lambda: 42.0)
     assert res.stopped_by == "plateau"
     assert res.epochs_completed < 10
 
@@ -228,11 +216,11 @@ def test_checkpoint_written_when_metric_improves(tmp_path):
 # ---------------------------------------------------------------- metricas
 
 @pytest.mark.parametrize("teacher,pruned,recovered,expected", [
-    (10.0, 30.0, 14.0, 0.80),   # recuperou 80% da queda
-    (10.0, 30.0, 30.0, 0.00),   # nao mudou nada
-    (10.0, 30.0, 10.0, 1.00),   # voltou ao teacher
-    (10.0, 30.0, 35.0, -0.25),  # piorou
-    (10.0, 8.0, 8.0, 1.00),     # poda nao degradou
+    (10.0, 30.0, 14.0, 0.80),
+    (10.0, 30.0, 30.0, 0.00),
+    (10.0, 30.0, 10.0, 1.00),
+    (10.0, 30.0, 35.0, -0.25),
+    (10.0, 8.0, 8.0, 1.00),
 ])
 def test_recovery_fraction(teacher, pruned, recovered, expected):
     assert recovery_fraction(teacher, pruned, recovered) == pytest.approx(expected)

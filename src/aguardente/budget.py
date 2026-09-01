@@ -1,8 +1,4 @@
-"""Orçamento de máquina: RAM, disco e o que cabe neles.
-
-Tudo derivado por primeiros princípios a partir da arquitetura — nada de
-tabelas de desempenho copiadas de blog.
-"""
+"""Estimativas de uso de memória e capacidade de processamento."""
 
 from __future__ import annotations
 
@@ -15,13 +11,12 @@ from .arch import Arch
 
 GB = 1024 ** 3
 
-# Preset macOS "4bit" do coreai-models: INT4 per-block(32) symmetric_with_clipping.
-# 4,50 bits/peso; 4,56 quando as embeddings ficam em fp16 (pesos atados a lm_head).
+# Bits por peso (BPW) estimados para os formatos suportados
 BPW_INT4_MACOS = 4.50
 BPW_INT4_EMBED_FP16 = 4.56
 BPW_FP16 = 16.0
 
-# A Apple recomenda deixar esta folga para o sistema no macOS.
+# Margem reservada para o sistema operacional no macOS
 SYSTEM_HEADROOM_BYTES = 6 * GB
 
 
@@ -52,7 +47,7 @@ class Machine:
 
     @property
     def usable_ram_bytes(self) -> int:
-        """RAM que um processo pode usar sem estrangular o sistema."""
+        """Memória utilizável após reserva de margem para o sistema."""
         return max(0, self.ram_bytes - SYSTEM_HEADROOM_BYTES)
 
 
@@ -61,26 +56,20 @@ def weights_bytes(params: int, bits_per_weight: float = BPW_FP16) -> int:
 
 
 def kv_cache_bytes(a: Arch, seq_len: int, dtype_bytes: int = 2) -> int:
-    """KV cache para um contexto. Escala linearmente com o comprimento —
-    é o que costuma estourar a memória em sessão longa, não os pesos."""
+    """Calcula o tamanho do KV cache em bytes para um dado comprimento de sequência."""
     return 2 * a.num_hidden_layers * a.num_key_value_heads * a.head_dim * seq_len * dtype_bytes
 
 
 def training_bytes(params: int, *, optimizer: str = "adamw", dtype_bytes: int = 2) -> int:
-    """Estado fixo de treino, sem ativações.
-
-    AdamW guarda dois momentos em fp32 (8 B/param) além de pesos e gradientes.
-    Ativações escalam com batch × seq × hidden × camadas e frequentemente
-    dominam — não estão aqui porque dependem de escolhas de execução.
-    """
-    per_param = dtype_bytes * 2  # pesos + gradientes
+    """Estimativa de memória estática para pesos, gradientes e estados do otimizador."""
+    per_param = dtype_bytes * 2  # pesos e gradientes
     per_param += 8 if optimizer == "adamw" else 4
     return int(params * per_param)
 
 
 @dataclass(frozen=True, slots=True)
 class Budget:
-    """Quanto se pode gastar, e o que isso implica em parâmetros."""
+    """Orçamento de recursos de máquina para treino e inferência."""
 
     machine: Machine
     ram_bytes: int
@@ -91,9 +80,10 @@ class Budget:
         return cls(machine=m, ram_bytes=m.usable_ram_bytes)
 
     def max_params_for_training(self, *, optimizer: str = "adamw") -> int:
-        """Maior modelo treinável no orçamento, deixando margem para ativações."""
+        """Número máximo de parâmetros para treino dentro da memória disponível."""
         per_param = 2 * 2 + (8 if optimizer == "adamw" else 4)
         return int(self.ram_bytes * self.train_fraction / per_param)
 
     def max_params_for_inference(self, *, bpw: float = BPW_INT4_EMBED_FP16) -> int:
+        """Número máximo de parâmetros para inferência dentro da memória disponível."""
         return int(self.ram_bytes * 8 / bpw)

@@ -1,51 +1,42 @@
 # Guia de uso
 
-Documento de referência: o que cada comando faz, o que esperar de cada etapa,
-e o que fazer quando algo falha.
+Documento de referência para comandos, opções e resolução de problemas.
 
-- [Antes de começar](#antes-de-começar)
-- [Ensaio recomendado](#ensaio-recomendado)
-- [Os comandos](#os-comandos)
-- [Anatomia de uma execução](#anatomia-de-uma-execução)
-- [Retomada](#retomada)
-- [Quando a memória não dá](#quando-a-memória-não-dá)
-- [Tratamento de erros](#tratamento-de-erros)
+- [Diagnóstico do ambiente](#diagnóstico-do-ambiente)
+- [Execução de teste](#execução-de-teste)
+- [Comandos](#os-comandos)
+- [Detalhamento do pipeline](#detalhamento-do-pipeline)
+- [Retomada de execução](#retomada-de-execução)
+- [Otimização de memória](#otimização-de-memória)
+- [Resolução de problemas](#resolução-de-problemas)
 - [Perguntas frequentes](#perguntas-frequentes)
 
 ---
 
-## Antes de começar
+## Diagnóstico do ambiente
 
 ```bash
 aguardente doctor
 ```
 
-Nove verificações. Todas precisam passar antes de qualquer trabalho pesado —
-descobrir um requisito ausente depois de quarenta minutos de download é o
-desperdício mais comum.
+Executa a verificação dos pré-requisitos necessários para as ferramentas do pipeline:
 
-<!-- placeholder: captura da saída de `aguardente doctor` -->
-![Verificação de ambiente](docs/media/doctor.png)
-
-| Verificação | Por que importa |
+| Verificação | Motivo |
 |---|---|
-| macOS 27+ | Requisito do framework Core AI |
-| Xcode 27+ | Traz o compilador de modelos |
-| `coreai-build` | Vem com o Metal Toolchain |
-| `aria2c` | Downloads retomáveis; sem ele, uma queda de rede custa o download inteiro |
-| Python 3.11–3.13 | O stack Core AI recusa 3.14 |
-| Apple Silicon | Não há binários para Intel |
-| Stack do pipeline | `torch`, `transformers` e os pacotes Core AI |
-| RAM e disco | Orçamento disponível |
-
-Cada linha que falha traz a correção junto.
+| macOS 27+ | Suporte ao framework Core AI |
+| Xcode 27+ | Compilador de modelos (`coreai-build`) |
+| `coreai-build` | Ferramenta do Metal Toolchain |
+| `aria2c` | Downloads acelerados e retomáveis |
+| Python 3.11–3.13 | Compatibilidade com o stack Core AI |
+| Apple Silicon | Arquitetura de execução suportada (`arm64`) |
+| Dependências do pipeline | `torch`, `transformers` e pacotes Core AI |
+| Recursos (RAM e disco) | Estimativa de espaço e memória disponíveis |
 
 ---
 
-## Ensaio recomendado
+## Execução de teste
 
-**Faça isto antes do modelo grande.** Percorre o caminho inteiro com um modelo
-pequeno em poucos minutos. Se algo estiver quebrado, você descobre agora.
+Para validar o fluxo completo e as dependências em poucos minutos usando um modelo leve:
 
 ```bash
 aguardente run HuggingFaceTB/SmolLM2-135M-Instruct \
@@ -54,42 +45,31 @@ aguardente run HuggingFaceTB/SmolLM2-135M-Instruct \
     --export-dry-run
 ```
 
-Baixa 256 MB, poda, recupera e **valida a configuração da conversão sem
-converter**. O `--export-dry-run` é o teste mais barato que existe para o
-único risco real do pipeline.
-
-Passando, repita sem a flag para produzir um `.aimodel` de verdade.
+A opção `--export-dry-run` valida os argumentos e a configuração de conversão sem executar o empacotamento completo.
 
 ---
 
 ## Os comandos
 
-### `plan` — o que vai acontecer
+### `plan` — Planejamento analítico
 
 ```bash
 aguardente plan Qwen/Qwen3-4B [--target-params 1.4e9]
 ```
 
-Não baixa um único byte. Consulta os metadados do repositório e o
-`config.json`, e a partir daí calcula tudo: distribuição de parâmetros, plano
-de poda, tamanho estimado do resultado, KV cache e RAM de treino.
+Analisa a arquitetura do modelo a partir do `config.json` e dos metadados remotos sem baixar os pesos. Exibe a distribuição de parâmetros, as dimensões sugeridas após a poda e as estimativas de memória e disco.
 
-Sem `--target-params`, o alvo é derivado da RAM da máquina.
+Caso `--target-params` não seja especificado, o alvo é sugerido com base na RAM da máquina.
 
-### `fetch` — só o download
+### `fetch` — Download isolado
 
 ```bash
 aguardente fetch Qwen/Qwen3-4B -o teacher/ [--connections 8]
 ```
 
-Usa `aria2` com várias conexões. Baixa apenas o que o pipeline consome —
-ignora READMEs, licenças e pesos em formatos alternativos. Num repositório com
-`.bin` **e** `.safetensors`, isso corta metade do tráfego.
+Baixa apenas os arquivos necessários para o modelo (configurações, tokenizers e pesos em `.safetensors`), ignorando variantes e formatos não utilizados.
 
-Idempotente: arquivos completos são pulados, truncados são retomados do ponto
-onde pararam.
-
-### `run` — tudo
+### `run` — Execução completa
 
 ```bash
 aguardente run <modelo> -o <diretório> [opções]
@@ -102,181 +82,128 @@ aguardente run <modelo> -o <diretório> [opções]
 | Calibração | `--calib-batches 32` `--batch-size 2` `--seq-len 512` `--calib-dataset` `--calib-file` |
 | Logits | `--logit-batches 256` `--top-k 128` |
 | Recuperação | `--epochs 2` `--lr 3e-5` `--alpha 0.9` `--temperature 2.0` `--grad-accum 4` |
-| Conversão | `--platform macOS` `--compression 4bit` `--max-context-length` `--export-dry-run` |
+| Exportação | `--platform macOS` `--compression 4bit` `--max-context-length` `--export-dry-run` |
 | Controle | `--device` `--measure` `--skip-recover` `--skip-export` `--skip-checks` |
 
-`--measure` mede a perplexidade em três pontos e é o que dá lastro à
-afirmação "recuperou X% da queda". Custa tempo; vale.
+A opção `--measure` calcula a perplexidade no início, pós-poda e após a recuperação para quantificar a fração recuperada.
 
-### `status` — onde parou
+### `status` — Inspeção de progresso
 
 ```bash
 aguardente status -o run/qwen3
 ```
 
+Exibe o estado das etapas registradas em `state.json`.
+
 ---
 
-## Anatomia de uma execução
+## Detalhamento do pipeline
 
 ### 1. fetch
 
-Baixa o modelo original. O tempo depende inteiramente da rede.
+Baixa os arquivos do modelo original via `aria2c`.
 
 ### 2. prune
 
-Carrega o modelo, roda alguns lotes de texto real para medir a importância de
-cada unidade, corta, e **verifica que o resultado ainda produz números
-finitos** antes de gravar. Um modelo cortado que não roda não vale a pena
-gravar.
-
-Três eixos são cortados em ordem de prioridade: neurônios do MLP, cabeças de
-atenção (em grupos GQA inteiros) e camadas inteiras.
+Carrega o modelo, avalia a importância estrutural com base em amostras reais de calibração e realiza o corte in-place dos pesos (MLP, grupos de atenção GQA e camadas). Valida que a saída após a poda permanece finita.
 
 ### 3. logits
 
-Roda o modelo original sobre o conjunto de calibração e guarda apenas as 128
-previsões mais prováveis por posição. Depois **descarrega o original da
-memória**.
-
-Por que só as 128 maiores: guardar as previsões completas para 10 mil amostras
-de 512 tokens com vocabulário de 152 mil custaria cerca de 1,4 TB. Com o
-recorte, cai para poucos GB — e a cauda descartada quase não influencia o
-resultado.
+Executa o modelo original sobre o conjunto de calibração para pré-computar os top-k logits por posição e gravá-los em shards no disco. Em seguida, libera a memória ocupada pelo modelo teacher.
 
 ### 4. recover
 
-A etapa longa. O modelo podado é treinado a reproduzir as previsões do
-original. Não está aprendendo do zero: está reencontrando um equilíbrio que a
-poda desfez, e por isso os hiperparâmetros são de ajuste fino.
-
-Para sozinha quando a melhora satura. `Ctrl-C` grava o progresso.
+Treina o modelo podado para minimizar a divergência KL em relação aos logits do teacher combinada com a entropia cruzada. O treinamento inclui verificação periódica de perda/perplexidade e parada antecipada caso haja estagnação.
 
 ### 5. export
 
-Delega ao `coreai.llm.export` da Apple. Produz um diretório com o `.aimodel`,
-o tokenizer e os metadados.
+Gera o pacote `.aimodel` chamando `coreai.llm.export` com a configuração de plataforma e compressão selecionadas.
 
 ---
 
-## Retomada
+## Retomada de execução
 
-Cada etapa grava o que produziu em `state.json`. Interromper e repetir o mesmo
-comando pula tudo que já terminou.
+O progresso é mantido no arquivo `state.json` no diretório de saída. Caso a execução seja interrompida, reiniciar o mesmo comando pula as etapas já finalizadas:
 
 ```bash
-aguardente run Qwen/Qwen3-4B -o run/qwen3 --target-params 1.4e9   # cai na etapa 4
-aguardente run Qwen/Qwen3-4B -o run/qwen3 --target-params 1.4e9   # retoma da 4
+aguardente run Qwen/Qwen3-4B -o run/qwen3 --target-params 1.4e9
 ```
 
-Uma etapa marcada como "em curso" num estado lido do disco é órfã — o processo
-anterior morreu no meio — e volta para pendente automaticamente.
-
-Estrutura da execução:
+Estrutura de arquivos gerada:
 
 ```
 run/qwen3/
-├── state.json      progresso por etapa
-├── teacher/        modelo original
-├── pruned/         modelo podado
-├── logits/         previsões pré-computadas
-├── student/        modelo recuperado
-├── ckpt/           checkpoints do treino
-└── bundle/         .aimodel final
+├── state.json      # estado e métricas das etapas
+├── teacher/        # arquivos do modelo original
+├── pruned/         # pesos e configs após poda estruturada
+├── logits/         # shards de logits pré-computados
+├── student/        # modelo recuperado após destilação
+├── ckpt/           # checkpoints de treinamento
+└── bundle/         # artefato .aimodel final
 ```
 
 ---
 
-## Quando a memória não dá
+## Otimização de memória
 
-Em ordem, do mais barato ao mais custoso em qualidade:
+Se o treinamento exceder a capacidade de memória da máquina, considere as seguintes opções:
 
-| Ajuste | Efeito |
+| Opção | Impacto |
 |---|---|
-| `--grad-accum 8` | Mesmo lote efetivo, menos memória por passo |
-| `--seq-len 256` | Ativações caem quase pela metade |
-| `--batch-size 1` | O mínimo |
-| `--target-params` menor | Modelo menor treina com menos memória |
-| `--skip-recover` | Só poda, sem treino — resultado pior, mas cabe |
-
-O `plan` avisa antecipadamente quando o estado de treino excede o orçamento.
+| `--grad-accum 8` | Mantém o tamanho efetivo de batch reduzindo a memória por passo |
+| `--seq-len 256` | Reduz o volume de ativações durante o backward pass |
+| `--batch-size 1` | Menor consumo de memória por lote |
+| `--target-params <menor>` | Gera um modelo menor, exigindo menos memória no treino |
+| `--skip-recover` | Pula a etapa de destilação de recuperação |
 
 ---
 
-## Tratamento de erros
-
-Toda mensagem de erro traz a causa e a ação sugerida. Os casos mais comuns:
+## Resolução de problemas
 
 ### Ambiente
 
-| Mensagem | Causa | Solução |
+| Sintoma | Causa provável | Ação recomendada |
 |---|---|---|
-| `Core AI exige macOS 27.0 ou superior` | Sistema antigo | Atualizar. Poda e destilação funcionam mesmo assim; só a conversão exige |
-| `coreai-build não encontrado` | Metal Toolchain ausente | `xcodebuild -downloadComponent MetalToolchain` |
-| `aria2c não encontrado` | Sem o acelerador de download | `brew install aria2` |
-| `coreai-opt exige >=3.11,<3.14` | Python errado | `uv venv --python 3.12` — o instalador já fixa isso |
-| `coreai-core só publica wheels para macOS arm64` | Mac Intel | Sem solução: o runtime não existe para Intel |
+| `Core AI exige macOS 27.0 ou superior` | Versão de sistema incompatível | Atualize o macOS para exportação de `.aimodel`. |
+| `coreai-build não encontrado` | Metal Toolchain ausente | Execute `xcodebuild -downloadComponent MetalToolchain`. |
+| `aria2c não encontrado` | Utilitário não instalado | Instale via `brew install aria2`. |
+| `coreai-opt exige >=3.11,<3.14` | Versão do Python incompatível | Crie o ambiente virtual com Python 3.12 (`uv venv --python 3.12`). |
+| `coreai-core só publica wheels para macOS arm64` | Arquitetura Intel | O runtime exige Macs com Apple Silicon. |
 
 ### Download
 
-| Mensagem | Causa | Solução |
+| Sintoma | Causa provável | Ação recomendada |
 |---|---|---|
-| `aria2c saiu com código N` | Rede caiu | Repetir o comando; retoma do ponto onde parou |
-| `N arquivo(s) incompletos após o download` | Transferência truncada | Repetir; o tamanho errado é detectado e corrigido |
-| `acesso negado` / `Modelo gated` | Licença não aceita | Aceitar na página do modelo e rodar `hf auth login` |
-| `não publica pesos em .safetensors` | Formato antigo | Não suportado; escolher outro modelo |
+| `aria2c saiu com código N` | Falha de conexão | Reexecute o comando; o download continuará do ponto atual. |
+| `N arquivo(s) incompletos após o download` | Arquivo corrompido ou truncado | Reexecute o comando para completar os arquivos ausentes. |
+| `acesso negado` / `Modelo gated` | Licença não aceita no Hub | Aceite os termos na página do modelo e execute `hf auth login`. |
+| `não publica pesos em .safetensors` | Formato não suportado | O pipeline suporta apenas modelos distribuídos em `.safetensors`. |
 
-### Poda e treino
+### Poda e treinamento
 
-| Mensagem | Causa | Solução |
+| Sintoma | Causa provável | Ação recomendada |
 |---|---|---|
-| `o modelo podado produz NaN ou Inf` | Corte agressivo demais | Alvo maior com `--target-params` |
-| `alvo é menor que o piso de poda` | Alvo abaixo do que a arquitetura permite | As embeddings sozinhas já podem exceder o alvo; escolher modelo menor |
-| `num_attention_heads não é múltiplo de num_key_value_heads` | Arquitetura fora do padrão | Não suportada |
-| `não foi possível localizar a lista de camadas` | Não é um modelo causal do formato transformers | Não suportado |
-| `MPS backend out of memory` | Sem memória | `--grad-accum 8 --seq-len 256` |
+| `o modelo podado produz NaN ou Inf` | Poda excessiva desestabilizou o modelo | Aumente o valor de `--target-params`. |
+| `alvo é menor que o piso de poda` | Alvo abaixo do limite estrutural | Escolha um modelo base menor ou eleve `--target-params`. |
+| `num_attention_heads não é múltiplo de num_key_value_heads` | Arquitetura não padrão | Incompatível com o corte em grupos GQA. |
+| `MPS backend out of memory` | Memória de GPU esgotada | Use `--grad-accum 8` e `--seq-len 256`. |
 
-### Calibração
+### Exportação
 
-| Mensagem | Causa | Solução |
+| Sintoma | Causa provável | Ação recomendada |
 |---|---|---|
-| `não foi possível carregar dados de calibração` | Rede, ou identificador de dataset mudou | `--calib-file meu.txt` com parágrafos separados por linha em branco |
-| `Repository id must be 'namespace/name'` | Identificador antigo sem namespace | Já corrigido internamente; se voltar, usar `--calib-dataset namespace/nome` |
-
-### Conversão
-
-| Mensagem | Causa | Solução |
-|---|---|---|
-| `coreai.llm.export não encontrado` | Stack Core AI ausente | Reexecutar `./install.sh` |
-| `coreai.llm.export falhou (código N)` | Ferramenta da Apple recusou a entrada | Repetir com `--export-dry-run` para ver a validação isolada |
-
-> Sobre `coreai-models`: o nome está ocupado no índice público do Python por um
-> pacote de terceiro, sem autor declarado. O pacote real da Apple existe apenas
-> no repositório oficial, e o instalador aponta para lá explicitamente. Não
-> instale `coreai-models` pelo índice público.
+| `coreai.llm.export não encontrado` | Dependência não instalada | Execute o instalador `./install.sh` ou instale o pacote correspondente. |
+| `coreai.llm.export falhou (código N)` | Parâmetros de exportação rejeitados | Execute com `--export-dry-run` para inspecionar os argumentos. |
 
 ---
 
 ## Perguntas frequentes
 
-**Poda ou quantização — qual usar?**
-As duas, nesta ordem. A quantização é gratuita: não precisa de dados nem
-treino, e corta o tamanho por cerca de 4×. Só recorra à poda quando ela
-sozinha não bastar, porque poda custa horas de treino.
+**Qual é a diferença entre poda e quantização?**
+A quantização reduz a precisão dos pesos (por exemplo, de 16 bits para 4 bits), reduzindo o tamanho em disco e a memória de inferência sem alterar a contagem de parâmetros. A poda remove parâmetros estruturalmente (linhas e colunas de matrizes e camadas inteiras). O pipeline combina poda estruturada com quantização final para maximizar a redução.
 
-**Por que o modelo podado fica pior antes de melhorar?**
-Porque é isso que acontece. A poda remove capacidade e a perplexidade sobe; a
-destilação recupera parte dela. Com `--measure` você vê os três números e
-julga se o resultado serve.
+**Por que a perplexidade sobe imediatamente após a poda?**
+A remoção de parâmetros afeta temporariamente a capacidade de representação do modelo. A etapa de destilação subsequente ajusta os pesos restantes para restaurar a qualidade.
 
-**Posso interromper?**
-Sim. `Ctrl-C` grava o estado. Repetir o comando retoma.
-
-**Preciso de GPU NVIDIA?**
-Não. O pipeline roda em Apple Silicon via MPS.
-
-**Quanto tempo demora?**
-Depende do modelo, da máquina e da rede. O download e a recuperação dominam.
-Faça o ensaio primeiro para calibrar a expectativa.
-
-**Onde fica o resultado?**
-Em `<saída>/bundle/`. Menos de 1 GB para um alvo de 1,4 B parâmetros.
+**A execução pode ser interrompida?**
+Sim. Ao interromper com `Ctrl-C`, o estado atual é salvo em `state.json` e checkpoints de treinamento são persistidos para retomada posterior.

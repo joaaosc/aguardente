@@ -1,21 +1,4 @@
-"""Dimensionamento do alvo e plano de poda.
-
-A ordem dos eixos não é arbitrária: vem da distribuição real de parâmetros.
-Num LLM causal típico o MLP é ~2/3 do total, a atenção ~1/4, e as embeddings
-o resto. Cortar onde há massa é o que dá retorno.
-
-Ordem, e a razão de cada posição:
-
-1. `intermediate_size` — maior fatia, e o corte é local: cada FFN é
-   independente. Alinhado a múltiplos de 128 para que a compressão per-block
-   não pule camadas por indivisibilidade.
-2. cabeças de atenção — em grupos GQA inteiros, nunca por cabeça solta.
-3. camadas — o corte mais brutal por parâmetro removido: descarta uma
-   transformação inteira do residual stream.
-
-`hidden_size` fica fora: podá-lo obriga a fatiar embeddings, lm_head, todas as
-projeções e normalizações de forma coerente, e é a maior fonte de bugs sutis.
-"""
+"""Cálculo do plano de redução de parâmetros por eixo."""
 
 from __future__ import annotations
 
@@ -24,13 +7,12 @@ from dataclasses import dataclass
 from .arch import Arch, count_params
 from .errors import PlanImpossible
 
-# Pisos por eixo, como fração do original. Além disto a degradação deixa de ser
-# recuperável por destilação em tempo razoável.
+# Limites mínimos de retenção por eixo (fração do original)
 FLOOR_INTERMEDIATE = 0.25
 FLOOR_KV_GROUPS = 0.50
 FLOOR_LAYERS = 0.50
 
-# Fatias do escalar de aperto t ∈ [0,1] atribuídas a cada eixo, na ordem.
+# Proporção de aplicação do fator t nos eixos
 _STAGE_INTERMEDIATE = 0.50
 _STAGE_HEADS = 0.30
 _STAGE_LAYERS = 0.20
@@ -40,7 +22,7 @@ ALIGN = 128
 
 @dataclass(frozen=True, slots=True)
 class PrunePlan:
-    """De → para, por eixo."""
+    """Definição do plano de poda com arquitetura de origem e destino."""
 
     source: Arch
     target: Arch
@@ -63,7 +45,7 @@ class PrunePlan:
         return self.source == self.target
 
     def changes(self) -> list[tuple[str, int, int]]:
-        """Eixos que mudaram, como (nome, de, para)."""
+        """Retorna os eixos alterados no formato (nome, valor_original, valor_novo)."""
         fields = ("intermediate_size", "num_attention_heads",
                   "num_key_value_heads", "num_hidden_layers")
         return [
@@ -74,7 +56,7 @@ class PrunePlan:
 
 
 def _lerp_int(hi: int, lo: int, t: float, *, align: int = 1, minimum: int = 1) -> int:
-    """Interpola de `hi` até `lo` conforme t ∈ [0,1], alinhado e com piso."""
+    """Interpolação linear inteira com alinhamento e piso."""
     t = min(1.0, max(0.0, t))
     raw = hi - (hi - lo) * t
     v = int(round(raw / align)) * align if align > 1 else int(round(raw))
@@ -82,11 +64,7 @@ def _lerp_int(hi: int, lo: int, t: float, *, align: int = 1, minimum: int = 1) -
 
 
 def shrink(a: Arch, t: float, *, align: int = ALIGN) -> Arch:
-    """Aplica um aperto t ∈ [0,1] respeitando a ordem de prioridade dos eixos.
-
-    Para t pequeno só o `intermediate_size` encolhe; as cabeças só começam a
-    cair depois que ele atinge o piso, e as camadas por último.
-    """
+    """Calcula as novas dimensões da arquitetura para um fator de redução t em [0, 1]."""
     t = min(1.0, max(0.0, t))
 
     t_int = min(1.0, t / _STAGE_INTERMEDIATE)
@@ -109,16 +87,13 @@ def shrink(a: Arch, t: float, *, align: int = ALIGN) -> Arch:
     return a.with_(
         intermediate_size=inter,
         num_key_value_heads=groups,
-        num_attention_heads=groups * a.heads_per_group,  # GQA preservado
+        num_attention_heads=groups * a.heads_per_group,  # Preserva estrutura GQA
         num_hidden_layers=layers,
     )
 
 
 def plan_for_target(a: Arch, target_params: int, *, align: int = ALIGN) -> PrunePlan:
-    """Menor aperto que atinge o alvo, por busca binária sobre t.
-
-    `shrink` é monotónico decrescente em t, então a busca é bem definida.
-    """
+    """Calcula o plano de poda para atingir a meta de parâmetros informada via busca binária."""
     if target_params <= 0:
         raise PlanImpossible("alvo de parâmetros precisa ser positivo")
 
@@ -130,8 +105,7 @@ def plan_for_target(a: Arch, target_params: int, *, align: int = ALIGN) -> Prune
         raise PlanImpossible(
             f"alvo de {target_params/1e9:.2f} B é menor que o piso de poda "
             f"({count_params(floor).total/1e9:.2f} B)",
-            hint="As embeddings sozinhas podem já exceder o alvo. Escolha um modelo "
-                 "menor, ou aceite um alvo maior.",
+            hint="As embeddings sozinhas podem já exceder o alvo. Escolha um modelo menor ou configure um alvo maior.",
         )
 
     lo, hi = 0.0, 1.0

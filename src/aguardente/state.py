@@ -1,12 +1,4 @@
-"""Estado de uma execução, para retomada.
-
-Um pipeline que baixa 7,5 GB e treina por horas não pode perder tudo num
-Ctrl-C ou numa queda de rede. Cada etapa grava o que produziu; ao retomar, o
-que já está pronto é pulado.
-
-O estado é um JSON simples e legível — dá para inspecionar e editar à mão
-quando algo dá errado, que é exatamente quando se precisa disso.
-"""
+"""Gerenciamento de estado de execução para suporte a retomada."""
 
 from __future__ import annotations
 
@@ -51,6 +43,8 @@ class StageState:
 
 @dataclass
 class RunState:
+    """Estado persistido da execução do pipeline."""
+
     run_dir: Path
     model: str = ""
     target_params: int | None = None
@@ -83,8 +77,7 @@ class RunState:
                                       metrics=v.get("metrics", {}))
                         for k, v in raw.get("stages", {}).items()},
             )
-            # Uma etapa marcada "running" num estado carregado do disco é órfã:
-            # o processo anterior morreu no meio. Volta para pendente.
+            # Reseta etapas interrompidas que ficaram salvas como "running"
             for s in state.stages.values():
                 if s.status is StageStatus.RUNNING:
                     s.status = StageStatus.PENDING
@@ -96,6 +89,7 @@ class RunState:
         return state
 
     def save(self) -> None:
+        """Grava o estado em disco de forma atômica."""
         payload = {
             "version": self.version,
             "model": self.model,
@@ -107,7 +101,7 @@ class RunState:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
-        tmp.replace(self.path)     # atômico: um Ctrl-C não deixa o estado corrompido
+        tmp.replace(self.path)
 
     # ---------------------------------------------------------------- etapas
 
@@ -115,11 +109,7 @@ class RunState:
         return self.stages.setdefault(name, StageState())
 
     def is_done(self, name: str, *, require: Sequence[str] = ()) -> bool:
-        """Concluída **e** com as saídas ainda no disco.
-
-        A segunda condição importa: alguém pode ter apagado a pasta entre
-        execuções, e confiar só no JSON produziria um erro confuso lá adiante.
-        """
+        """Verifica se a etapa foi concluída e se as saídas esperadas existem no disco."""
         s = self.stage(name)
         if not s.done:
             return False

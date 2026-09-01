@@ -1,10 +1,4 @@
-"""Interface de linha de comando.
-
-A apresentação vive em `ui.py`; aqui ficam apenas a análise de argumentos e a
-composição das saídas. Cada comando explica o que está fazendo antes de
-mostrar os números, para que alguém sem familiaridade com o assunto acompanhe
-sem precisar sair da ferramenta.
-"""
+"""Interface de linha de comando."""
 
 from __future__ import annotations
 
@@ -42,13 +36,10 @@ _STATE_MAP = {
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    ui.title("Verificação de ambiente",
-             "o que este computador precisa ter para o pipeline funcionar")
+    ui.title("Verificação de ambiente", "Diagnóstico dos requisitos do sistema")
     ui.blank()
     ui.explain(
-        "Cada item abaixo é um requisito do caminho completo. Falhar aqui custa "
-        "segundos; descobrir a mesma falta depois de baixar dezenas de gigabytes "
-        "custa uma tarde. Itens marcados como aviso não impedem o trabalho.",
+        "Verifica os pré-requisitos necessários para a execução do pipeline.",
         indent=0,
     )
     ui.blank()
@@ -65,13 +56,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     passed = len(results) - len(fails)
     if fails:
         ui.error(f"{len(fails)} de {len(results)} verificações falharam",
-                 cause="O pipeline não roda enquanto os itens marcados acima "
-                       "não estiverem resolvidos.",
-                 action="Siga a instrução ao lado de cada falha e rode "
-                        "`aguardente doctor` de novo.")
+                 cause="Existem dependências ou requisitos do sistema pendentes.",
+                 action="Siga a instrução ao lado de cada falha e execute "
+                        "`aguardente doctor` novamente.")
         return 1
     ui.done(f"{passed} de {len(results)} verificações passaram",
-            hint="Comece por `aguardente plan <modelo>` — não baixa nada.")
+            hint="Execute `aguardente plan <modelo>` para inspecionar um modelo.")
     return 0
 
 
@@ -79,21 +69,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
-    """Mostra o que vai acontecer, sem baixar nada."""
+    """Calcula o plano de poda e dimensionamento do modelo."""
     p = probe(args.model)
     a = p.arch
     b = count_params(a)
 
     ui.title(f"Plano para {p.name}",
-             "nenhum peso foi baixado — tudo abaixo vem dos metadados do modelo")
+             "Estimativas calculadas a partir dos metadados do modelo")
 
     ui.header("Modelo")
-    ui.explain(
-        "Um modelo de linguagem é uma pilha de camadas com pesos numéricos. "
-        "O total de parâmetros determina quanta memória ele exige e quão "
-        "rápido responde.",
-    )
-    ui.blank()
     ui.field("arquitetura", p.model_type or "desconhecida",
              note=f"{len(p.weight_files)} arquivo(s) de peso")
     ui.field("parâmetros", _fmt_params(p.stored_params), note=f"{p.stored_params:,}")
@@ -101,20 +85,14 @@ def cmd_plan(args: argparse.Namespace) -> int:
     if p.gated:
         ui.blank()
         ui.warn("modelo de acesso restrito",
-                "Aceite a licença na página do modelo e rode `hf auth login`.")
+                "Aceite a licença na página do modelo e execute `hf auth login`.")
 
     err = p.count_error()
     if abs(err) > 0.01:
         ui.warn(f"a contagem diverge {err:+.2%} do total publicado",
-                "A arquitetura foge do padrão esperado; o plano pode não ser confiável.")
+                "A arquitetura difere do padrão esperado; o plano pode não ser exato.")
 
-    ui.header("Onde estão os parâmetros")
-    ui.explain(
-        "Saber onde a massa se concentra é o que define o que vale a pena "
-        "cortar. Na maioria dos modelos o bloco de processamento (MLP) "
-        "domina, seguido pela atenção.",
-    )
-    ui.blank()
+    ui.header("Distribuição de parâmetros")
     ui.table(
         ["componente", "parâmetros", "fatia"],
         [(nome, _fmt_params(getattr(b, nome)), f"{fatia:.1%}")
@@ -134,13 +112,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
     m = Machine.detect()
     budget = Budget.for_machine(m)
-    ui.header("Esta máquina")
-    ui.explain(
-        "O orçamento reserva memória para o sistema operacional. Treinar exige "
-        "muito mais que apenas rodar: além dos pesos, o treino guarda "
-        "gradientes e o estado do otimizador.",
-    )
-    ui.blank()
+    ui.header("Ambiente local")
     ui.field("RAM total", f"{m.ram_bytes / GB:.0f} GB",
              note=f"orçamento de {m.usable_ram_bytes / GB:.0f} GB")
     ui.field("disco livre", f"{m.free_disk_bytes / GB:.0f} GB")
@@ -152,21 +124,13 @@ def cmd_plan(args: argparse.Namespace) -> int:
     ui.header("Plano de poda")
     if count_params(a).total <= target:
         ui.explain(
-            f"O modelo já cabe no alvo de {_fmt_params(target)} parâmetros. "
-            "Nenhuma poda é necessária — basta comprimir e converter.",
+            f"O modelo já atende ao limite de {_fmt_params(target)} parâmetros. "
+            "Nenhuma poda estruturada é necessária.",
         )
     else:
         plan = plan_for_target(a, target)
-        ui.explain(
-            "Podar remove parâmetros de verdade: neurônios do bloco de "
-            "processamento, cabeças de atenção e camadas inteiras. É diferente "
-            "de comprimir, que mantém todos os parâmetros e apenas guarda cada "
-            "um com menos bits. O que sai é escolhido por importância medida, "
-            "não por posição.",
-        )
-        ui.blank()
-        ui.field("alvo pedido", _fmt_params(target))
-        ui.field("alvo alcançável", _fmt_params(plan.target_params),
+        ui.field("alvo solicitado", _fmt_params(target))
+        ui.field("alvo calculado", _fmt_params(plan.target_params),
                  note=f"{plan.ratio:.2f}× menor")
         ui.blank()
         ui.table(
@@ -178,20 +142,20 @@ def cmd_plan(args: argparse.Namespace) -> int:
     final = plan.target if plan else a
     final_params = plan.target_params if plan else count_params(a).total
 
-    ui.header("Resultado estimado")
+    ui.header("Estimativa de recursos")
     ui.table(
         ["formato", "tamanho"],
         [("original (16 bits por peso)", _fmt_bytes(weights_bytes(final_params, BPW_FP16))),
          ("comprimido (~4,5 bits)", _fmt_bytes(weights_bytes(final_params, BPW_INT4_EMBED_FP16))),
          ("memória por 2.048 tokens", _fmt_bytes(kv_cache_bytes(final, 2048))),
          ("memória por 8.192 tokens", _fmt_bytes(kv_cache_bytes(final, 8192))),
-         ("RAM durante o treino", _fmt_bytes(training_bytes(final_params)))],
+         ("RAM estimada no treino", _fmt_bytes(training_bytes(final_params)))],
         align_right=(1,),
     )
 
     if plan and training_bytes(final_params) > budget.ram_bytes:
-        ui.warn("o treino excede a memória disponível",
-                "Use --grad-accum 8 e --seq-len 256, ou escolha um alvo maior.")
+        ui.warn("o treino pode exceder a memória disponível",
+                "Considere usar --grad-accum 8 e --seq-len 256, ou aumentar o alvo de parâmetros.")
 
     ui.blank()
     ui.rule()
@@ -209,7 +173,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
 
 def cmd_fetch(args: argparse.Namespace) -> int:
-    """Baixa um modelo, e só isso."""
+    """Executa o download dos arquivos do modelo."""
     from .fetch import fetch, plan_fetch, require_aria2
 
     require_aria2()
@@ -218,9 +182,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
     ui.title(f"Download de {args.model}")
     ui.explain(
-        "O download usa várias conexões simultâneas e é retomável: se a rede "
-        "cair, repetir o comando continua de onde parou em vez de recomeçar. "
-        "Só são baixados os arquivos que o pipeline consome.",
+        "Download dos arquivos do modelo via aria2c com suporte a retomada.",
         indent=0,
     )
     ui.blank()
@@ -228,10 +190,10 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     ui.field("tamanho total", _fmt_bytes(fp.total_bytes))
 
     if not pendentes:
-        ui.done("tudo já está em disco", hint=str(fp.dest))
+        ui.done("arquivos já estão presentes no disco", hint=str(fp.dest))
         return 0
 
-    ui.field("falta baixar", f"{len(pendentes)} arquivo(s)",
+    ui.field("pendente", f"{len(pendentes)} arquivo(s)",
              note=_fmt_bytes(fp.pending_bytes))
     ui.blank()
 
@@ -279,29 +241,27 @@ def _options_from(args: argparse.Namespace) -> RunOptions:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """O pipeline inteiro numa invocação, retomável."""
+    """Executa o pipeline completo."""
     opts = _options_from(args)
 
     ui.title(f"aguardente · {opts.model}",
-             "poda estruturada, destilação de recuperação e conversão para Core AI")
+             "Poda estruturada, destilação e conversão para Core AI")
 
     if not args.skip_checks:
         results = run_all()
         fails = blocking(results)
         if fails:
             ui.error(
-                "o ambiente não atende os requisitos",
+                "o ambiente não atende aos requisitos necessários",
                 cause="; ".join(f"{r.name}: {r.detail}" for r in fails),
-                action="Rode `aguardente doctor` para ver a correção de cada item. "
-                       "Para ignorar por sua conta e risco, use --skip-checks.",
+                action="Execute `aguardente doctor` para ver instruções de correção, "
+                       "ou use --skip-checks para prosseguir sem validação.",
             )
             return 1
 
     ui.blank()
     ui.explain(
-        "O trabalho acontece em cinco etapas, e cada uma grava o que produziu. "
-        "Se algo falhar ou você interromper, repetir o mesmo comando retoma de "
-        "onde parou em vez de recomeçar.",
+        "O pipeline é executado em etapas com persistência de estado em disco.",
         indent=0,
     )
     ui.blank()
@@ -328,21 +288,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     mostrar = {k: v for k, v in ctx.metrics.items()
                if k.startswith("ppl") or k in ("recovered_fraction", "bundle_bytes")}
     if mostrar:
-        ui.header("Qualidade")
-        ui.explain(
-            "Perplexidade mede o quanto o modelo se surpreende com um texto "
-            "real: quanto menor, melhor. A poda faz o número subir; a "
-            "recuperação traz parte dele de volta.",
-        )
-        ui.blank()
+        ui.header("Métricas de qualidade")
         linhas = []
-        rotulos = {"ppl_teacher": "modelo original", "ppl_pruned": "depois da poda",
-                   "ppl_recovered": "depois da recuperação"}
+        rotulos = {"ppl_teacher": "modelo original", "ppl_pruned": "após poda",
+                   "ppl_recovered": "após recuperação"}
         for chave, rotulo in rotulos.items():
             if chave in ctx.metrics:
                 linhas.append((rotulo, f"{ctx.metrics[chave]:.2f}"))
         if linhas:
-            ui.table(["momento", "perplexidade"], linhas, align_right=(1,))
+            ui.table(["etapa", "perplexidade"], linhas, align_right=(1,))
         if "recovered_fraction" in ctx.metrics:
             ui.blank()
             ui.field("queda recuperada", f"{ctx.metrics['recovered_fraction']:.1%}")
@@ -356,7 +310,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         ui.done("pipeline concluído", hint=str(bundle))
         ui.blank()
         ui.command(f'swift run -c release llm-runner --model {bundle} --prompt "Olá"',
-                   label="para experimentar o modelo")
+                   label="para testar o modelo gerado")
     else:
         ui.done(f"pipeline concluído em {_fmt_seconds(total)}",
                 hint=str(opts.out_dir))
@@ -367,14 +321,14 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    """Onde uma execução parou."""
+    """Exibe o estado de uma execução existente."""
     from .state import RunState
 
     d = Path(args.out).expanduser()
     if not (d / "state.json").is_file():
         ui.error(f"nenhuma execução encontrada em {d}",
                  cause="O arquivo state.json não existe neste diretório.",
-                 action="Confira o caminho, ou inicie uma execução com "
+                 action="Verifique o caminho ou inicie uma execução com "
                         "`aguardente run <modelo> -o <diretório>`.")
         return 1
 
@@ -395,10 +349,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     pendentes = [n for n, s, _ in st.summary() if s.value not in ("ok", "skipped")]
     ui.blank()
     if pendentes:
-        ui.note(f"faltam: {', '.join(pendentes)}")
+        ui.note(f"etapas pendentes: {', '.join(pendentes)}")
         ui.command(f"aguardente run {st.model} -o {d}", label="para retomar")
     else:
-        ui.done("todas as etapas concluídas")
+        ui.done("todas as etapas foram concluídas")
     return 0
 
 
@@ -406,18 +360,18 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def _add_pipeline_args(p: argparse.ArgumentParser) -> None:
-    """Opções partilhadas entre `run` e os comandos de etapa."""
+    """Argumentos compartilhados do pipeline."""
     p.add_argument("--target-params", type=lambda s: int(float(s)),
-                   help="alvo de parâmetros (ex.: 1.4e9). Padrão: o que cabe na RAM")
+                   help="alvo de parâmetros (ex.: 1.4e9). Padrão: baseado na RAM disponível")
     p.add_argument("--connections", type=int, default=8,
-                   help="conexões por servidor no aria2c")
+                   help="número de conexões por servidor no aria2c")
     p.add_argument("--concurrent", type=int, default=4,
-                   help="downloads simultâneos no aria2c")
+                   help="número de downloads simultâneos no aria2c")
     p.add_argument("--calib-batches", type=int, default=32)
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--seq-len", type=int, default=512)
     p.add_argument("--calib-dataset", help="dataset de calibração (namespace/name)")
-    p.add_argument("--calib-file", help="arquivo .txt local, parágrafos separados por linha em branco")
+    p.add_argument("--calib-file", help="arquivo .txt local com amostras separadas por linha em branco")
     p.add_argument("--logit-batches", type=int, default=256)
     p.add_argument("--top-k", type=int, default=128)
     p.add_argument("--epochs", type=int, default=2)
@@ -432,10 +386,10 @@ def _add_pipeline_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--compute-precision", default="float16")
     p.add_argument("--max-context-length", type=int)
     p.add_argument("--export-dry-run", action="store_true",
-                   help="valida a configuração do export sem converter")
-    p.add_argument("--device", help="mps, cpu (padrão: detecta)")
+                   help="valida argumentos de exportação sem converter o modelo")
+    p.add_argument("--device", help="dispositivo de execução (mps, cpu)")
     p.add_argument("--measure", action="store_true",
-                   help="mede perplexidade em três pontos (custa tempo, vale a pena)")
+                   help="avalia a perplexidade durante as etapas do pipeline")
     p.add_argument("--skip-recover", action="store_true")
     p.add_argument("--skip-export", action="store_true")
 
@@ -443,35 +397,35 @@ def _add_pipeline_args(p: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="aguardente",
-        description="Poda estruturada, destilação de recuperação e conversão para Core AI.",
+        description="Poda estruturada, destilação e conversão para Core AI.",
     )
     p.add_argument("--version", action="version", version=f"aguardente {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
 
-    d = sub.add_parser("doctor", help="verifica o ambiente")
+    d = sub.add_parser("doctor", help="verifica o ambiente e dependências")
     d.set_defaults(func=cmd_doctor)
 
-    pl = sub.add_parser("plan", help="sonda um modelo e monta o plano, sem baixar pesos")
+    pl = sub.add_parser("plan", help="inspeciona o modelo e calcula o plano de poda sem baixar pesos")
     pl.add_argument("model", help="identificador do Hugging Face ou diretório local")
     pl.add_argument("--target-params", type=lambda s: int(float(s)))
     pl.set_defaults(func=cmd_plan)
 
-    ft = sub.add_parser("fetch", help="baixa um modelo com aria2c (retomável)")
+    ft = sub.add_parser("fetch", help="baixa os arquivos do modelo via aria2c")
     ft.add_argument("model", help="identificador do Hugging Face")
     ft.add_argument("-o", "--out", required=True, help="diretório de destino")
     ft.add_argument("--connections", type=int, default=8)
     ft.add_argument("--concurrent", type=int, default=4)
     ft.set_defaults(func=cmd_fetch)
 
-    rn = sub.add_parser("run", help="pipeline completo: baixa, poda, recupera, converte")
+    rn = sub.add_parser("run", help="executa o pipeline completo (download, poda, recuperação e conversão)")
     rn.add_argument("model", help="identificador do Hugging Face ou diretório local")
     rn.add_argument("-o", "--out", required=True, help="diretório da execução")
     rn.add_argument("--skip-checks", action="store_true",
-                    help="ignora as verificações de ambiente")
+                    help="ignora verificações de pré-requisitos de ambiente")
     _add_pipeline_args(rn)
     rn.set_defaults(func=cmd_run)
 
-    st = sub.add_parser("status", help="mostra o estado de uma execução")
+    st = sub.add_parser("status", help="exibe o estado e progresso de uma execução")
     st.add_argument("-o", "--out", required=True, help="diretório da execução")
     st.set_defaults(func=cmd_status)
 
@@ -486,8 +440,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nerro: {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("\ninterrompido — o estado foi gravado; use `aguardente run` de novo "
-              "para retomar", file=sys.stderr)
+        print("\nexecução interrompida pelo usuário — estado salvo para retomada", file=sys.stderr)
         return 130
 
 

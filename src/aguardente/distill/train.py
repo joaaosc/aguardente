@@ -1,19 +1,4 @@
-"""Loop de recuperação.
-
-O student aqui **não aprende do zero** — reencontra um equilíbrio que a poda
-desfez. Isso muda os hiperparâmetros: taxa de aprendizado baixa (é ajuste fino),
-`alpha` alto (o sinal do teacher vale mais que os rótulos), poucas épocas.
-
-|                | recuperação | destilação do zero |
-|----------------|-------------|--------------------|
-| alpha          | 0,9         | 0,7                |
-| temperatura    | 2,0         | 4,0                |
-| learning rate  | 1e-5…5e-5   | 1e-4…1e-3          |
-| épocas         | 1–3         | 10+                |
-
-A parada é por platô, não por contagem de épocas: os pesos já eram bons, então
-o ganho satura cedo e treinar além disso gasta horas sem retorno.
-"""
+"""Treinamento de recuperação via destilação de logits."""
 
 from __future__ import annotations
 
@@ -33,6 +18,8 @@ if TYPE_CHECKING:  # pragma: no cover
 
 @dataclass(frozen=True, slots=True)
 class RecoveryConfig:
+    """Hiperparâmetros e configurações do treino de recuperação."""
+
     epochs: int = 2
     learning_rate: float = 3e-5
     weight_decay: float = 0.01
@@ -42,15 +29,13 @@ class RecoveryConfig:
     max_grad_norm: float = 1.0
     warmup_fraction: float = 0.03
     gradient_checkpointing: bool = True
-    eval_every: int = 0            # 0 = duas vezes por época
-    plateau_threshold: float = 0.005   # ganho relativo mínimo para continuar
+    eval_every: int = 0
+    plateau_threshold: float = 0.005
     plateau_patience: int = 2
     max_seconds: float | None = None
 
 
-# O histórico de perdas serve para inspeção, não para o treino. Num treino de
-# horas seriam centenas de milhares de floats retidos sem proveito, então
-# guarda-se uma janela recente de tamanho fixo.
+# Janela máxima de histórico de perdas mantida em memória
 _MAX_LOSS_HISTORY = 2000
 
 
@@ -60,7 +45,7 @@ class RecoveryResult:
     epochs_completed: int = 0
     seconds: float = 0.0
     losses: list[float] = field(default_factory=list)
-    evals: list[tuple[int, float]] = field(default_factory=list)   # (passo, perplexidade)
+    evals: list[tuple[int, float]] = field(default_factory=list)
     stopped_by: str = "epochs"
 
     @property
@@ -78,7 +63,6 @@ def _build_optimizer(model: Any, cfg: RecoveryConfig) -> Any:
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        # Normas e biases não recebem weight decay — encolhê-los distorce a escala.
         (no_decay if p.ndim <= 1 or "norm" in name.lower() else decay).append(p)
     return torch.optim.AdamW(
         [{"params": decay, "weight_decay": cfg.weight_decay},
@@ -88,8 +72,7 @@ def _build_optimizer(model: Any, cfg: RecoveryConfig) -> Any:
 
 
 def _lr_at(step: int, total: int, cfg: RecoveryConfig) -> float:
-    """Warmup linear curto e depois cosseno. Warmup evita que os primeiros
-    passos, ainda com momentos zerados, desloquem os pesos herdados."""
+    """Calcula a taxa de aprendizado com warmup linear e decaimento por cosseno."""
     warmup = max(1, int(total * cfg.warmup_fraction))
     if step < warmup:
         return cfg.learning_rate * step / warmup
@@ -107,11 +90,7 @@ def recover(
     on_step: Callable[[int, float], None] | None = None,
     checkpoint_dir: str | Path | None = None,
 ) -> RecoveryResult:
-    """Treina o student contra os logits pré-computados do teacher.
-
-    `evaluate` devolve uma métrica onde **menor é melhor** (perplexidade). É o
-    que alimenta a parada por platô; sem ela o loop roda as épocas todas.
-    """
+    """Executa o treinamento de recuperação do student contra os logits do teacher."""
     import torch
 
     cfg = cfg or RecoveryConfig()
@@ -121,8 +100,6 @@ def recover(
     if cfg.gradient_checkpointing and hasattr(student, "gradient_checkpointing_enable"):
         student.gradient_checkpointing_enable()
         if hasattr(student, "config"):
-            # Sem isto o checkpointing entra em conflito com o cache e o
-            # transformers emite um aviso a cada passo.
             student.config.use_cache = False
 
     optimizer = _build_optimizer(student, cfg)
@@ -206,13 +183,7 @@ def _finish(result: RecoveryResult, started: float, student: Any,
 
 
 def _save_checkpoint(student: Any, ckpt: Path, step: int, metric: float) -> None:
-    """Grava o melhor checkpoint de forma atômica.
-
-    Escrever direto sobre `best.pt` significa que uma interrupção no meio da
-    gravação destrói o único checkpoint bom que existia — justamente quando
-    ele mais importa. Grava-se ao lado e renomeia-se, que é atômico no mesmo
-    sistema de arquivos.
-    """
+    """Grava o melhor checkpoint em disco de forma atômica."""
     import torch
 
     destino = ckpt / "best.pt"

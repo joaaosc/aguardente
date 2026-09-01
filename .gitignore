@@ -8,7 +8,9 @@ dist/
 build/
 
 # saídas de execução: modelos, logits, bundles
+run/
 runs/
+ensaio/
 outputs/
 exports/
 

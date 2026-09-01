@@ -1,8 +1,4 @@
-"""Aritmética de arquitetura: onde os parâmetros de um LLM causal realmente estão.
-
-Puro — sem torch, sem rede. Tudo aqui deriva do `config.json` do Hugging Face,
-e é o que permite planejar a poda antes de baixar qualquer peso.
-"""
+"""Cálculo analítico da contagem de parâmetros a partir do config do modelo."""
 
 from __future__ import annotations
 
@@ -14,7 +10,7 @@ from .errors import UnsupportedArchitecture
 
 @dataclass(frozen=True, slots=True)
 class Arch:
-    """As dimensões que importam para contar parâmetros e podar."""
+    """Dimensões estruturais para contagem de parâmetros e cálculo de poda."""
 
     hidden_size: int
     intermediate_size: int
@@ -24,12 +20,12 @@ class Arch:
     head_dim: int
     vocab_size: int
     tie_word_embeddings: bool = True
-    # Alguns modelos (Qwen3) aplicam RMSNorm por cabeça em q e k.
+    # Modelos como Qwen3 aplicam RMSNorm por cabeça em q e k.
     qk_norm: bool = False
 
     @property
     def heads_per_group(self) -> int:
-        """Quantas cabeças de query cada cabeça KV serve (GQA)."""
+        """Número de cabeças de query por grupo de chave/valor (GQA)."""
         return self.num_attention_heads // self.num_key_value_heads
 
     def __post_init__(self) -> None:
@@ -37,25 +33,22 @@ class Arch:
             raise UnsupportedArchitecture(
                 f"num_attention_heads ({self.num_attention_heads}) não é múltiplo de "
                 f"num_key_value_heads ({self.num_key_value_heads})",
-                hint="A poda de cabeças anda em grupos GQA inteiros; sem essa divisão "
-                     "exata não há como cortar sem quebrar o agrupamento.",
+                hint="A poda de cabeças requer divisão exata de grupos GQA.",
             )
 
     @classmethod
     def from_hf_config(cls, cfg: dict[str, Any]) -> Arch:
-        """Extrai do config.json, tolerando os campos que algumas famílias omitem."""
+        """Extrai dimensões a partir do config.json."""
         try:
             hidden = int(cfg["hidden_size"])
             heads = int(cfg["num_attention_heads"])
         except KeyError as exc:
             raise UnsupportedArchitecture(
                 f"config.json não expõe {exc.args[0]!r}",
-                hint="Só arquiteturas de LLM causal no formato transformers são suportadas.",
+                hint="São suportadas apenas arquiteturas de LLM causal no formato transformers.",
             ) from exc
 
-        # head_dim costuma ser omitido quando é simplesmente hidden / heads.
         head_dim = int(cfg.get("head_dim") or hidden // heads)
-        # Sem GQA, num_key_value_heads == num_attention_heads.
         n_kv = int(cfg.get("num_key_value_heads") or heads)
 
         return cls(
@@ -71,7 +64,7 @@ class Arch:
         )
 
     def with_(self, **changes: int) -> Arch:
-        """Cópia com dimensões trocadas — usado pelo planejador de poda."""
+        """Retorna cópia com dimensões alteradas."""
         return replace(self, **changes)
 
 
@@ -105,16 +98,10 @@ class Breakdown:
 
 
 def count_params(a: Arch) -> Breakdown:
-    """Conta parâmetros por componente.
+    """Calcula a distribuição de parâmetros por componente estrutural.
 
-    Modelo de referência: blocos no estilo Llama/Qwen — atenção com projeções
-    q/k/v/o (GQA quando num_key_value_heads < num_attention_heads), MLP com
-    gate/up/down, e dois RMSNorm por camada mais um final.
-
-    Conta o modelo **lógico**: com embeddings atadas, o lm_head não soma. Para o
-    que ocupa disco, use `count_stored()` — não é a mesma grandeza.
-
-    Não inclui biases (a maioria destas famílias não usa).
+    Baseado na arquitetura padrão de LLMs causais (atenção com projeções
+    q/k/v/o e suporte a GQA, MLP com gate/up/down e camadas de normalização).
     """
     q_out = a.num_attention_heads * a.head_dim
     kv_out = a.num_key_value_heads * a.head_dim
@@ -127,7 +114,7 @@ def count_params(a: Arch) -> Breakdown:
     )
     mlp_per_layer = 3 * a.hidden_size * a.intermediate_size  # gate + up + down
 
-    # RMSNorm por cabeça em q e k (Qwen3): head_dim cada, por camada.
+    # RMSNorm por cabeça em q e k (Qwen3)
     qk = 2 * a.head_dim * a.num_hidden_layers if a.qk_norm else 0
 
     embeddings = a.vocab_size * a.hidden_size
@@ -141,11 +128,9 @@ def count_params(a: Arch) -> Breakdown:
 
 
 def count_stored(a: Arch, *, lm_head_materialized: bool) -> int:
-    """Parâmetros gravados em disco — o que determina download e tamanho do arquivo.
+    """Contagem de parâmetros gravados em disco.
 
-    Diverge da contagem lógica num ponto que o `config.json` não permite prever:
-    alguns modelos gravam `lm_head.weight` mesmo declarando `tie_word_embeddings`
-    (o Qwen3-0.6B faz isso; o SmolLM2-135M não). Só o índice de tensores diz.
+    Leva em conta se a camada lm_head foi materializada como tensor independente.
     """
     total = count_params(a).total
     if a.tie_word_embeddings and lm_head_materialized:
@@ -154,11 +139,7 @@ def count_stored(a: Arch, *, lm_head_materialized: bool) -> int:
 
 
 def reconcile(a: Arch, reported_total: int | None, *, lm_head_materialized: bool = False) -> float | None:
-    """Erro relativo entre a contagem em disco e o total que o Hugging Face reporta.
-
-    Sanidade do planejamento: erro acima de ~1% significa que a arquitetura foge
-    do modelo de referência e o plano de poda não é confiável.
-    """
+    """Calcula o erro relativo entre a contagem calculada e o total reportado pelo modelo."""
     if not reported_total:
         return None
     counted = count_stored(a, lm_head_materialized=lm_head_materialized)

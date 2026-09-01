@@ -1,4 +1,4 @@
-"""Poda estruturada de LLMs causais no formato transformers."""
+"""Módulo de poda estruturada de LLMs causais."""
 
 from .surgery import PruneReport, prune_model
 from .scoring import Scores, score_model

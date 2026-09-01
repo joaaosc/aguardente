@@ -1,18 +1,4 @@
-"""Pontuação de importância.
-
-Que fatia cortar não é arbitrário: mede-se a contribuição de cada unidade num
-conjunto de calibração pequeno. Três granularidades, uma por eixo de poda.
-
-* **Neurónios do MLP** — norma L2 média da ativação que entra em `down_proj`.
-  Um neurónio que quase nunca dispara contribui quase nada para a saída.
-* **Grupos KV** — norma L2 média da saída de `v_proj`, agregada por grupo.
-  Como a poda anda em grupos GQA inteiros, a pontuação também.
-* **Camadas** — *block influence*: `1 - cos(entrada, saída)`. Um bloco que
-  quase não altera o residual stream é candidato natural a sair.
-
-Poucos lotes bastam. O sinal aqui é grosseiro por natureza — o objetivo é
-distinguir o irrelevante do essencial, não ordenar com precisão cirúrgica.
-"""
+"""Cálculo de importância para poda estruturada."""
 
 from __future__ import annotations
 
@@ -28,29 +14,22 @@ if TYPE_CHECKING:  # pragma: no cover
 
 @dataclass(slots=True)
 class Scores:
-    """Importância por unidade. Maior é mais importante."""
+    """Métricas de importância por componente."""
 
     ffn: "torch.Tensor"        # [intermediate_size]
     kv_groups: "torch.Tensor"  # [num_key_value_heads]
     layers: "torch.Tensor"     # [num_hidden_layers]
 
     def top_ffn(self, k: int) -> "torch.Tensor":
-        """Índices dos k neurónios mais importantes, em ordem crescente.
-
-        A ordem importa: fatiar com índices ordenados preserva a estrutura
-        espacial dos pesos e mantém o resultado determinístico.
-        """
+        """Retorna os índices ordenados dos k neurônios intermediários mais importantes."""
         return self.ffn.topk(k).indices.sort().values
 
     def top_kv_groups(self, k: int) -> list[int]:
+        """Retorna os índices dos k grupos KV mais importantes."""
         return sorted(self.kv_groups.topk(k).indices.tolist())
 
     def keep_layers(self, k: int, *, protect: set[int] | None = None) -> list[int]:
-        """Camadas a manter, sempre incluindo as protegidas.
-
-        Primeira e última são protegidas por omissão: camadas de fronteira são
-        desproporcionalmente sensíveis.
-        """
+        """Retorna os índices das k camadas a manter, preservando as camadas protegidas."""
         import torch
 
         n = len(self.layers)
@@ -70,11 +49,7 @@ def score_model(
     *,
     max_batches: int = 16,
 ) -> Scores:
-    """Mede importância rodando alguns lotes de calibração pelo modelo.
-
-    `batches` produz kwargs para `model(**batch)` — tipicamente
-    `{"input_ids": ..., "attention_mask": ...}`.
-    """
+    """Calcula os scores de importância a partir de ativações em lotes de calibração."""
     import torch
 
     layers = _find_layers(model)
@@ -87,7 +62,6 @@ def score_model(
     handles: list[Any] = []
 
     def _hook_down_proj(_m: Any, inputs: tuple, _out: Any) -> None:
-        """A entrada de down_proj é a ativação por neurónio intermediário."""
         nonlocal ffn_acc
         x = inputs[0].detach().float()
         v = x.reshape(-1, x.shape[-1]).pow(2).mean(0).sqrt().cpu()

@@ -1,4 +1,4 @@
-"""O planejador precisa respeitar a ordem dos eixos, os pisos e o GQA."""
+"""Testes do planejador de poda e cálculo de dimensões."""
 
 import pytest
 
@@ -16,7 +16,6 @@ def test_no_shrink_at_zero():
 
 
 def test_mlp_shrinks_before_heads_and_layers():
-    """Aperto leve so pode mexer no intermediate_size."""
     s = shrink(QWEN3_4B, 0.20)
     assert s.intermediate_size < QWEN3_4B.intermediate_size
     assert s.num_key_value_heads == QWEN3_4B.num_key_value_heads
@@ -24,7 +23,6 @@ def test_mlp_shrinks_before_heads_and_layers():
 
 
 def test_layers_shrink_last():
-    """Camadas so caem depois que os outros dois eixos ja apertaram."""
     mid = shrink(QWEN3_4B, 0.70)
     assert mid.num_hidden_layers == QWEN3_4B.num_hidden_layers
     deep = shrink(QWEN3_4B, 0.95)
@@ -32,7 +30,6 @@ def test_layers_shrink_last():
 
 
 def test_gqa_preserved_at_every_step():
-    """Sem esta invariante o agrupamento quebra e o modelo nao roda."""
     for i in range(101):
         s = shrink(QWEN3_4B, i / 100)
         assert s.num_attention_heads % s.num_key_value_heads == 0
@@ -40,13 +37,11 @@ def test_gqa_preserved_at_every_step():
 
 
 def test_intermediate_stays_aligned():
-    """Desalinhamento faz a compressao per-block pular camadas em silencio."""
     for i in range(101):
         assert shrink(QWEN3_4B, i / 100).intermediate_size % ALIGN == 0
 
 
 def test_monotonic_in_t():
-    """A busca binaria depende desta monotonicidade."""
     counts = [count_params(shrink(QWEN3_4B, i / 50)).total for i in range(51)]
     assert all(a >= b for a, b in zip(counts, counts[1:]))
 
@@ -67,7 +62,7 @@ def test_target_above_source_is_noop():
 
 def test_impossible_target_raises_with_hint():
     with pytest.raises(PlanImpossible) as e:
-        plan_for_target(QWEN3_4B, 100_000_000)   # abaixo so das embeddings
+        plan_for_target(QWEN3_4B, 100_000_000)
     assert e.value.hint
 
 

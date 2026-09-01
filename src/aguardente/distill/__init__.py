@@ -1,4 +1,4 @@
-"""Destilação de recuperação: devolver ao modelo podado o que o corte tirou."""
+"""Módulo de destilação de recuperação."""
 
 from .loss import kd_loss
 from .teacher import TeacherLogits, precompute_logits

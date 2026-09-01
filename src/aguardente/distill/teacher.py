@@ -1,12 +1,4 @@
-"""Pré-computação dos logits do teacher.
-
-O teacher só faz forward, sempre sob `no_grad`. Mantê-lo residente durante
-várias épocas paga a memória dele N vezes pelos mesmos números — e em máquina
-pequena essa memória é justamente o que falta.
-
-Fazendo o forward uma vez e guardando o top-k em disco, o pico de RAM passa a
-ser `max(teacher, student)` em vez de `teacher + student`.
-"""
+"""Geração e leitura de shards de logits do modelo teacher."""
 
 from __future__ import annotations
 
@@ -24,7 +16,7 @@ _MANIFEST = "manifest.json"
 
 @dataclass(frozen=True, slots=True)
 class TeacherLogits:
-    """Um diretório de shards com o top-k do teacher."""
+    """Gerenciador de shards de logits pré-computados."""
 
     path: Path
     top_k: int
@@ -40,13 +32,10 @@ class TeacherLogits:
                    samples=meta["samples"], seq_len=meta["seq_len"])
 
     def batches(self, *, device: str | None = None) -> Iterator[dict[str, "torch.Tensor"]]:
-        """Itera os shards gravados, na ordem."""
+        """Itera sobre os shards armazenados em ordem."""
         import torch
 
         for i in range(self.shards):
-            # weights_only=True recusa pickles arbitrários: `torch.load` sem
-            # esta restrição executa código durante a desserialização, e estes
-            # shards podem vir de um backup ou de outra máquina.
             blob = torch.load(self.path / f"{i:06d}.pt", map_location="cpu",
                               weights_only=True)
             if device:
@@ -54,16 +43,13 @@ class TeacherLogits:
             yield blob
 
     def estimated_bytes(self) -> int:
-        """valores fp16 + índices int32, por token."""
+        """Estimativa de bytes para valores fp16 e índices int32 por token."""
         return self.samples * self.seq_len * self.top_k * (2 + 4)
 
 
 def estimate_logit_bytes(samples: int, seq_len: int, *, top_k: int = DEFAULT_TOP_K,
                          vocab_size: int | None = None) -> tuple[int, int | None]:
-    """Bytes com top-k e, para comparação, com o vocabulário completo.
-
-    A segunda grandeza é o que torna óbvio por que o top-k não é opcional.
-    """
+    """Estima o espaço em disco necessário para armazenamento dos logits."""
     topk_bytes = samples * seq_len * top_k * (2 + 4)
     full_bytes = samples * seq_len * vocab_size * 2 if vocab_size else None
     return topk_bytes, full_bytes
@@ -77,11 +63,7 @@ def precompute_logits(
     top_k: int = DEFAULT_TOP_K,
     on_progress: Any = None,
 ) -> TeacherLogits:
-    """Roda o teacher e grava o top-k por lote.
-
-    Grava um shard por lote — retomar uma corrida interrompida é só pular os
-    shards que já existem.
-    """
+    """Executa o modelo teacher e grava os top-k logits em shards por lote."""
     import torch
 
     out = Path(out_dir)

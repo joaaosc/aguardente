@@ -1,15 +1,4 @@
-"""Sondagem de um modelo antes de baixar os pesos.
-
-Duas fontes, ambas baratas:
-
-* `api/models/<id>` — contagem exata de parâmetros (`safetensors.total`), tags,
-  se é gated, e a lista de arquivos.
-* o **cabeçalho** do `.safetensors` — via Range request de poucos KB. Dá os
-  nomes reais dos tensores, e é a única forma de saber se `lm_head.weight`
-  está materializado (o `config.json` não permite prever isso).
-
-Sem torch, sem transformers, sem baixar pesos.
-"""
+"""Inspeção de metadados e estrutura do modelo antes do download completo."""
 
 from __future__ import annotations
 
@@ -26,13 +15,13 @@ from .errors import ProbeError
 
 _HF = "https://huggingface.co"
 _TIMEOUT = 30
-_MAX_HEADER = 64 * 1024 * 1024  # sanidade: cabeçalho de safetensors não passa disso
-_MAX_JSON = 8 * 1024 * 1024     # respostas de metadados são pequenas
+_MAX_HEADER = 64 * 1024 * 1024
+_MAX_JSON = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
 class ModelProbe:
-    """Tudo o que se sabe sobre um modelo sem ter baixado um peso."""
+    """Metadados e estrutura identificados na sondagem do modelo."""
 
     ref: str
     arch: Arch
@@ -54,7 +43,7 @@ class ModelProbe:
         return self.stored_params * 2
 
     def count_error(self) -> float:
-        """Erro relativo da fórmula analítica contra o total real. Sanidade."""
+        """Erro relativo entre o cálculo analítico e o total real de parâmetros."""
         counted = count_stored(self.arch, lm_head_materialized=self.lm_head_materialized)
         return (counted - self.stored_params) / self.stored_params
 
@@ -64,7 +53,7 @@ def _get_json(url: str) -> dict[str, Any]:
         with urllib.request.urlopen(url, timeout=_TIMEOUT) as r:
             bruto = r.read(_MAX_JSON + 1)
             if len(bruto) > _MAX_JSON:
-                raise ProbeError(f"resposta de {url} excede o limite razoável")
+                raise ProbeError(f"resposta de {url} excede o limite máximo permitido")
             return json.loads(bruto)
     except urllib.error.HTTPError as e:
         if e.code == 401:
@@ -73,23 +62,19 @@ def _get_json(url: str) -> dict[str, Any]:
                 hint="Modelo gated. Aceite a licença na página do Hugging Face e rode `hf auth login`.",
             ) from e
         if e.code == 404:
-            raise ProbeError(f"não encontrado: {url}", hint="Confira o identificador.") from e
+            raise ProbeError(f"não encontrado: {url}", hint="Confira o identificador informado.") from e
         raise ProbeError(f"HTTP {e.code} em {url}") from e
     except (urllib.error.URLError, TimeoutError) as e:
         raise ProbeError(f"falha de rede em {url}: {e}") from e
 
 
 def read_safetensors_header(url_or_path: str) -> dict[str, Any]:
-    """Lê só o cabeçalho de um `.safetensors`.
-
-    Formato: 8 bytes u64 little-endian com o tamanho do JSON, depois o JSON.
-    Remoto usa Range request — transferem-se KB, não GB.
-    """
+    """Lê o cabeçalho JSON de um arquivo .safetensors (local ou remoto via Range)."""
     if not url_or_path.startswith("http"):
         with open(url_or_path, "rb") as f:
             n = struct.unpack("<Q", f.read(8))[0]
             if n > _MAX_HEADER:
-                raise ProbeError(f"cabeçalho implausível ({n} bytes) em {url_or_path}")
+                raise ProbeError(f"tamanho de cabeçalho inválido ({n} bytes) em {url_or_path}")
             return json.loads(f.read(n))
 
     def _range(a: int, b: int) -> bytes:
@@ -100,14 +85,14 @@ def read_safetensors_header(url_or_path: str) -> dict[str, Any]:
     try:
         n = struct.unpack("<Q", _range(0, 7))[0]
         if n > _MAX_HEADER:
-            raise ProbeError(f"cabeçalho implausível ({n} bytes)")
+            raise ProbeError(f"tamanho de cabeçalho inválido ({n} bytes)")
         return json.loads(_range(8, 8 + n - 1))
     except (urllib.error.URLError, TimeoutError, struct.error, json.JSONDecodeError) as e:
         raise ProbeError(f"não foi possível ler o cabeçalho de {url_or_path}: {e}") from e
 
 
 def _summarize_tensors(header: dict[str, Any]) -> tuple[int, bool, tuple[str, ...]]:
-    """Total de parâmetros, se lm_head existe, e os nomes — do cabeçalho."""
+    """Extrai contagem de parâmetros, presença de lm_head e nomes dos tensores do cabeçalho."""
     header = {k: v for k, v in header.items() if k != "__metadata__"}
     total = 0
     for meta in header.values():
@@ -120,14 +105,13 @@ def _summarize_tensors(header: dict[str, Any]) -> tuple[int, bool, tuple[str, ..
 
 
 def probe_local(path: str | Path) -> ModelProbe:
-    """Sonda um diretório local no formato transformers."""
+    """Inspeciona os metadados de um modelo em diretório local."""
     d = Path(path).expanduser().resolve()
     cfg_path = d / "config.json"
     if not cfg_path.is_file():
         raise ProbeError(
             f"{d} não contém config.json",
-            hint="O diretório precisa da estrutura padrão do transformers: "
-                 "config.json, os pesos (.safetensors) e o tokenizer.",
+            hint="O diretório precisa conter a estrutura padrão: config.json, arquivos .safetensors e tokenizer.",
         )
     cfg = json.loads(cfg_path.read_text())
     arch = Arch.from_hf_config(cfg)
@@ -156,7 +140,7 @@ def probe_local(path: str | Path) -> ModelProbe:
 
 
 def probe_hub(model_id: str) -> ModelProbe:
-    """Sonda um modelo do Hugging Face sem baixar pesos."""
+    """Inspeciona os metadados de um modelo no Hugging Face Hub sem baixar pesos."""
     from .fetch import validate_model_id
 
     validate_model_id(model_id)
@@ -176,7 +160,6 @@ def probe_hub(model_id: str) -> ModelProbe:
 
     reported = (api.get("safetensors") or {}).get("total")
 
-    # Um shard basta para saber se lm_head existe; a contagem vem da API.
     has_lm_head = False
     names: tuple[str, ...] = ()
     try:
@@ -185,7 +168,7 @@ def probe_hub(model_id: str) -> ModelProbe:
         if reported is None:
             reported = shard_total if len(files) == 1 else None
     except ProbeError:
-        pass  # sem o cabeçalho ainda dá para planejar; só perde-se precisão
+        pass
 
     if reported is None:
         raise ProbeError(
@@ -207,7 +190,7 @@ def probe_hub(model_id: str) -> ModelProbe:
 
 
 def probe(ref: str) -> ModelProbe:
-    """Sonda um identificador do Hugging Face ou um diretório local."""
+    """Inspeciona o modelo a partir de um identificador do Hub ou diretório local."""
     p = Path(ref).expanduser()
     if p.exists() and p.is_dir():
         return probe_local(p)

@@ -1,15 +1,4 @@
-"""Download de modelos com aria2c.
-
-Um teacher de 4 B são ~7,5 GB. Numa conexão instável, um download que morre aos
-90 % e recomeça do zero é a diferença entre vinte minutos e uma tarde perdida.
-O `aria2c` retoma de onde parou e abre várias conexões por arquivo; o servidor
-do Hugging Face responde `Accept-Ranges: bytes`, então a retomada funciona de
-fato.
-
-Só se baixa o que o pipeline usa. READMEs, licenças e pesos em formatos
-alternativos ficam de fora — num repositório com `.bin` **e** `.safetensors`
-isso corta metade do tráfego.
-"""
+"""Download de modelos do Hugging Face via aria2c."""
 
 from __future__ import annotations
 
@@ -26,19 +15,13 @@ from .errors import AguardenteError
 
 _HF = "https://huggingface.co"
 _TIMEOUT = 30
-
-# Uma resposta de índice legítima tem alguns KB. O limite existe para que uma
-# resposta hostil ou defeituosa não consuma memória sem fim antes de falhar.
 _MAX_INDEX_BYTES = 8 * 1024 * 1024
 
-# Formato dos identificadores do Hugging Face: `nome` ou `namespace/nome`.
-# Sem esta validação, um identificador como `../../api/interno` ou
-# `a/b?x=1#frag` reescreve a URL e aponta a requisição para outro lugar.
 _MODEL_ID = re.compile(r"^[A-Za-z0-9][\w.-]*(?:/[A-Za-z0-9][\w.-]*)?$")
 
 
 def validate_model_id(model_id: str) -> str:
-    """Recusa identificadores capazes de manipular a URL da API."""
+    """Valida se o identificador do modelo segue a convenção `nome` ou `namespace/nome`."""
     if not isinstance(model_id, str) or not _MODEL_ID.match(model_id):
         raise AguardenteError(
             f"identificador de modelo inválido: {model_id!r}",
@@ -46,7 +29,7 @@ def validate_model_id(model_id: str) -> str:
         )
     return model_id
 
-# Padrões que o carregamento do transformers exige. Ordem sem importância.
+# Arquivos necessários para execução e carregamento do modelo
 WANTED_EXACT = frozenset({
     "config.json",
     "generation_config.json",
@@ -63,63 +46,46 @@ WANTED_EXACT = frozenset({
 })
 WANTED_SUFFIX = (".safetensors",)
 
-# Excluídos mesmo quando casam por sufixo: variantes que não usamos.
+# Subdiretórios ou variantes excluídos do download
 EXCLUDE_PARTS = ("onnx/", "openvino/", "coreml/", "gguf/", "/consolidated")
 
 
 def safe_join(base: Path, relative: str) -> Path:
-    """Junta um caminho vindo da rede ao destino, recusando qualquer escape.
-
-    O índice de arquivos de um repositório remoto é escrito por quem o publica.
-    Um caminho como `../../.ssh/authorized_keys` ou `/etc/cron.d/x` faria a
-    escrita cair fora do destino — e caminhos absolutos são especialmente
-    traiçoeiros, porque `Path("destino") / "/etc/x"` descarta o destino inteiro
-    em vez de concatenar.
-
-    Recusa: caminhos absolutos, componentes `..`, separadores do Windows, e
-    qualquer resultado que, depois de resolvido, não esteja sob `base`.
-    """
+    """Resolve caminho relativo garantindo que permaneça dentro do diretório base."""
     if not relative or relative.strip() != relative:
         raise AguardenteError(f"caminho remoto inválido: {relative!r}")
 
     if "\\" in relative or ":" in relative:
         raise AguardenteError(
             f"caminho remoto com separador ou esquema inesperado: {relative!r}",
-            hint="O repositório pode estar comprometido.",
+            hint="O caminho fornecido contém caracteres inválidos.",
         )
 
     candidate = PurePosixPath(relative)
     if candidate.is_absolute() or any(part == ".." for part in candidate.parts):
         raise AguardenteError(
             f"caminho remoto tenta sair do destino: {relative!r}",
-            hint="O repositório pode estar comprometido. Nenhum arquivo foi gravado.",
+            hint="Caminhos remotos não podem conter referências a diretórios pais.",
         )
 
     base_resolved = base.resolve()
     target = (base_resolved / candidate).resolve()
-    # `is_relative_to` compara depois de resolver symlinks — cobre o caso em que
-    # um diretório intermediário aponta para fora.
     if not target.is_relative_to(base_resolved):
         raise AguardenteError(
             f"caminho remoto resolve para fora do destino: {relative!r}",
-            hint="O repositório pode estar comprometido. Nenhum arquivo foi gravado.",
+            hint="O caminho resolvido precisa estar contido no diretório de destino.",
         )
     return base_resolved / candidate
 
 
 @dataclass(frozen=True, slots=True)
 class RemoteFile:
-    """Um arquivo anunciado pelo repositório remoto.
-
-    O `path` é validado na construção: um objeto destes nunca carrega um
-    caminho capaz de escapar do destino.
-    """
+    """Arquivo remoto identificado no repositório."""
 
     path: str
     size: int
 
     def __post_init__(self) -> None:
-        # Valida contra uma base sintética — só a forma do caminho importa aqui.
         safe_join(Path("/__validacao__"), self.path)
 
     def url(self, model_id: str, revision: str = "main") -> str:
@@ -138,7 +104,7 @@ class FetchPlan:
         return sum(f.size for f in self.files)
 
     def missing(self) -> tuple[RemoteFile, ...]:
-        """Arquivos ausentes ou de tamanho errado — um download truncado conta."""
+        """Identifica arquivos ausentes ou incompletos no destino."""
         out = []
         for f in self.files:
             local = safe_join(self.dest, f.path)
@@ -152,11 +118,7 @@ class FetchPlan:
 
 
 def _wanted(path: str) -> bool:
-    """Se o arquivo interessa ao pipeline — e se o caminho é seguro.
-
-    A checagem de segurança vem primeiro de propósito: um caminho hostil que
-    termina em `.safetensors` passaria pelo filtro de extensão sem ela.
-    """
+    """Verifica se o arquivo é necessário para o modelo e tem caminho seguro."""
     if not path or path.strip() != path:
         return False
     if path.startswith("/") or "\\" in path or ":" in path:
@@ -170,7 +132,7 @@ def _wanted(path: str) -> bool:
 
 
 def list_files(model_id: str, revision: str = "main") -> tuple[RemoteFile, ...]:
-    """Lista os arquivos do repositório com tamanho, sem baixar nada."""
+    """Lista os arquivos necessários do repositório no Hugging Face."""
     validate_model_id(model_id)
     url = f"{_HF}/api/models/{model_id}/tree/{revision}?recursive=1"
     try:
@@ -179,7 +141,7 @@ def list_files(model_id: str, revision: str = "main") -> tuple[RemoteFile, ...]:
             if len(bruto) > _MAX_INDEX_BYTES:
                 raise AguardenteError(
                     f"índice de {model_id} excede {_MAX_INDEX_BYTES // 1024 // 1024} MB",
-                    hint="Resposta implausível para um índice de repositório.",
+                    hint="Resposta do índice excedeu o tamanho máximo permitido.",
                 )
             entries = json.loads(bruto)
     except urllib.error.HTTPError as e:
@@ -209,8 +171,6 @@ def list_files(model_id: str, revision: str = "main") -> tuple[RemoteFile, ...]:
         try:
             files.append(RemoteFile(path=caminho, size=int(size)))
         except AguardenteError:
-            # `_wanted` já deveria ter barrado; se chegou aqui, o repositório
-            # está a tentar algo. Ignora a entrada e segue com as demais.
             continue
 
     if not any(f.path.endswith(".safetensors") for f in files):
@@ -245,9 +205,7 @@ def fetch(
     retry_wait: int = 5,
     on_line: Callable[[str], None] | None = None,
 ) -> Path:
-    """Baixa o que falta. Idempotente — o que já está completo é pulado."""
-    # Valores absurdos fazem o aria2 falhar com mensagens obscuras, ou abrir
-    # conexões demais contra o servidor. Limitar aqui dá erro claro e cedo.
+    """Executa o download dos arquivos do plano via aria2c."""
     for nome, valor, teto in (("connections", connections, 16),
                               ("concurrent", concurrent, 16),
                               ("max_tries", max_tries, 100)):
@@ -265,7 +223,6 @@ def fetch(
 
     plan.dest.mkdir(parents=True, exist_ok=True)
 
-    # Formato do arquivo de entrada do aria2: URL numa linha, opções indentadas.
     lines: list[str] = []
     for f in pending:
         target = safe_join(plan.dest, f.path)
@@ -274,13 +231,12 @@ def fetch(
         lines.append(f"  out={target.name}")
     input_file = plan.dest / ".aguardente-fetch.txt"
     input_file.write_text("\n".join(lines) + "\n")
-    # Lista de URLs e caminhos locais: sem interesse para outros usuários da máquina.
     input_file.chmod(0o600)
 
     cmd = [
         exe,
         "--input-file", str(input_file),
-        "--continue=true",                      # retoma de onde parou
+        "--continue=true",
         f"--max-connection-per-server={connections}",
         f"--split={connections}",
         f"--max-concurrent-downloads={concurrent}",
@@ -289,7 +245,7 @@ def fetch(
         f"--retry-wait={retry_wait}",
         "--timeout=60",
         "--connect-timeout=30",
-        "--auto-file-renaming=false",           # retomar, não criar file.1
+        "--auto-file-renaming=false",
         "--allow-overwrite=true",
         "--conditional-get=true",
         "--summary-interval=10",
@@ -315,8 +271,7 @@ def fetch(
     if code != 0:
         raise AguardenteError(
             f"aria2c saiu com código {code}",
-            hint="O download é retomável: rode o mesmo comando de novo e ele "
-                 "continua de onde parou.",
+            hint="O download é retomável: execute o mesmo comando novamente para continuar.",
         )
 
     still_missing = plan.missing()
@@ -324,7 +279,7 @@ def fetch(
         names = ", ".join(f.path for f in still_missing[:3])
         raise AguardenteError(
             f"{len(still_missing)} arquivo(s) incompletos após o download: {names}",
-            hint="Rode de novo — o aria2c retoma o que falta.",
+            hint="Execute o comando novamente para retomar os arquivos incompletos.",
         )
     return plan.dest
 
@@ -333,7 +288,7 @@ def fetch_model(
     model_id: str, dest: str | Path, *, revision: str = "main",
     on_line: Callable[[str], None] | None = None, **kw: Any,
 ) -> FetchPlan:
-    """Conveniência: planeja e baixa numa chamada."""
+    """Planeja e executa o download do modelo."""
     plan = plan_fetch(model_id, dest, revision=revision)
     fetch(plan, on_line=on_line, **kw)
     return plan

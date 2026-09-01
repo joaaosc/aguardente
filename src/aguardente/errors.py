@@ -1,10 +1,10 @@
-"""Erros do domínio. Todos carregam uma sugestão acionável quando existe uma."""
+"""Exceções do pacote."""
 
 from __future__ import annotations
 
 
 class AguardenteError(Exception):
-    """Base. `hint` é o que o usuário pode fazer a respeito."""
+    """Exceção base do pacote, com suporte a sugestão de ação corretiva."""
 
     def __init__(self, message: str, *, hint: str | None = None) -> None:
         super().__init__(message)
@@ -16,16 +16,16 @@ class AguardenteError(Exception):
 
 
 class PreflightError(AguardenteError):
-    """Ambiente não atende um requisito duro."""
+    """Requisito obrigatório de ambiente não atendido."""
 
 
 class ProbeError(AguardenteError):
-    """Não foi possível sondar o modelo."""
+    """Falha ao inspecionar metadados do modelo."""
 
 
 class UnsupportedArchitecture(AguardenteError):
-    """A arquitetura não expõe os campos necessários para planejar a poda."""
+    """Arquitetura não suportada ou parâmetros insuficientes para o plano de poda."""
 
 
 class PlanImpossible(AguardenteError):
-    """O alvo pedido não é alcançável dentro dos limites de poda."""
+    """Alvo de parâmetros solicitado não pode ser alcançado dentro dos limites da arquitetura."""

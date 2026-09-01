@@ -1,8 +1,4 @@
-"""Canal de eventos estruturado, paralelo à saída legível.
-
-Uma linha JSON por evento. É o que permite retomar uma execução e, mais tarde,
-alimentar uma interface gráfica sem parsear texto formatado.
-"""
+"""Emissão de eventos estruturados em formato NDJSON."""
 
 from __future__ import annotations
 
@@ -16,7 +12,7 @@ from typing import Any, TextIO
 
 @dataclass
 class EventLog:
-    """Escreve NDJSON num arquivo e, opcionalmente, num stream."""
+    """Registrador de eventos em arquivo NDJSON e/ou stream de saída."""
 
     path: Path | None = None
     stream: TextIO | None = None
@@ -43,7 +39,6 @@ class EventLog:
             self.stream.write(line)
             self.stream.flush()
 
-    # Vocabulário de eventos — nomes fixos para que consumidores não adivinhem.
     def plan(self, stages: list[dict[str, Any]]) -> None:
         self.emit("plan", stages=stages)
 
