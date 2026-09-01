@@ -28,7 +28,7 @@ from math import prod
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator, Mapping
 
-from .arch import Arch, count_stored
+from .arch import TEXT_CONFIG_KEYS, Arch, count_stored, text_config
 from .errors import UnsupportedArchitecture
 
 # Raiz canônica de um decoder causal no formato transformers.
@@ -274,49 +274,12 @@ def discover_layout(headers: Mapping[str, Mapping[str, Any]]) -> TextLayout:
     )
 
 
-# Chaves sob as quais um checkpoint multimodal aninha o config do decoder.
-TEXT_CONFIG_KEYS = ("text_config", "language_config", "llm_config", "decoder_config")
-
-# Campos que costumam ficar só no nível de topo e pertencem ao decoder.
-INHERITED = ("tie_word_embeddings", "torch_dtype", "dtype", "vocab_size",
-             "bos_token_id", "eos_token_id", "pad_token_id")
-
 # Número de cabeças assumido pela classe de config do transformers quando o
 # config aninhado o omite. É hipótese, nunca conclusão: o valor derivado daqui
 # é obrigatoriamente conferido contra as formas de q_proj e k_proj, e uma
 # divergência interrompe. O DeepSeek-VL depende disto — seu `language_config`
 # declara só camadas e vocabulário.
 CLASS_HEADS = {"llama": 32, "mistral": 32}
-
-
-def text_config(cfg: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
-    """Localiza o config do decoder e devolve (config mesclado, chave de origem).
-
-    Quando as dimensões estão no topo, o próprio config é o do decoder — é o
-    caso do Qwen2.5-VL. Caso contrário elas estão aninhadas, sob uma chave que
-    varia por família.
-    """
-    if "hidden_size" in cfg:
-        return dict(cfg), ""
-
-    achadas = [k for k in TEXT_CONFIG_KEYS if isinstance(cfg.get(k), dict)]
-    if not achadas:
-        raise UnsupportedArchitecture(
-            "o config.json não expõe as dimensões no topo nem as aninha em "
-            + ", ".join(TEXT_CONFIG_KEYS),
-            hint="São suportadas arquiteturas de LLM causal no formato transformers.",
-        )
-    if len(achadas) > 1:
-        raise UnsupportedArchitecture(
-            "o config.json aninha mais de um sub-config de texto: "
-            + ", ".join(achadas),
-            hint="Não há como escolher entre eles sem adivinhar.",
-        )
-
-    chave = achadas[0]
-    # O sub-config tem precedência: quando declara um campo, é ele que vale.
-    mesclado = {k: cfg[k] for k in INHERITED if k in cfg} | dict(cfg[chave])
-    return mesclado, chave
 
 
 def _forma(formas: Mapping[str, list[int]], nome: str) -> list[int]:

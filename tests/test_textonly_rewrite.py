@@ -269,3 +269,22 @@ def test_origem_sem_safetensors(vlm, tmp_path):
         extract_weights(vazio, tmp_path / "texto", layout_de(vlm))
 
     assert "safetensors" in e.value.message
+
+
+def test_cabecalho_exato_ocupa_o_espaco_pedido():
+    """A reescrita no lugar exige tamanho exato, e o alinhamento de 8 conspira.
+
+    `_cabecalho_exato` calcula o preenchimento sobre um cabeçalho que já foi
+    alinhado, e `encode_header` alinha de novo. Só fecha porque o alvo vem de um
+    arquivo válido, cujo início de dados é múltiplo de 8.
+    """
+    from aguardente.textonly import _cabecalho_exato
+
+    entradas = {f"model.layers.{i}.mlp.up_proj.weight":
+                {"dtype": "F16", "shape": [4, 4], "data_offsets": [i * 32, i * 32 + 32]}
+                for i in range(3)}
+    minimo = len(encode_header(entradas))
+    for alvo in range(minimo, minimo + 200, 8):
+        saida = _cabecalho_exato(entradas, alvo)
+        assert saida is not None and len(saida) == alvo, alvo
+    assert _cabecalho_exato(entradas, minimo - 8) is None

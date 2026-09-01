@@ -10,8 +10,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .arch import Arch, count_stored
+from .arch import Arch, count_stored, text_config
 from .errors import ProbeError
+from .textonly import TextLayout, arch_from_shapes, discover_layout
 
 _HF = "https://huggingface.co"
 _TIMEOUT = 30
@@ -33,19 +34,42 @@ class ModelProbe:
     lm_head_materialized: bool = False
     weight_files: tuple[str, ...] = ()
     tensor_names: tuple[str, ...] = field(default=(), repr=False)
+    # Presente quando o checkpoint foi inspecionado tensor a tensor. Ausente
+    # quando só houve metadados da API, caso em que texto e visão não se separam.
+    layout: TextLayout | None = field(default=None, repr=False)
+    text_model_type: str = ""
 
     @property
     def name(self) -> str:
         return Path(self.ref).name if self.is_local else self.ref
 
     @property
+    def text_params(self) -> int:
+        """Parâmetros do decoder de texto, que é o que o pipeline processa."""
+        return self.layout.kept_params if self.layout else self.stored_params
+
+    @property
+    def dropped_params(self) -> int:
+        """Parâmetros de torre de visão, projetor e demais componentes descartados."""
+        return self.layout.dropped_params if self.layout else 0
+
+    @property
+    def is_multimodal(self) -> bool:
+        return bool(self.layout and self.layout.is_multimodal)
+
+    @property
     def fp16_bytes(self) -> int:
-        return self.stored_params * 2
+        return self.text_params * 2
 
     def count_error(self) -> float:
-        """Erro relativo entre o cálculo analítico e o total real de parâmetros."""
+        """Erro relativo entre o cálculo analítico e o total real de parâmetros.
+
+        A comparação é contra o decoder, não contra o checkpoint inteiro: num
+        modelo multimodal a torre de visão responde por parte dos tensores e
+        nunca entra na contagem analítica.
+        """
         counted = count_stored(self.arch, lm_head_materialized=self.lm_head_materialized)
-        return (counted - self.stored_params) / self.stored_params
+        return (counted - self.text_params) / self.text_params
 
 
 def _get_json(url: str) -> dict[str, Any]:
@@ -104,6 +128,40 @@ def _summarize_tensors(header: dict[str, Any]) -> tuple[int, bool, tuple[str, ..
     return total, has_lm_head, tuple(sorted(header))
 
 
+# Ler o cabeçalho de cada shard custa duas requisições por arquivo. Acima deste
+# teto o custo deixa de compensar, e a sondagem cai para os metadados da API —
+# que dão o total, mas não separam texto de visão.
+MAX_SHARDS_SONDADOS = 32
+
+
+def _totalizar(headers: dict[str, dict[str, Any]]) -> tuple[int, bool, list[str]]:
+    """Soma os parâmetros de todos os shards e reúne os nomes."""
+    total, has_lm_head, names = 0, False, []
+    for header in headers.values():
+        t, h, n = _summarize_tensors(header)
+        total += t
+        has_lm_head |= h
+        names.extend(n)
+    return total, has_lm_head, names
+
+
+def _analisar(cfg: dict[str, Any],
+              headers: dict[str, dict[str, Any]]) -> tuple[TextLayout | None, Arch, str]:
+    """Localiza o decoder e deriva as dimensões das formas dos tensores.
+
+    O config entra apenas onde as formas são ambíguas. Quando não há cabeçalhos
+    — sondagem que só alcançou os metadados da API —, resta o config sozinho.
+    """
+    sub, _ = text_config(cfg)
+    tipo = str(sub.get("model_type") or cfg.get("model_type") or "")
+    if not headers:
+        return None, Arch.from_hf_config(cfg), tipo
+    limpos = {a: {k: v for k, v in h.items() if k != "__metadata__"}
+              for a, h in headers.items()}
+    layout = discover_layout(limpos)
+    return layout, arch_from_shapes(limpos, layout, cfg=sub), tipo
+
+
 def probe_local(path: str | Path) -> ModelProbe:
     """Inspeciona os metadados de um modelo em diretório local."""
     d = Path(path).expanduser().resolve()
@@ -114,18 +172,14 @@ def probe_local(path: str | Path) -> ModelProbe:
             hint="O diretório precisa conter a estrutura padrão: config.json, arquivos .safetensors e tokenizer.",
         )
     cfg = json.loads(cfg_path.read_text())
-    arch = Arch.from_hf_config(cfg)
 
     shards = sorted(p for p in d.glob("*.safetensors"))
     if not shards:
         raise ProbeError(f"{d} não contém arquivos .safetensors")
 
-    total, has_lm_head, names = 0, False, []
-    for s in shards:
-        t, h, n = _summarize_tensors(read_safetensors_header(str(s)))
-        total += t
-        has_lm_head |= h
-        names.extend(n)
+    headers = {s.name: read_safetensors_header(str(s)) for s in shards}
+    total, has_lm_head, names = _totalizar(headers)
+    layout, arch, tipo_texto = _analisar(cfg, headers)
 
     return ModelProbe(
         ref=str(d),
@@ -136,6 +190,8 @@ def probe_local(path: str | Path) -> ModelProbe:
         lm_head_materialized=has_lm_head,
         weight_files=tuple(s.name for s in shards),
         tensor_names=tuple(sorted(names)),
+        layout=layout,
+        text_model_type=tipo_texto,
     )
 
 
@@ -146,7 +202,6 @@ def probe_hub(model_id: str) -> ModelProbe:
     validate_model_id(model_id)
     api = _get_json(f"{_HF}/api/models/{model_id}")
     cfg = _get_json(f"{_HF}/{model_id}/resolve/main/config.json")
-    arch = Arch.from_hf_config(cfg)
 
     files = tuple(
         s["rfilename"] for s in api.get("siblings", [])
@@ -160,21 +215,31 @@ def probe_hub(model_id: str) -> ModelProbe:
 
     reported = (api.get("safetensors") or {}).get("total")
 
-    has_lm_head = False
-    names: tuple[str, ...] = ()
-    try:
-        hdr = read_safetensors_header(f"{_HF}/{model_id}/resolve/main/{files[0]}")
-        shard_total, has_lm_head, names = _summarize_tensors(hdr)
+    # Separar decoder de torre de visão exige as formas de todos os tensores, e
+    # não só as do primeiro shard: o decoder do DeepSeek-VL se espalha por três.
+    headers: dict[str, dict[str, Any]] = {}
+    if len(files) <= MAX_SHARDS_SONDADOS:
+        try:
+            for nome in files:
+                headers[nome] = read_safetensors_header(
+                    f"{_HF}/{model_id}/resolve/main/{nome}")
+        except ProbeError:
+            headers = {}
+
+    has_lm_head, names = False, ()
+    if headers:
+        shard_total, has_lm_head, nomes = _totalizar(headers)
+        names = tuple(sorted(nomes))
         if reported is None:
-            reported = shard_total if len(files) == 1 else None
-    except ProbeError:
-        pass
+            reported = shard_total
 
     if reported is None:
         raise ProbeError(
             f"não foi possível determinar a contagem de parâmetros de {model_id}",
             hint="O modelo pode ser multi-shard sem metadados na API.",
         )
+
+    layout, arch, tipo_texto = _analisar(cfg, headers)
 
     return ModelProbe(
         ref=model_id,
@@ -186,6 +251,8 @@ def probe_hub(model_id: str) -> ModelProbe:
         lm_head_materialized=has_lm_head,
         weight_files=files,
         tensor_names=names,
+        layout=layout,
+        text_model_type=tipo_texto,
     )
 
 

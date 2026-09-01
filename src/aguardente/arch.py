@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Mapping
 
 from .errors import UnsupportedArchitecture
 
@@ -12,7 +12,14 @@ from .errors import UnsupportedArchitecture
 MOE_KEYS = ("num_experts", "n_routed_experts", "num_local_experts",
             "moe_intermediate_size", "num_experts_per_tok", "n_shared_experts")
 VISION_KEYS = ("vision_config", "vision_n_layers", "vision_tower", "visual")
-NESTED_KEYS = ("text_config", "language_config", "llm_config")
+
+# Atenção latente: q, k e v deixam de ser projeções densas e passam por um posto
+# reduzido, que a poda estruturada não sabe fatiar.
+MLA_KEYS = ("kv_lora_rank", "q_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim")
+
+# Camadas de cross-attention intercaladas quebram a uniformidade que a seleção
+# de camadas pressupõe.
+CROSS_KEYS = ("cross_attention_layers", "cross_attn_layers")
 
 # Chaves genéricas o bastante para colidir com outro uso: só contam como sinal
 # de arquitetura multimodal quando carregam uma subconfiguração.
@@ -48,30 +55,38 @@ def _quantized(cfg: dict[str, Any]) -> str | None:
     return None
 
 
-def _reject_unsupported(cfg: dict[str, Any]) -> None:
-    """Recusa configs cuja contagem densa produziria um resultado silenciosamente errado."""
+def _reject_unsupported(cfg: dict[str, Any], *, origem: str = "") -> None:
+    """Recusa decoders cuja contagem densa produziria um resultado silenciosamente errado.
+
+    A guarda opera sobre o config **do decoder**, já desaninhado: um sinal de MoE
+    no `language_config` de um modelo multimodal conta tanto quanto um no topo.
+    Torre de visão e projetor não são mais motivo de recusa — são descartados
+    pela extração —, e por isso `VISION_KEYS` deixou de levantar aqui.
+    """
+    onde = f"o {origem}" if origem else "o config.json"
     if moe := _present(cfg, MOE_KEYS):
         raise UnsupportedArchitecture(
-            f"arquitetura MoE não suportada (config expõe {', '.join(moe)})",
+            f"decoder de texto MoE não suportado ({onde} expõe {', '.join(moe)})",
             hint="A contagem de parâmetros assume uma MLP densa por camada; em um modelo "
                  "MoE ela erraria por ordens de grandeza. Use um decoder denso.",
         )
-    if vis := _present(cfg, VISION_KEYS):
+    if mla := _present(cfg, MLA_KEYS):
         raise UnsupportedArchitecture(
-            f"arquitetura multimodal não suportada (config expõe {', '.join(vis)})",
-            hint="O pipeline poda e destila apenas o decoder causal de texto.",
+            f"atenção latente (MLA) não suportada ({onde} expõe {', '.join(mla)})",
+            hint="Em MLA as projeções de q, k e v passam por um posto reduzido, e a "
+                 "poda estruturada fatia projeções densas.",
+        )
+    if cross := _present(cfg, CROSS_KEYS):
+        raise UnsupportedArchitecture(
+            f"decoder com camadas de cross-attention ({onde} expõe {', '.join(cross)})",
+            hint="A seleção de camadas pressupõe blocos uniformes; intercalar tipos "
+                 "diferentes quebraria o padrão que o modelo espera.",
         )
     if quant := _quantized(cfg):
         raise UnsupportedArchitecture(
-            f"pesos pré-quantizados não suportados (config expõe {quant})",
+            f"pesos pré-quantizados não suportados ({onde} expõe {quant})",
             hint="A poda estruturada e a destilação operam sobre tensores densos em "
                  "float16. Use o repositório com os pesos originais não quantizados.",
-        )
-    if "hidden_size" not in cfg and (nested := _present(cfg, NESTED_KEYS)):
-        raise UnsupportedArchitecture(
-            f"config.json aninha as dimensões em {', '.join(nested)}",
-            hint="Use o repositório do decoder de texto correspondente, cujo config.json "
-                 "expõe as dimensões no nível de topo.",
         )
 
 
@@ -82,6 +97,44 @@ def _norms_per_layer(cfg: dict[str, Any]) -> int:
     normas por camada. Nas demais famílias são duas.
     """
     return 4 if str(cfg.get("model_type", "")).startswith("gemma") else 2
+
+
+# Chaves sob as quais um checkpoint multimodal aninha o config do decoder.
+TEXT_CONFIG_KEYS = ("text_config", "language_config", "llm_config", "decoder_config")
+
+# Campos que costumam ficar só no nível de topo e pertencem ao decoder.
+INHERITED = ("tie_word_embeddings", "torch_dtype", "dtype", "vocab_size",
+             "bos_token_id", "eos_token_id", "pad_token_id")
+
+def text_config(cfg: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Localiza o config do decoder e devolve (config mesclado, chave de origem).
+
+    Quando as dimensões estão no topo, o próprio config é o do decoder — é o
+    caso do Qwen2.5-VL. Caso contrário elas estão aninhadas, sob uma chave que
+    varia por família.
+    """
+    if "hidden_size" in cfg:
+        return dict(cfg), ""
+
+    achadas = [k for k in TEXT_CONFIG_KEYS if isinstance(cfg.get(k), dict)]
+    if not achadas:
+        raise UnsupportedArchitecture(
+            "o config.json não expõe 'hidden_size' no topo nem aninha as dimensões em "
+            + ", ".join(TEXT_CONFIG_KEYS),
+            hint="São suportadas arquiteturas de LLM causal no formato transformers.",
+        )
+    if len(achadas) > 1:
+        raise UnsupportedArchitecture(
+            "o config.json aninha mais de um sub-config de texto: "
+            + ", ".join(achadas),
+            hint="Não há como escolher entre eles sem adivinhar.",
+        )
+
+    chave = achadas[0]
+    # O sub-config tem precedência: quando declara um campo, é ele que vale.
+    mesclado = {k: cfg[k] for k in INHERITED if k in cfg} | dict(cfg[chave])
+    return mesclado, chave
+
 
 
 def _qk_norm(cfg: dict[str, Any]) -> bool:
@@ -129,8 +182,14 @@ class Arch:
 
     @classmethod
     def from_hf_config(cls, cfg: dict[str, Any]) -> Arch:
-        """Extrai dimensões a partir do config.json de um decoder causal denso."""
-        _reject_unsupported(cfg)
+        """Extrai dimensões a partir do config.json, desaninhando quando preciso.
+
+        Num modelo multimodal as dimensões do decoder ficam sob `text_config` ou
+        equivalente. Descer até elas é o que permite planejar a poda de um VLM
+        sem baixar peso algum.
+        """
+        cfg, origem = text_config(cfg)
+        _reject_unsupported(cfg, origem=origem)
         try:
             hidden = int(cfg["hidden_size"])
             heads = int(cfg["num_attention_heads"])

@@ -25,22 +25,26 @@ def test_moe_rejeitado_com_mensagem(chave):
     assert "densa" in e.value.hint
 
 
-@pytest.mark.parametrize("chave", ["vision_config", "vision_n_layers", "vision_tower"])
-def test_multimodal_rejeitado_com_mensagem(chave):
-    with pytest.raises(UnsupportedArchitecture) as e:
-        Arch.from_hf_config(DENSO | {chave: 32})
-    assert "multimodal" in e.value.message and chave in e.value.message
+@pytest.mark.parametrize("chave", ["vision_config", "vision_n_layers", "vision_tower",
+                                   "visual"])
+def test_torre_de_visao_nao_impede_mais_a_leitura(chave):
+    """A torre é descartada pela extração; sua presença não invalida as dimensões."""
+    assert Arch.from_hf_config(DENSO | {chave: {"depth": 32}}).hidden_size == 1024
 
 
-def test_visual_como_subconfig_e_rejeitado():
-    with pytest.raises(UnsupportedArchitecture) as e:
-        Arch.from_hf_config(DENSO | {"visual": {"depth": 32}})
-    assert "multimodal" in e.value.message and "visual" in e.value.message
+def test_dimensoes_aninhadas_sao_alcancadas():
+    """Num VLM as dimensões do decoder ficam sob text_config ou equivalente."""
+    a = Arch.from_hf_config({
+        "model_type": "idefics3",
+        "vision_config": {"depth": 27},
+        "text_config": DENSO,
+    })
+    assert a.hidden_size == 1024 and a.num_hidden_layers == 28
 
 
-def test_visual_escalar_nao_dispara_guarda():
-    """`visual` é genérica: só um dicionário aninhado indica torre de visão."""
-    assert Arch.from_hf_config(DENSO | {"visual": 1}).hidden_size == 1024
+@pytest.mark.parametrize("chave", ["text_config", "language_config", "llm_config"])
+def test_sub_config_e_encontrado_por_qualquer_das_chaves(chave):
+    assert Arch.from_hf_config({"model_type": "x", chave: DENSO}).hidden_size == 1024
 
 
 def test_chave_moe_zerada_nao_dispara_guarda():
@@ -92,8 +96,8 @@ def test_qk_norm_explicito_tem_precedencia_sobre_a_heuristica(chave):
     assert Arch.from_hf_config(DENSO | {chave: False}).qk_norm is False
 
 
-def test_moe_tem_precedencia_sobre_multimodal():
-    """Um config MoE multimodal deve reportar primeiro a razão que invalida a contagem."""
+def test_moe_multimodal_reporta_o_moe():
+    """A torre seria descartada; o MoE é o que de fato invalida a contagem."""
     cfg = DENSO | {"n_routed_experts": 256, "vision_config": {}}
     with pytest.raises(UnsupportedArchitecture) as e:
         Arch.from_hf_config(cfg)
@@ -105,12 +109,28 @@ def test_chave_moe_nula_nao_dispara_guarda():
     assert Arch.from_hf_config(DENSO | {"num_experts": None}).hidden_size == 1024
 
 
-def test_config_aninhado_rejeitado():
-    cfg = {"model_type": "multi_modality", "language_config": {"hidden_size": 2048},
-           "aligner_config": {}}
+def test_moe_no_sub_config_e_recusado_dizendo_onde():
+    """Um sinal de MoE no language_config conta tanto quanto um no topo."""
+    cfg = {"model_type": "deepseek_vl_v2",
+           "language_config": DENSO | {"n_routed_experts": 72}}
     with pytest.raises(UnsupportedArchitecture) as e:
         Arch.from_hf_config(cfg)
-    assert "language_config" in e.value.message
+    assert "MoE" in e.value.message and "language_config" in e.value.message
+
+
+@pytest.mark.parametrize("chave", ["kv_lora_rank", "q_lora_rank"])
+def test_atencao_latente_e_recusada(chave):
+    with pytest.raises(UnsupportedArchitecture) as e:
+        Arch.from_hf_config(DENSO | {chave: 512})
+    assert "MLA" in e.value.message and chave in e.value.message
+
+
+@pytest.mark.parametrize("chave", ["cross_attention_layers", "cross_attn_layers"])
+def test_cross_attention_intercalada_e_recusada(chave):
+    """O mllama intercala blocos de tipos diferentes; a seleção de camadas quebraria."""
+    with pytest.raises(UnsupportedArchitecture) as e:
+        Arch.from_hf_config(DENSO | {chave: [3, 8, 13]})
+    assert "cross-attention" in e.value.message
 
 
 @pytest.mark.parametrize("faltante", ["hidden_size", "num_attention_heads", "intermediate_size",
