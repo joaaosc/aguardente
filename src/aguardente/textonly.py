@@ -17,11 +17,16 @@ já lidos, o que o torna testável sem rede e sem pesos.
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import shutil
+import struct
 from collections import Counter
 from dataclasses import dataclass, field
 from math import prod
-from typing import Any, Iterator, Mapping
+from pathlib import Path
+from typing import Any, BinaryIO, Iterator, Mapping
 
 from .arch import Arch, count_stored
 from .errors import UnsupportedArchitecture
@@ -47,6 +52,9 @@ SIGNATURE = frozenset({
 EMBED = "embed_tokens.weight"
 NORM = "norm.weight"
 LM_HEAD = "lm_head.weight"
+
+# Mesmo teto usado na sondagem remota, por coerência.
+MAX_HEADER = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -427,3 +435,248 @@ def reconcile(arch: Arch, layout: TextLayout) -> int:
     """
     return count_stored(arch, lm_head_materialized=not layout.tie_word_embeddings) \
         - layout.kept_params
+
+
+# Tamanho máximo de um shard de saída, alinhado com o padrão do `save_pretrained`.
+SHARD_LIMIT = 4 * 1024 ** 3
+# Blocos de cópia. Grande o bastante para não pagar syscall por tensor pequeno,
+# pequeno o bastante para não segurar meio gigabyte de um tensor de embeddings.
+CHUNK = 8 * 1024 ** 2
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractReport:
+    """O que a extração escreveu, e a que custo."""
+
+    shards: tuple[str, ...]
+    reused: tuple[str, ...]
+    tensors: int
+    total_bytes: int
+    copied_bytes: int
+
+    @property
+    def saved_bytes(self) -> int:
+        """Bytes que não precisaram ser copiados por reaproveitamento de shard."""
+        return self.total_bytes - self.copied_bytes
+
+
+def read_header(f: "BinaryIO") -> tuple[dict[str, Any], int]:
+    """Lê o cabeçalho e devolve (entradas, deslocamento do início dos dados)."""
+    bruto = f.read(8)
+    if len(bruto) < 8:
+        raise UnsupportedArchitecture("arquivo safetensors truncado no cabeçalho")
+    tamanho = struct.unpack("<Q", bruto)[0]
+    if tamanho > MAX_HEADER:
+        raise UnsupportedArchitecture(
+            f"cabeçalho safetensors de {tamanho} bytes excede o limite aceito")
+    try:
+        return json.loads(f.read(tamanho)), 8 + tamanho
+    except json.JSONDecodeError as e:
+        raise UnsupportedArchitecture(f"cabeçalho safetensors ilegível: {e}") from e
+
+
+def encode_header(entradas: Mapping[str, Any], *, padding: int = 0) -> bytes:
+    """Serializa o cabeçalho com o prefixo de tamanho e o alinhamento do formato.
+
+    O buffer de dados começa em `8 + len(json)`, e leitores que mapeiam o arquivo
+    em memória esperam esse limite alinhado em 8 bytes. O formato permite
+    preencher o JSON com espaços, que é como se chega ao alinhamento — e também
+    como se ocupa exatamente o espaço de um cabeçalho anterior maior.
+    """
+    corpo = json.dumps({"__metadata__": {"format": "pt"}} | dict(entradas),
+                       separators=(",", ":")).encode()
+    corpo += b" " * padding
+    if sobra := (8 + len(corpo)) % 8:
+        corpo += b" " * (8 - sobra)
+    return struct.pack("<Q", len(corpo)) + corpo
+
+
+def _copiar(origem: "BinaryIO", destino: "BinaryIO", inicio: int, fim: int) -> int:
+    """Copia a faixa [início, fim) em blocos, sem carregar o tensor inteiro."""
+    origem.seek(inicio)
+    restante = fim - inicio
+    while restante:
+        bloco = origem.read(min(CHUNK, restante))
+        if not bloco:
+            raise UnsupportedArchitecture(
+                "arquivo safetensors truncado: os dados acabam antes do declarado")
+        destino.write(bloco)
+        restante -= len(bloco)
+    return fim - inicio
+
+
+def _tudo_mantido(header: Mapping[str, Any], layout: TextLayout) -> bool:
+    return all(nome in layout.rename for nome in header if nome != "__metadata__")
+
+
+def _cabecalho_exato(entradas: Mapping[str, Any], alvo: int) -> bytes | None:
+    """Cabeçalho ocupando exatamente `alvo` bytes, ou None se não couber.
+
+    Reescrever o cabeçalho no lugar do antigo só é possível quando o novo cabe
+    no mesmo espaço — e ele quase sempre cabe, porque a renomeação encurta as
+    chaves. Ocupar o espaço exato deixa os `data_offsets` válidos e dispensa
+    mover um único byte do buffer de dados.
+    """
+    base = encode_header(entradas)
+    if len(base) > alvo:
+        return None
+    saida = encode_header(entradas, padding=alvo - len(base))
+    return saida if len(saida) == alvo else None
+
+
+class _Saida:
+    """Shard de saída em construção."""
+
+    def __init__(self, caminho: Path) -> None:
+        self.caminho = caminho
+        self.fh = open(caminho, "wb")
+        self.entradas: dict[str, Any] = {}
+        self.offset = 0
+
+    def acrescentar(self, nome: str, meta: Mapping[str, Any], nbytes: int) -> None:
+        self.entradas[nome] = {"dtype": meta["dtype"], "shape": meta["shape"],
+                               "data_offsets": [self.offset, self.offset + nbytes]}
+        self.offset += nbytes
+
+    def fechar(self) -> None:
+        """Prefixa o cabeçalho ao corpo já gravado.
+
+        O tamanho do cabeçalho depende dos deslocamentos, que só se conhecem no
+        fim, então o corpo é gravado primeiro e o arquivo é remontado ao fechar.
+        """
+        self.fh.close()
+        corpo = self.caminho.with_suffix(".corpo")
+        os.replace(self.caminho, corpo)
+        with open(corpo, "rb") as entrada, open(self.caminho, "wb") as saida:
+            saida.write(encode_header(self.entradas))
+            while bloco := entrada.read(CHUNK):
+                saida.write(bloco)
+        corpo.unlink()
+
+
+def extract_weights(src: str | Path, dst: str | Path, layout: TextLayout, *,
+                    shard_limit: int = SHARD_LIMIT, reuse_shards: bool = False,
+                    on_progress: Any = None) -> ExtractReport:
+    """Escreve em `dst` um checkpoint só com o decoder, renomeado para a raiz canônica.
+
+    A cópia é feita no nível dos bytes: as faixas de cada tensor mantido são
+    transferidas sem interpretação, o que dispensa torch e preserva qualquer
+    dtype — `bfloat16` inclusive, que não tem representação em NumPy.
+
+    Com `reuse_shards`, um shard cujos tensores são todos mantidos não é copiado:
+    reescreve-se o cabeçalho no lugar e o arquivo é movido. Isso **consome** o
+    shard de origem, e por isso é opcional.
+    """
+    src, dst = Path(src), Path(dst)
+    fontes = sorted(src.glob("*.safetensors"))
+    if not fontes:
+        raise UnsupportedArchitecture(f"{src} não contém arquivos .safetensors")
+
+    parcial = dst.with_name(dst.name + ".parcial")
+    shutil.rmtree(parcial, ignore_errors=True)
+    parcial.mkdir(parents=True)
+
+    saidas: list[Path] = []
+    reusados: list[str] = []
+    mapa: dict[str, str] = {}
+    entradas_por_arquivo: dict[Path, dict[str, Any]] = {}
+    total = copiados = tensores = 0
+    atual: _Saida | None = None
+
+    def novo_shard() -> _Saida:
+        caminho = parcial / f"shard-{len(saidas):05d}.safetensors"
+        saidas.append(caminho)
+        return _Saida(caminho)
+
+    try:
+        for fonte in fontes:
+            with open(fonte, "rb") as f:
+                header, dados = read_header(f)
+                mantidos = [n for n in header
+                            if n != "__metadata__" and n in layout.rename]
+                if not mantidos:
+                    continue
+
+                renomeadas = {layout.rename[n]: header[n] for n in mantidos}
+                bytes_do_shard = sum(header[n]["data_offsets"][1]
+                                     - header[n]["data_offsets"][0] for n in mantidos)
+                total += bytes_do_shard
+                tensores += len(mantidos)
+
+                if reuse_shards and _tudo_mantido(header, layout) and (
+                        novo := _cabecalho_exato(renomeadas, dados)):
+                    f.close()
+                    with open(fonte, "r+b") as alvo:
+                        alvo.write(novo)
+                    destino = parcial / fonte.name
+                    os.replace(fonte, destino)
+                    saidas.append(destino)
+                    entradas_por_arquivo[destino] = renomeadas
+                    reusados.append(fonte.name)
+                    for canonico in renomeadas:
+                        mapa[canonico] = destino.name
+                    if on_progress:
+                        on_progress(fonte.name, 0, bytes_do_shard)
+                    continue
+
+                # Ordem por deslocamento de origem: a leitura fica sequencial.
+                for nome in sorted(mantidos,
+                                   key=lambda n: header[n]["data_offsets"][0]):
+                    meta = header[nome]
+                    inicio, fim = meta["data_offsets"]
+                    nbytes = fim - inicio
+                    if atual is None or (atual.offset and
+                                         atual.offset + nbytes > shard_limit):
+                        if atual is not None:
+                            entradas_por_arquivo[atual.caminho] = atual.entradas
+                            atual.fechar()
+                        atual = novo_shard()
+                    canonico = layout.rename[nome]
+                    atual.acrescentar(canonico, meta, nbytes)
+                    copiados += _copiar(f, atual.fh, dados + inicio, dados + fim)
+                    mapa[canonico] = atual.caminho.name
+                if on_progress:
+                    on_progress(fonte.name, bytes_do_shard, bytes_do_shard)
+
+        if atual is not None:
+            entradas_por_arquivo[atual.caminho] = atual.entradas
+            atual.fechar()
+            atual = None
+    except BaseException:
+        if atual is not None:
+            atual.fh.close()
+        shutil.rmtree(parcial, ignore_errors=True)
+        raise
+
+    _nomear_shards(parcial, saidas, mapa)
+    _escrever_indice(parcial, mapa, total)
+
+    shutil.rmtree(dst, ignore_errors=True)
+    os.replace(parcial, dst)
+    return ExtractReport(
+        shards=tuple(sorted(p.name for p in dst.glob("*.safetensors"))),
+        reused=tuple(reusados), tensors=tensores,
+        total_bytes=total, copied_bytes=copiados,
+    )
+
+
+def _nomear_shards(parcial: Path, saidas: list[Path], mapa: dict[str, str]) -> None:
+    """Renomeia para a convenção do Hugging Face, que embute o total de shards."""
+    total = len(saidas)
+    finais = {}
+    for i, caminho in enumerate(sorted(saidas), start=1):
+        nome = ("model.safetensors" if total == 1
+                else f"model-{i:05d}-of-{total:05d}.safetensors")
+        os.replace(caminho, parcial / nome)
+        finais[caminho.name] = nome
+    for chave, antigo in mapa.items():
+        mapa[chave] = finais[antigo]
+
+
+def _escrever_indice(parcial: Path, mapa: dict[str, str], total: int) -> None:
+    """Grava o índice de shards. Um checkpoint de arquivo único dispensa índice."""
+    if len(set(mapa.values())) <= 1:
+        return
+    (parcial / "model.safetensors.index.json").write_text(json.dumps(
+        {"metadata": {"total_size": total}, "weight_map": dict(sorted(mapa.items()))},
+        indent=2) + "\n")
