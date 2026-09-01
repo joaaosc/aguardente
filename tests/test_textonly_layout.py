@@ -227,3 +227,33 @@ def test_renomeacao_leva_tudo_para_a_raiz_canonica():
     assert layout.rename["language_model.model.embed_tokens.weight"] == \
         "model.embed_tokens.weight"
     assert layout.rename["language_model.model.norm.weight"] == "model.norm.weight"
+
+
+# --------------------------------------------- achados da auditoria do módulo
+
+
+def test_camada_zero_anomala_nao_culpa_as_demais():
+    """A referência é o conjunto mais frequente, não o da camada 0.
+
+    Com `indices[0]` como referência, um decoder cuja primeira camada destoa
+    — o `first_k_dense_replace` do DeepSeek faz isso — reportaria as outras 33
+    como divergentes e apontaria o lugar errado.
+    """
+    h = decoder("model.", 8)
+    h["model.layers.0.mlp.shared_expert.weight"] = t(64, 64)
+    with pytest.raises(UnsupportedArchitecture) as e:
+        discover_layout({"m.safetensors": h})
+
+    assert "camada 0" in e.value.message
+    assert "shared_expert" in e.value.message
+
+
+def test_lm_head_exige_fronteira_de_componente():
+    """`endswith` sozinho casaria `vision_lm_head.weight`, que é de outra torre."""
+    h = decoder("model.", 4)
+    h["vision_lm_head.weight"] = t(1000, 64)
+    layout = discover_layout({"m.safetensors": h})
+
+    assert layout.lm_head is None
+    assert layout.tie_word_embeddings is True
+    assert "vision_lm_head.weight" in layout.dropped

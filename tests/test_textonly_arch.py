@@ -40,7 +40,7 @@ def checkpoint(prefixo, *, hidden, inter, camadas, vocab, q_out, kv_out,
             h[base + "self_attn.q_norm.weight"] = t(hidden // (q_out // kv_out or 1))
             h[base + "self_attn.k_norm.weight"] = t(hidden // (q_out // kv_out or 1))
     if lm_head:
-        h[f"{prefixo.split('model.')[0]}lm_head.weight"] = t(vocab, hidden)
+        h[prefixo.removesuffix("model.") + "lm_head.weight"] = t(vocab, hidden)
     return h
 
 

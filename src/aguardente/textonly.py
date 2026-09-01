@@ -18,6 +18,7 @@ já lidos, o que o torna testável sem rede e sem pesos.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from math import prod
 from typing import Any, Iterator, Mapping
@@ -101,6 +102,15 @@ def _tensors(headers: Mapping[str, Mapping[str, Any]]) -> Iterator[tuple[str, Ma
             yield nome, meta
 
 
+def _e_lm_head(nome: str) -> bool:
+    """Cabeça de saída do modelo, e não um tensor cujo nome termina parecido.
+
+    `endswith` sozinho casaria `vision_lm_head.weight`: a fronteira precisa cair
+    num separador de componente, ou o nome ser a raiz.
+    """
+    return nome == LM_HEAD or nome.endswith("." + LM_HEAD)
+
+
 def _numel(meta: Mapping[str, Any]) -> int:
     return prod(meta.get("shape") or ()) if meta.get("shape") else 0
 
@@ -146,12 +156,18 @@ def _conferir_camadas(prefixo: str, indices: dict[int, set[str]]) -> int:
     # Camadas com conjuntos de sufixos diferentes denunciam intercalamento de
     # tipos — cross-attention a cada N blocos, como no mllama. Selecionar
     # camadas nesse caso quebraria o padrão que o modelo espera.
-    referencia = indices[0]
+    #
+    # A referência é o conjunto mais frequente, não o da camada 0: quando é a
+    # primeira camada que destoa — o `first_k_dense_replace` do DeepSeek deixa
+    # as primeiras densas e o resto MoE — tomá-la como referência culparia todas
+    # as outras e apontaria o lugar errado.
+    frequencia = Counter(frozenset(sufixos) for sufixos in indices.values())
+    referencia = set(frequencia.most_common(1)[0][0])
     for i in sorted(indices):
         if indices[i] != referencia:
             divergentes = ", ".join(sorted(indices[i] ^ referencia))
             raise UnsupportedArchitecture(
-                f"a camada {i} de {prefixo!r} difere da camada 0 em: {divergentes}",
+                f"a camada {i} de {prefixo!r} difere das demais em: {divergentes}",
                 hint="O decoder precisa ser uniforme para que a seleção de camadas "
                      "preserve o comportamento do modelo.",
             )
@@ -186,7 +202,7 @@ def discover_layout(headers: Mapping[str, Mapping[str, Any]]) -> TextLayout:
 
     for nome, meta in _tensors(headers):
         nomes[nome] = _numel(meta)
-        if nome.endswith(LM_HEAD):
+        if _e_lm_head(nome):
             cabecas.append(nome)
         if m := _LAYER.match(nome):
             idx = camadas.setdefault(m["prefixo"], {})
