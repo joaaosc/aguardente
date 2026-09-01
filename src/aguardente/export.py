@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from .errors import AguardenteError
+from .preflight import toolchain_hint
 
 DEFAULT_COMPRESSION = "4bit"          # preset macOS: int4 per-block(32), ~4.50 BPW
 DEFAULT_PRECISION = "float16"
@@ -131,6 +132,48 @@ def find_bundle(out_dir: str | Path) -> ExportResult:
                         metadata=meta)
 
 
+# O tempo de compilação acompanha o tamanho do modelo: uma constante fixa
+# bastava para os alvos atuais e não sobreviveria a um modelo maior.
+COMPILE_TIMEOUT_MIN = 1800
+COMPILE_SECONDS_PER_GB = 1200
+
+
+def _compile_timeout(aimodel: Path) -> int:
+    """Limite de tempo proporcional ao tamanho do artefato a compilar."""
+    try:
+        size = aimodel.stat().st_size
+    except OSError:
+        return COMPILE_TIMEOUT_MIN
+    return int(max(COMPILE_TIMEOUT_MIN, size / (1024 ** 3) * COMPILE_SECONDS_PER_GB))
+
+
+def _run_coreai(cmd: list[str], *, acao: str, timeout: int) -> subprocess.CompletedProcess[str]:
+    """Executa `xcrun coreai-build`, traduzindo falhas de toolchain em erro acionável."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=True)
+    except FileNotFoundError as e:
+        raise AguardenteError(
+            "xcrun não encontrado",
+            hint=toolchain_hint() or "Instale o Xcode 27+ e as Command Line Tools.",
+        ) from e
+    except subprocess.TimeoutExpired as e:
+        raise AguardenteError(
+            f"coreai-build {acao} excedeu o tempo limite de {timeout}s",
+            hint="Execute o comando manualmente no Terminal para observar o progresso: "
+                 f"{' '.join(cmd)}",
+        ) from e
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        hint = toolchain_hint()
+        if not hint and "unable to find utility" in stderr:
+            hint = ("coreai-build não está disponível no toolchain ativo. Instale o Metal "
+                    "Toolchain: xcodebuild -downloadComponent MetalToolchain")
+        raise AguardenteError(
+            f"coreai-build {acao} falhou: {stderr or f'código de saída {e.returncode}'}",
+            hint=hint,
+        ) from e
+
+
 def inspect_asset(aimodel: str | Path, *, storage: bool = True, compute: bool = True,
                   ops: bool = True) -> dict[str, Any]:
     """Inspeciona o arquivo .aimodel utilizando `xcrun coreai-build inspect --json`."""
@@ -141,15 +184,7 @@ def inspect_asset(aimodel: str | Path, *, storage: bool = True, compute: bool = 
         cmd.append("--compute")
     if ops:
         cmd.append("--ops")
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=True)
-    except FileNotFoundError as e:
-        raise AguardenteError(
-            "xcrun não encontrado",
-            hint="Instale o Xcode 27+ e as Command Line Tools.",
-        ) from e
-    except subprocess.CalledProcessError as e:
-        raise AguardenteError(f"coreai-build inspect falhou: {e.stderr.strip()}") from e
+    out = _run_coreai(cmd, acao="inspect", timeout=300)
     try:
         return json.loads(out.stdout)
     except json.JSONDecodeError as e:
@@ -157,15 +192,13 @@ def inspect_asset(aimodel: str | Path, *, storage: bool = True, compute: bool = 
 
 
 def compile_aot(aimodel: str | Path, out_dir: str | Path, *, platform: str = "macOS",
-                min_version: str = "27.0") -> list[Path]:
+                min_version: str = "27.0", timeout: int | None = None) -> list[Path]:
     """Compila o modelo AOT utilizando `xcrun coreai-build compile`."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     cmd = ["xcrun", "coreai-build", "compile", str(aimodel),
            "--platform", platform, "--min-deployment-version", min_version,
            "--output", str(out)]
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=3600, check=True)
-    except subprocess.CalledProcessError as e:
-        raise AguardenteError(f"coreai-build compile falhou: {e.stderr.strip()}") from e
+    _run_coreai(cmd, acao="compile",
+                timeout=timeout if timeout is not None else _compile_timeout(Path(aimodel)))
     return sorted(out.glob("*.aimodelc"))
