@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import errno
+import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -11,7 +14,9 @@ from . import __version__
 from .arch import count_params
 from .budget import (BPW_FP16, BPW_INT4_EMBED_FP16, GB, Budget, Machine,
                      kv_cache_bytes, training_bytes, weights_bytes)
+from . import effort
 from .errors import AguardenteError
+from .events import stdout_log
 from .plan import plan_for_target
 from .pipeline import RunOptions, run_pipeline
 from .preflight import Status, blocking, run_all
@@ -31,6 +36,12 @@ _STATE_MAP = {
     "skipped": StageState.SKIPPED,
 }
 
+# Variável de ambiente que libera o traceback completo nas falhas inesperadas.
+DEBUG_ENV = "AGUARDENTE_DEBUG"
+
+# Subdiretórios derivados de uma execução, descartados por --restart.
+ARTIFACT_DIRS = ("teacher", "pruned", "logits", "student", "bundle", "ckpt")
+
 
 # ------------------------------------------------------------------ doctor
 
@@ -44,24 +55,40 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     )
     ui.blank()
 
+    verbose = getattr(args, "verbose", False)
     results = run_all()
     width = max(len(r.name) for r in results)
     state_of = {Status.OK: StageState.OK, Status.WARN: StageState.SKIPPED,
                 Status.FAIL: StageState.FAILED}
     for r in results:
         ui.check(r.name, state_of[r.status], r.detail, hint=r.hint, width=width)
+        if verbose and r.debug:
+            for linha in r.debug.splitlines():
+                ui.step(linha, indent=6 + width)
 
     fails = blocking(results)
     ui.blank()
-    passed = len(results) - len(fails)
+    # Avisos não são aprovações: contá-los como tal descrevia como íntegro um
+    # ambiente em que `aguardente run` seria bloqueado logo em seguida.
+    passed = sum(1 for r in results if r.status is Status.OK)
+    avisos = [r for r in results if r.status is Status.WARN]
     if fails:
+        acao = ("Siga a instrução ao lado de cada falha e execute "
+                "`aguardente doctor` novamente.")
+        if not verbose and any(r.debug for r in fails):
+            acao += " Use `aguardente doctor --verbose` para ver a saída bruta dos comandos."
         ui.error(f"{len(fails)} de {len(results)} verificações falharam",
                  cause="Existem dependências ou requisitos do sistema pendentes.",
-                 action="Siga a instrução ao lado de cada falha e execute "
-                        "`aguardente doctor` novamente.")
+                 action=acao)
         return 1
-    ui.done(f"{passed} de {len(results)} verificações passaram",
-            hint="Execute `aguardente plan <modelo>` para inspecionar um modelo.")
+    resumo = f"{passed} de {len(results)} verificações passaram"
+    if avisos:
+        resumo += f" · {len(avisos)} aviso(s): {', '.join(r.name for r in avisos)}"
+        ui.done(resumo,
+                hint="Avisos não impedem `plan`, mas a stack do pipeline é requisito de "
+                     "`aguardente run`.")
+        return 0
+    ui.done(resumo, hint="Execute `aguardente plan <modelo>` para inspecionar um modelo.")
     return 0
 
 
@@ -119,7 +146,14 @@ def cmd_plan(args: argparse.Namespace) -> int:
     ui.field("treinável até", _fmt_params(budget.max_params_for_training()))
     ui.field("comprimido cabe até", _fmt_params(budget.max_params_for_inference()))
 
-    target = args.target_params or budget.max_params_for_training()
+    teto = budget.max_params_for_training()
+    target = args.target_params or teto
+    if args.target_params and args.target_params > teto:
+        ui.blank()
+        ui.warn(f"o alvo de {_fmt_params(args.target_params)} excede o teto de treino "
+                f"desta máquina ({_fmt_params(teto)})",
+                "A etapa de recuperação tende a esgotar a memória. Reduza o alvo, use "
+                "--skip-recover, ou --allow-oversized para assumir o risco.")
     plan = None
     ui.header("Plano de poda")
     if count_params(a).total <= target:
@@ -142,6 +176,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
     final = plan.target if plan else a
     final_params = plan.target_params if plan else count_params(a).total
 
+    nivel = effort.get(getattr(args, "effort", None))
+    lote = getattr(args, "batch_size", 2)
+
     ui.header("Estimativa de recursos")
     ui.table(
         ["formato", "tamanho"],
@@ -149,9 +186,12 @@ def cmd_plan(args: argparse.Namespace) -> int:
          ("comprimido (~4,5 bits)", _fmt_bytes(weights_bytes(final_params, BPW_INT4_EMBED_FP16))),
          ("memória por 2.048 tokens", _fmt_bytes(kv_cache_bytes(final, 2048))),
          ("memória por 8.192 tokens", _fmt_bytes(kv_cache_bytes(final, 8192))),
-         ("RAM estimada no treino", _fmt_bytes(training_bytes(final_params)))],
+         ("RAM estimada no treino", _fmt_bytes(training_bytes(final_params))),
+         (f"logits em disco (--effort {nivel.name})", _fmt_bytes(nivel.logit_bytes(lote)))],
         align_right=(1,),
     )
+
+    _effort_panel(nivel, [], batch_size=lote, animate=not getattr(args, "no_anim", False))
 
     if plan and training_bytes(final_params) > budget.ram_bytes:
         ui.warn("o treino pode exceder a memória disponível",
@@ -160,12 +200,83 @@ def cmd_plan(args: argparse.Namespace) -> int:
     ui.blank()
     ui.rule()
     if plan:
+        # O comando sugerido precisa ser executável: sem a flag, `run` recusaria
+        # o alvo que este mesmo relatório acabou de exibir.
+        extra = " --allow-oversized" if target > teto else ""
         ui.command(f"aguardente run {args.model} -o run/ "
-                   f"--target-params {target:.0f} --measure",
+                   f"--target-params {target:.0f}{extra} --effort {nivel.name} --measure",
                    label="para executar este plano")
     else:
-        ui.command(f"aguardente run {args.model} -o run/ --measure",
+        ui.command(f"aguardente run {args.model} -o run/ --effort {nivel.name} --measure",
                    label="para converter este modelo")
+    return 0
+
+
+# ------------------------------------------------------------------ effort
+
+
+def _effort_panel(nivel, sobrescritos, *, batch_size: int = 2,
+                  animate: bool = True) -> None:
+    """Painel do nível escolhido: escala, o que muda e o que custa."""
+    ui.header("Esforço da destilação")
+    ui.meter_line(effort.index(nivel), total=len(effort.LEVELS),
+                  label=f"{ui.bold(nivel.name)}  {ui.dim('· ' + nivel.label)}",
+                  animate=animate)
+    ui.explain(nivel.summary)
+    ui.blank()
+    ui.field("custo relativo", f"{effort.relative_cost(nivel):.2f}× do nível "
+                               f"{effort.DEFAULT}")
+    ui.field("logits em disco", _fmt_bytes(nivel.logit_bytes(batch_size)))
+    ui.field("épocas de recuperação", str(nivel.epochs))
+    ui.field("profundidade top-k", str(nivel.top_k))
+    if sobrescritos:
+        ui.blank()
+        ui.note(f"informado na linha de comando, com precedência sobre o preset: "
+                f"{', '.join('--' + c.replace('_', '-') for c in sobrescritos)}")
+
+
+def cmd_effort(args: argparse.Namespace) -> int:
+    """Explica a escala de esforço sem tocar em nenhum modelo."""
+    animar = not getattr(args, "no_anim", False)
+    lote = getattr(args, "batch_size", 2)
+
+    ui.title("Esforço da destilação",
+             "Quanto trabalho investir para recuperar a qualidade perdida na poda")
+    ui.blank()
+    ui.explain(
+        "O nível de esforço é ortogonal ao alvo de poda: --target-params decide o "
+        "tamanho do resultado, --effort decide o cuidado com que se chega nele. "
+        "Um alvo agressivo com esforço baixo é o caminho mais rápido para um modelo ruim.",
+        indent=0,
+    )
+
+    ui.header("Escala")
+    for nivel in effort.LEVELS:
+        ui.blank()
+        ui.meter_line(effort.index(nivel), total=len(effort.LEVELS),
+                      label=f"{ui.bold(f'{nivel.name:<7}')} {ui.dim('· ' + nivel.label)}",
+                      animate=animar)
+        ui.explain(nivel.summary, indent=8)
+        ui.explain(nivel.when, indent=8)
+
+    ui.header("Comparação")
+    ui.table(
+        ["nível", "épocas", "top-k", "seq", "lotes", "logits em disco", "custo"],
+        [(l["name"], str(l["epochs"]), str(l["top_k"]), str(l["seq_len"]),
+          str(l["logit_batches"]), _fmt_bytes(l["logit_bytes"]), f"{l['cost']:.2f}×")
+         for l in effort.comparison(lote)],
+        align_right=(1, 2, 3, 4, 5, 6),
+    )
+    ui.blank()
+    ui.explain(
+        f"Disco estimado com --batch-size {lote}. O custo é o tempo relativo ao nível "
+        f"{effort.DEFAULT}, calculado pelos tokens processados em cada etapa.",
+    )
+
+    ui.blank()
+    ui.rule()
+    ui.command("aguardente run <modelo> -o run/ --effort high",
+               label="para usar um nível específico")
     return 0
 
 
@@ -209,25 +320,25 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
 
 def _options_from(args: argparse.Namespace) -> RunOptions:
+    nivel = effort.get(getattr(args, "effort", None))
+    informado = {campo: getattr(args, campo, None) for campo in effort.CONTROLLED}
+    valores, sobrescritos = effort.resolve(nivel, informado)
+    # Guardados no Namespace para que a apresentação saiba o que veio do preset
+    # e o que o usuário digitou, sem recalcular a resolução.
+    args.effort_level = nivel
+    args.effort_overrides = sobrescritos
     return RunOptions(
         model=args.model,
         out_dir=Path(args.out).expanduser(),
         target_params=args.target_params,
         connections=args.connections,
         concurrent=args.concurrent,
-        calib_batches=args.calib_batches,
         batch_size=args.batch_size,
-        seq_len=args.seq_len,
         calib_dataset=args.calib_dataset,
         calib_file=args.calib_file,
-        logit_batches=args.logit_batches,
-        top_k=args.top_k,
-        epochs=args.epochs,
-        lr=args.lr,
-        alpha=args.alpha,
-        temperature=args.temperature,
-        grad_accum=args.grad_accum,
+        effort=nivel.name,
         no_checkpointing=args.no_checkpointing,
+        **valores,
         platform=args.platform,
         compression=args.compression,
         compute_precision=args.compute_precision,
@@ -237,42 +348,93 @@ def _options_from(args: argparse.Namespace) -> RunOptions:
         measure=args.measure,
         skip_recover=args.skip_recover,
         skip_export=args.skip_export,
+        restart=getattr(args, "restart", False),
+        allow_oversized=getattr(args, "allow_oversized", False),
     )
+
+
+def _discard_run_dir(out_dir: Path) -> list[str]:
+    """Remove o estado e os artefatos de uma execução anterior, listando o descartado."""
+    removidos = []
+    for nome in ("state.json", "run.lock"):
+        alvo = out_dir / nome
+        if alvo.exists():
+            alvo.unlink()
+            removidos.append(nome)
+    for nome in ARTIFACT_DIRS:
+        alvo = out_dir / nome
+        if alvo.is_dir():
+            shutil.rmtree(alvo)
+            removidos.append(f"{nome}/")
+    return removidos
 
 
 def cmd_run(args: argparse.Namespace) -> int:
     """Executa o pipeline completo."""
     opts = _options_from(args)
+    is_json = getattr(args, "json", False)
+    event_log = stdout_log() if is_json else None
 
-    ui.title(f"aguardente · {opts.model}",
-             "Poda estruturada, destilação e conversão para Core AI")
+    if not is_json:
+        ui.title(f"aguardente · {opts.model}",
+                 "Poda estruturada, destilação e conversão para Core AI")
+
+    if args.restart and opts.out_dir.is_dir():
+        removidos = _discard_run_dir(opts.out_dir)
+        if removidos and not is_json:
+            ui.blank()
+            ui.warn(f"--restart descartou: {', '.join(removidos)}",
+                    "Todas as etapas serão refeitas do zero.")
 
     if not args.skip_checks:
-        results = run_all()
-        fails = blocking(results)
+        # A stack do pipeline é informativa no `doctor` e requisito aqui: sem
+        # torch a execução avançaria até morrer num import, possivelmente depois
+        # do download já ter consumido tempo e banda.
+        results = run_all(path=opts.out_dir)
+        fails = blocking(results, warn_as_fail=("stack do pipeline",))
         if fails:
-            ui.error(
-                "o ambiente não atende aos requisitos necessários",
-                cause="; ".join(f"{r.name}: {r.detail}" for r in fails),
-                action="Execute `aguardente doctor` para ver instruções de correção, "
-                       "ou use --skip-checks para prosseguir sem validação.",
-            )
+            cause_str = "; ".join(f"{r.name}: {r.detail}" for r in fails)
+            if is_json:
+                event_log.error("preflight", "o ambiente não atende aos requisitos necessários", hint=cause_str)
+            else:
+                ui.error(
+                    "o ambiente não atende aos requisitos necessários",
+                    cause=cause_str,
+                    action="Execute `aguardente doctor` para ver instruções de correção, "
+                           "ou use --skip-checks para prosseguir sem validação.",
+                )
             return 1
 
-    ui.blank()
-    ui.explain(
-        "O pipeline é executado em etapas com persistência de estado em disco.",
-        indent=0,
-    )
-    ui.blank()
-    ui.field("destino", str(opts.out_dir))
-    if opts.target_params:
-        ui.field("alvo", _fmt_params(opts.target_params))
-    ui.rule()
+    if not is_json:
+        ui.blank()
+        ui.explain(
+            "O pipeline é executado em etapas com persistência de estado em disco.",
+            indent=0,
+        )
+        ui.blank()
+        ui.field("destino", str(opts.out_dir))
+        if opts.target_params:
+            ui.field("alvo", _fmt_params(opts.target_params))
+        if not opts.skip_recover:
+            _effort_panel(args.effort_level, args.effort_overrides,
+                          batch_size=opts.batch_size)
+        ui.blank()
+        ui.rule()
+
+    if is_json:
+        nivel = args.effort_level
+        event_log.emit("effort", name=nivel.name, label=nivel.label,
+                       summary=nivel.summary, cost=effort.relative_cost(nivel),
+                       overrides=args.effort_overrides, values=nivel.values())
 
     inicio = time.perf_counter()
-    ctx = run_pipeline(opts)
+    report_func = (lambda msg="": event_log.log("pipeline", msg) if msg else None) if is_json else print
+    ctx = run_pipeline(opts, report=report_func, events=event_log,
+                       animate=not is_json)
     total = time.perf_counter() - inicio
+
+    if is_json:
+        return 0
 
     ui.blank()
     ui.rule()
@@ -359,26 +521,37 @@ def cmd_status(args: argparse.Namespace) -> int:
 # ----------------------------------------------------------------- parser
 
 
+# Os padrões das opções abaixo são `None` de propósito: só assim se distingue
+# "não informado" de "informado com o mesmo valor do preset", e o nível de
+# esforço pode preencher o que faltou sem passar por cima da escolha de quem
+# digitou a opção. O valor efetivo aparece no painel de esforço.
+PRESET = "definido por --effort"
+
+
 def _add_pipeline_args(p: argparse.ArgumentParser) -> None:
     """Argumentos compartilhados do pipeline."""
+    p.add_argument("--effort", choices=effort.NAMES, default=effort.DEFAULT,
+                   help="agressividade da destilação: quanto trabalho investir para "
+                        f"recuperar a qualidade perdida na poda (padrão: {effort.DEFAULT})")
     p.add_argument("--target-params", type=lambda s: int(float(s)),
-                   help="alvo de parâmetros (ex.: 1.4e9). Padrão: baseado na RAM disponível")
+                   help="alvo de parâmetros (ex.: 1.0e9). Padrão: baseado na RAM disponível")
     p.add_argument("--connections", type=int, default=8,
                    help="número de conexões por servidor no aria2c")
     p.add_argument("--concurrent", type=int, default=4,
                    help="número de downloads simultâneos no aria2c")
-    p.add_argument("--calib-batches", type=int, default=32)
-    p.add_argument("--batch-size", type=int, default=2)
-    p.add_argument("--seq-len", type=int, default=512)
+    p.add_argument("--calib-batches", type=int, help=PRESET)
+    p.add_argument("--batch-size", type=int, default=2,
+                   help="amostras por lote; restrição de memória, não de esforço (padrão: 2)")
+    p.add_argument("--seq-len", type=int, help=PRESET)
     p.add_argument("--calib-dataset", help="dataset de calibração (namespace/name)")
     p.add_argument("--calib-file", help="arquivo .txt local com amostras separadas por linha em branco")
-    p.add_argument("--logit-batches", type=int, default=256)
-    p.add_argument("--top-k", type=int, default=128)
-    p.add_argument("--epochs", type=int, default=2)
-    p.add_argument("--lr", type=float, default=3e-5)
-    p.add_argument("--alpha", type=float, default=0.9)
-    p.add_argument("--temperature", type=float, default=2.0)
-    p.add_argument("--grad-accum", type=int, default=4)
+    p.add_argument("--logit-batches", type=int, help=PRESET)
+    p.add_argument("--top-k", type=int, help=PRESET)
+    p.add_argument("--epochs", type=int, help=PRESET)
+    p.add_argument("--lr", type=float, help=PRESET)
+    p.add_argument("--alpha", type=float, help=PRESET)
+    p.add_argument("--temperature", type=float, help=PRESET)
+    p.add_argument("--grad-accum", type=int, help=PRESET)
     p.add_argument("--no-checkpointing", action="store_true")
     p.add_argument("--platform", default="macOS",
                    choices=["macOS", "iOS", "watchOS", "visionOS", "tvOS"])
@@ -392,6 +565,8 @@ def _add_pipeline_args(p: argparse.ArgumentParser) -> None:
                    help="avalia a perplexidade durante as etapas do pipeline")
     p.add_argument("--skip-recover", action="store_true")
     p.add_argument("--skip-export", action="store_true")
+    p.add_argument("--json", action="store_true",
+                   help="emite eventos estruturados em formato NDJSON no stdout para a GUI")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -403,11 +578,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     d = sub.add_parser("doctor", help="verifica o ambiente e dependências")
+    d.add_argument("-v", "--verbose", action="store_true",
+                   help="exibe a saída bruta dos comandos que falharam")
     d.set_defaults(func=cmd_doctor)
 
     pl = sub.add_parser("plan", help="inspeciona o modelo e calcula o plano de poda sem baixar pesos")
     pl.add_argument("model", help="identificador do Hugging Face ou diretório local")
     pl.add_argument("--target-params", type=lambda s: int(float(s)))
+    pl.add_argument("--effort", choices=effort.NAMES, default=effort.DEFAULT,
+                    help=f"nível de esforço a dimensionar (padrão: {effort.DEFAULT})")
+    pl.add_argument("--batch-size", type=int, default=2)
+    pl.add_argument("--no-anim", action="store_true", help="não anima os medidores")
     pl.set_defaults(func=cmd_plan)
 
     ft = sub.add_parser("fetch", help="baixa os arquivos do modelo via aria2c")
@@ -422,14 +603,35 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument("-o", "--out", required=True, help="diretório da execução")
     rn.add_argument("--skip-checks", action="store_true",
                     help="ignora verificações de pré-requisitos de ambiente")
+    rn.add_argument("--restart", action="store_true",
+                    help="descarta o estado e os artefatos do diretório antes de começar")
+    rn.add_argument("--allow-oversized", action="store_true",
+                    help="aceita alvo de parâmetros acima do teto de treino da máquina")
     _add_pipeline_args(rn)
     rn.set_defaults(func=cmd_run)
+
+    ef = sub.add_parser("effort", help="explica os níveis de agressividade da destilação")
+    ef.add_argument("--batch-size", type=int, default=2,
+                    help="lote usado para estimar o disco dos logits (padrão: 2)")
+    ef.add_argument("--no-anim", action="store_true", help="não anima os medidores")
+    ef.set_defaults(func=cmd_effort)
 
     st = sub.add_parser("status", help="exibe o estado e progresso de uma execução")
     st.add_argument("-o", "--out", required=True, help="diretório da execução")
     st.set_defaults(func=cmd_status)
 
     return p
+
+
+def _falha(msg: str, hint: str | None = None, *, exc: BaseException | None = None) -> int:
+    """Imprime a falha no formato do pacote, com traceback só sob AGUARDENTE_DEBUG."""
+    print(f"\nerro: {msg}", file=sys.stderr)
+    if hint:
+        print(f"  → {hint}", file=sys.stderr)
+    if exc is not None and os.environ.get(DEBUG_ENV):
+        import traceback
+        traceback.print_exception(exc, file=sys.stderr)
+    return 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -442,6 +644,32 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\nexecução interrompida pelo usuário — estado salvo para retomada", file=sys.stderr)
         return 130
+    # As famílias abaixo são previsíveis e mereciam mensagem própria; sem elas
+    # qualquer uma chegava ao usuário como traceback.
+    except MemoryError as e:
+        return _falha(
+            "memória insuficiente para concluir a etapa",
+            "Reduza --target-params, --batch-size ou --seq-len, aumente --grad-accum, "
+            "e feche outros aplicativos antes de repetir.", exc=e)
+    except ModuleNotFoundError as e:
+        return _falha(
+            f"dependência ausente: {e.name}",
+            "Instale a stack completa com `uv pip install 'aguardente[pipeline]'` e "
+            "confirme com `aguardente doctor`.", exc=e)
+    except OSError as e:
+        if e.errno == errno.ENOSPC:
+            return _falha("disco cheio durante a escrita",
+                          "Libere espaço ou aponte -o para outro volume. O estado da "
+                          "execução foi preservado para retomada.", exc=e)
+        if e.errno in (errno.EACCES, errno.EPERM):
+            return _falha(f"permissão negada: {e.filename or e}",
+                          "Verifique as permissões do diretório de execução.", exc=e)
+        return _falha(f"falha de entrada/saída: {e}",
+                      "Verifique o caminho de destino e a conexão de rede.", exc=e)
+    except Exception as e:  # noqa: BLE001 — último recurso, com traceback opcional
+        return _falha(f"falha inesperada: {type(e).__name__}: {e}",
+                      f"Defina {DEBUG_ENV}=1 e repita o comando para ver o traceback completo.",
+                      exc=e)
 
 
 if __name__ == "__main__":
