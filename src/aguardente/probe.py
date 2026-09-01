@@ -27,6 +27,7 @@ from .errors import ProbeError
 _HF = "https://huggingface.co"
 _TIMEOUT = 30
 _MAX_HEADER = 64 * 1024 * 1024  # sanidade: cabeçalho de safetensors não passa disso
+_MAX_JSON = 8 * 1024 * 1024     # respostas de metadados são pequenas
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +62,10 @@ class ModelProbe:
 def _get_json(url: str) -> dict[str, Any]:
     try:
         with urllib.request.urlopen(url, timeout=_TIMEOUT) as r:
-            return json.load(r)
+            bruto = r.read(_MAX_JSON + 1)
+            if len(bruto) > _MAX_JSON:
+                raise ProbeError(f"resposta de {url} excede o limite razoável")
+            return json.loads(bruto)
     except urllib.error.HTTPError as e:
         if e.code == 401:
             raise ProbeError(
@@ -153,6 +157,9 @@ def probe_local(path: str | Path) -> ModelProbe:
 
 def probe_hub(model_id: str) -> ModelProbe:
     """Sonda um modelo do Hugging Face sem baixar pesos."""
+    from .fetch import validate_model_id
+
+    validate_model_id(model_id)
     api = _get_json(f"{_HF}/api/models/{model_id}")
     cfg = _get_json(f"{_HF}/{model_id}/resolve/main/config.json")
     arch = Arch.from_hf_config(cfg)

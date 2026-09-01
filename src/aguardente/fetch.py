@@ -14,17 +14,37 @@ isso corta metade do tráfego.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Sequence
 
 from .errors import AguardenteError
 
 _HF = "https://huggingface.co"
 _TIMEOUT = 30
+
+# Uma resposta de índice legítima tem alguns KB. O limite existe para que uma
+# resposta hostil ou defeituosa não consuma memória sem fim antes de falhar.
+_MAX_INDEX_BYTES = 8 * 1024 * 1024
+
+# Formato dos identificadores do Hugging Face: `nome` ou `namespace/nome`.
+# Sem esta validação, um identificador como `../../api/interno` ou
+# `a/b?x=1#frag` reescreve a URL e aponta a requisição para outro lugar.
+_MODEL_ID = re.compile(r"^[A-Za-z0-9][\w.-]*(?:/[A-Za-z0-9][\w.-]*)?$")
+
+
+def validate_model_id(model_id: str) -> str:
+    """Recusa identificadores capazes de manipular a URL da API."""
+    if not isinstance(model_id, str) or not _MODEL_ID.match(model_id):
+        raise AguardenteError(
+            f"identificador de modelo inválido: {model_id!r}",
+            hint="Use o formato `namespace/nome`, como `Qwen/Qwen3-4B`.",
+        )
+    return model_id
 
 # Padrões que o carregamento do transformers exige. Ordem sem importância.
 WANTED_EXACT = frozenset({
@@ -47,10 +67,60 @@ WANTED_SUFFIX = (".safetensors",)
 EXCLUDE_PARTS = ("onnx/", "openvino/", "coreml/", "gguf/", "/consolidated")
 
 
+def safe_join(base: Path, relative: str) -> Path:
+    """Junta um caminho vindo da rede ao destino, recusando qualquer escape.
+
+    O índice de arquivos de um repositório remoto é escrito por quem o publica.
+    Um caminho como `../../.ssh/authorized_keys` ou `/etc/cron.d/x` faria a
+    escrita cair fora do destino — e caminhos absolutos são especialmente
+    traiçoeiros, porque `Path("destino") / "/etc/x"` descarta o destino inteiro
+    em vez de concatenar.
+
+    Recusa: caminhos absolutos, componentes `..`, separadores do Windows, e
+    qualquer resultado que, depois de resolvido, não esteja sob `base`.
+    """
+    if not relative or relative.strip() != relative:
+        raise AguardenteError(f"caminho remoto inválido: {relative!r}")
+
+    if "\\" in relative or ":" in relative:
+        raise AguardenteError(
+            f"caminho remoto com separador ou esquema inesperado: {relative!r}",
+            hint="O repositório pode estar comprometido.",
+        )
+
+    candidate = PurePosixPath(relative)
+    if candidate.is_absolute() or any(part == ".." for part in candidate.parts):
+        raise AguardenteError(
+            f"caminho remoto tenta sair do destino: {relative!r}",
+            hint="O repositório pode estar comprometido. Nenhum arquivo foi gravado.",
+        )
+
+    base_resolved = base.resolve()
+    target = (base_resolved / candidate).resolve()
+    # `is_relative_to` compara depois de resolver symlinks — cobre o caso em que
+    # um diretório intermediário aponta para fora.
+    if not target.is_relative_to(base_resolved):
+        raise AguardenteError(
+            f"caminho remoto resolve para fora do destino: {relative!r}",
+            hint="O repositório pode estar comprometido. Nenhum arquivo foi gravado.",
+        )
+    return base_resolved / candidate
+
+
 @dataclass(frozen=True, slots=True)
 class RemoteFile:
+    """Um arquivo anunciado pelo repositório remoto.
+
+    O `path` é validado na construção: um objeto destes nunca carrega um
+    caminho capaz de escapar do destino.
+    """
+
     path: str
     size: int
+
+    def __post_init__(self) -> None:
+        # Valida contra uma base sintética — só a forma do caminho importa aqui.
+        safe_join(Path("/__validacao__"), self.path)
 
     def url(self, model_id: str, revision: str = "main") -> str:
         return f"{_HF}/{model_id}/resolve/{revision}/{self.path}"
@@ -71,7 +141,7 @@ class FetchPlan:
         """Arquivos ausentes ou de tamanho errado — um download truncado conta."""
         out = []
         for f in self.files:
-            local = self.dest / f.path
+            local = safe_join(self.dest, f.path)
             if not local.is_file() or (f.size and local.stat().st_size != f.size):
                 out.append(f)
         return tuple(out)
@@ -82,6 +152,17 @@ class FetchPlan:
 
 
 def _wanted(path: str) -> bool:
+    """Se o arquivo interessa ao pipeline — e se o caminho é seguro.
+
+    A checagem de segurança vem primeiro de propósito: um caminho hostil que
+    termina em `.safetensors` passaria pelo filtro de extensão sem ela.
+    """
+    if not path or path.strip() != path:
+        return False
+    if path.startswith("/") or "\\" in path or ":" in path:
+        return False
+    if any(part == ".." for part in PurePosixPath(path).parts):
+        return False
     if any(part in path for part in EXCLUDE_PARTS):
         return False
     name = path.rsplit("/", 1)[-1]
@@ -90,10 +171,17 @@ def _wanted(path: str) -> bool:
 
 def list_files(model_id: str, revision: str = "main") -> tuple[RemoteFile, ...]:
     """Lista os arquivos do repositório com tamanho, sem baixar nada."""
+    validate_model_id(model_id)
     url = f"{_HF}/api/models/{model_id}/tree/{revision}?recursive=1"
     try:
         with urllib.request.urlopen(url, timeout=_TIMEOUT) as r:
-            entries = json.load(r)
+            bruto = r.read(_MAX_INDEX_BYTES + 1)
+            if len(bruto) > _MAX_INDEX_BYTES:
+                raise AguardenteError(
+                    f"índice de {model_id} excede {_MAX_INDEX_BYTES // 1024 // 1024} MB",
+                    hint="Resposta implausível para um índice de repositório.",
+                )
+            entries = json.loads(bruto)
     except urllib.error.HTTPError as e:
         if e.code == 401:
             raise AguardenteError(
@@ -104,13 +192,26 @@ def list_files(model_id: str, revision: str = "main") -> tuple[RemoteFile, ...]:
         raise AguardenteError(f"HTTP {e.code} ao listar {model_id}") from e
     except (urllib.error.URLError, TimeoutError) as e:
         raise AguardenteError(f"falha de rede ao listar {model_id}: {e}") from e
+    except json.JSONDecodeError as e:
+        raise AguardenteError(f"índice de {model_id} não é JSON válido: {e}") from e
+
+    if not isinstance(entries, list):
+        raise AguardenteError(f"índice de {model_id} tem formato inesperado")
 
     files = []
     for e in entries:
-        if e.get("type") != "file" or not _wanted(e["path"]):
+        caminho = e.get("path")
+        if not isinstance(caminho, str) or e.get("type") != "file":
+            continue
+        if not _wanted(caminho):
             continue
         size = e.get("size") or (e.get("lfs") or {}).get("size") or 0
-        files.append(RemoteFile(path=e["path"], size=int(size)))
+        try:
+            files.append(RemoteFile(path=caminho, size=int(size)))
+        except AguardenteError:
+            # `_wanted` já deveria ter barrado; se chegou aqui, o repositório
+            # está a tentar algo. Ignora a entrada e segue com as demais.
+            continue
 
     if not any(f.path.endswith(".safetensors") for f in files):
         raise AguardenteError(
@@ -145,6 +246,18 @@ def fetch(
     on_line: Callable[[str], None] | None = None,
 ) -> Path:
     """Baixa o que falta. Idempotente — o que já está completo é pulado."""
+    # Valores absurdos fazem o aria2 falhar com mensagens obscuras, ou abrir
+    # conexões demais contra o servidor. Limitar aqui dá erro claro e cedo.
+    for nome, valor, teto in (("connections", connections, 16),
+                              ("concurrent", concurrent, 16),
+                              ("max_tries", max_tries, 100)):
+        if not isinstance(valor, int) or not 1 <= valor <= teto:
+            raise AguardenteError(
+                f"{nome} precisa ser um inteiro entre 1 e {teto} (recebido: {valor!r})")
+    if not isinstance(retry_wait, int) or not 0 <= retry_wait <= 600:
+        raise AguardenteError(
+            f"retry_wait precisa ser um inteiro entre 0 e 600 (recebido: {retry_wait!r})")
+
     exe = require_aria2()
     pending = plan.missing()
     if not pending:
@@ -155,12 +268,14 @@ def fetch(
     # Formato do arquivo de entrada do aria2: URL numa linha, opções indentadas.
     lines: list[str] = []
     for f in pending:
-        target = plan.dest / f.path
+        target = safe_join(plan.dest, f.path)
         lines.append(f.url(plan.model_id, plan.revision))
         lines.append(f"  dir={target.parent}")
         lines.append(f"  out={target.name}")
     input_file = plan.dest / ".aguardente-fetch.txt"
     input_file.write_text("\n".join(lines) + "\n")
+    # Lista de URLs e caminhos locais: sem interesse para outros usuários da máquina.
+    input_file.chmod(0o600)
 
     cmd = [
         exe,
