@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+dist/
+build/
+
+# saídas de execução: modelos, logits, bundles
+runs/
+outputs/
+exports/
+
+# rascunhos e anotações locais
+.local/
+
+# macOS
+.DS_Store

@@ -1,0 +1,42 @@
+[project]
+name = "aguardente"
+version = "0.1.0"
+description = "Poda estruturada, destilacao de recuperacao e conversao para Core AI"
+requires-python = ">=3.11,<3.14"
+
+# O nucleo de planejamento (probe/arch/plan/budget/fetch) nao depende de torch.
+# Isso mantem `doctor`, `plan` e `fetch` utilizaveis num ambiente leve.
+dependencies = []
+
+[project.optional-dependencies]
+# ATENCAO: `coreai-models` NAO pode vir do PyPI.
+# O nome esta ocupado por um pacote de terceiro (summary "Add your description
+# here", sem autor, requires-python >=3.14). O pacote real da Apple existe
+# apenas no GitHub e nunca foi publicado no PyPI. Por isso a URL git explicita.
+pipeline = [
+    "torch>=2.8.0",
+    "transformers>=5.5.0",
+    "datasets>=4.0,<5.0",
+    "accelerate>=1.12,<2.0",
+    "coreai-torch",
+    "coreai-opt",
+    "coreai-models @ git+https://github.com/apple/coreai-models@main#subdirectory=python",
+]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+aguardente = "aguardente.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Necessario para a URL git de `coreai-models` no extra `pipeline`.
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aguardente"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
