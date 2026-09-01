@@ -1,11 +1,20 @@
-# aguardente
+<p align="center">
+  <img src="docs/media/icon.svg" width="128" alt="aguardente">
+</p>
 
-Encolhe modelos de linguagem para caberem no seu Mac — e converte o resultado
-para o formato nativo da Apple.
+<h1 align="center">aguardente</h1>
 
-Pega um modelo do Hugging Face grande demais para a sua máquina, **remove
-parâmetros** por poda estruturada, **recupera a qualidade** perdida por
-destilação, e entrega um `.aimodel` pronto para rodar via Core AI.
+<p align="center">
+  Encolhe modelos de linguagem até caberem num Mac —<br>
+  e converte o resultado para o formato nativo da Apple.
+</p>
+
+---
+
+Modelos de linguagem cresceram mais rápido que a memória das máquinas em que
+se quer rodá-los. `aguardente` pega um modelo do Hugging Face grande demais,
+**remove parâmetros** por poda estruturada, **recupera a qualidade** perdida
+por destilação, e entrega um `.aimodel` pronto para rodar via Core AI.
 
 <!--
   MÍDIA — substituir pelos arquivos reais em docs/media/.
@@ -24,13 +33,13 @@ Um comando. Resolve Homebrew, `uv`, `aria2`, o interpretador Python correto e
 o próprio programa:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SEU-USUARIO/aguardente/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/joaaosc/aguardente/main/install.sh | bash
 ```
 
 Ou, a partir de um clone do repositório:
 
 ```bash
-git clone https://github.com/SEU-USUARIO/aguardente && cd aguardente && ./install.sh
+git clone https://github.com/joaaosc/aguardente && cd aguardente && ./install.sh
 ```
 
 O instalador é idempotente: rodar de novo apenas atualiza o que mudou.
@@ -172,5 +181,15 @@ uv run --with pytest --with torch --with transformers pytest
 
 ## Licença
 
-Ver `LICENSE`. Os utilitários em `src/aguardente/vendor/` vêm do projeto
-`apple/coreai-models` sob BSD-3-Clause, com a atribuição preservada.
+**Software proprietário.** O código está visível para leitura e auditoria, o
+que não o torna livre nem de código aberto.
+
+Permitido: uso pessoal, privado e sem fins lucrativos; estudo do código;
+modificação para uso próprio.
+
+Proibido sem autorização escrita: uso comercial, reprodução, redistribuição,
+e obras derivadas destinadas a distribuição.
+
+Ver [`LICENSE`](LICENSE) para os termos completos. Os modelos gerados pela
+ferramenta não são cobertos por esta licença — seu uso segue a licença do
+modelo de origem.

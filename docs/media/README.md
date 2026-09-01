@@ -5,6 +5,8 @@ no repositório ainda — este documento diz como gravá-los.
 
 | Arquivo | Onde aparece | O que mostrar |
 |---|---|---|
+| `icon.svg` | README, topo | pronto — gota em vidro líquido |
+| `icon-mono.svg` | uso monocromático | pronto — herda `currentColor` |
 | `demo.gif` | README, topo | `aguardente run` do início ao fim, acelerado |
 | `plan.png` | README, seção Uso | saída completa de `aguardente plan Qwen/Qwen3-4B` |
 | `doctor.png` | usage.md | saída de `aguardente doctor` com tudo verde |

@@ -1,28 +1,132 @@
-BSD 3-Clause License
+LICENÇA DE USO RESTRITO — aguardente
+Copyright (c) 2026. Todos os direitos reservados.
 
-Copyright (c) 2026, joaaosc
+Este software é proprietário. Não é software livre nem de código aberto.
+O código-fonte está visível para leitura e auditoria, o que NÃO concede
+qualquer direito além dos expressamente listados abaixo.
 
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
 
-1. Redistributions of source code must retain the above copyright notice, this
-   list of conditions and the following disclaimer.
+1. PERMITIDO
 
-2. Redistributions in binary form must reproduce the above copyright notice,
-   this list of conditions and the following disclaimer in the documentation
-   and/or other materials provided with the distribution.
+   a) Executar o software para uso pessoal, privado e sem fins lucrativos.
+   b) Ler e estudar o código-fonte.
+   c) Modificar o código para uso próprio, privado e não comercial.
+   d) Relatar defeitos e sugerir melhorias ao titular dos direitos.
 
-3. Neither the name of the copyright holder nor the names of its
-   contributors may be used to endorse or promote products derived from
-   this software without specific prior written permission.
 
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+2. PROIBIDO SEM AUTORIZAÇÃO PRÉVIA E POR ESCRITO
+
+   a) USO COMERCIAL de qualquer natureza, incluindo — sem limitação — uso
+      dentro de empresa ou organização com fins lucrativos, prestação de
+      serviços a terceiros, e incorporação em produto ou serviço pago ou
+      gratuito oferecido a terceiros.
+
+   b) REPRODUÇÃO E REDISTRIBUIÇÃO, no todo ou em parte, em qualquer forma
+      ou meio, incluindo republicação do código, espelhamento do
+      repositório, e distribuição de binários ou pacotes derivados.
+
+   c) OBRAS DERIVADAS destinadas a distribuição ou disponibilização
+      pública, ainda que gratuitas.
+
+   d) SUBLICENCIAMENTO, venda, aluguel, empréstimo ou cessão dos direitos
+      aqui concedidos.
+
+   e) REMOÇÃO OU ALTERAÇÃO de avisos de copyright, de autoria ou desta
+      licença.
+
+   f) USO DO NOME do projeto ou do titular para promover produtos ou
+      serviços derivados.
+
+
+3. MODELOS PRODUZIDOS PELO SOFTWARE
+
+   Os artefatos gerados pela execução do software — modelos podados,
+   destilados ou convertidos — não são objeto desta licença. Seu uso
+   permanece sujeito à licença do modelo de origem, que o usuário é o
+   único responsável por verificar e cumprir.
+
+
+4. COMPONENTES DE TERCEIROS
+
+   O software invoca ferramentas e bibliotecas de terceiros, distribuídas
+   sob suas próprias licenças e não abrangidas por esta. Nenhum código de
+   terceiros é redistribuído neste repositório.
+
+
+5. AUSÊNCIA DE GARANTIA
+
+   O SOFTWARE É FORNECIDO "NO ESTADO EM QUE SE ENCONTRA", SEM GARANTIA DE
+   QUALQUER NATUREZA, EXPRESSA OU IMPLÍCITA, INCLUINDO GARANTIAS DE
+   COMERCIALIZAÇÃO, ADEQUAÇÃO A UMA FINALIDADE ESPECÍFICA E NÃO VIOLAÇÃO.
+   EM NENHUMA HIPÓTESE O TITULAR SERÁ RESPONSÁVEL POR QUALQUER
+   RECLAMAÇÃO, DANO OU OUTRA RESPONSABILIDADE DECORRENTE DO SOFTWARE OU
+   DE SEU USO.
+
+
+6. RESCISÃO
+
+   Esta licença termina automaticamente e sem aviso caso qualquer condição
+   seja violada. Encerrada a licença, todo uso deve cessar e todas as
+   cópias devem ser destruídas.
+
+
+7. AUTORIZAÇÕES
+
+   Permissões além das concedidas aqui — incluindo licenciamento comercial —
+   devem ser solicitadas ao titular dos direitos por meio do repositório
+   oficial do projeto.
+
+
+================================================================================
+
+RESTRICTED USE LICENSE — aguardente
+Copyright (c) 2026. All rights reserved.
+
+This software is proprietary. It is neither free nor open source software.
+The source code is visible for reading and auditing, which grants NO rights
+beyond those expressly listed below.
+
+1. PERMITTED
+   a) Running the software for personal, private, non-profit use.
+   b) Reading and studying the source code.
+   c) Modifying the code for private, non-commercial personal use.
+   d) Reporting defects and suggesting improvements to the rights holder.
+
+2. PROHIBITED WITHOUT PRIOR WRITTEN AUTHORIZATION
+   a) COMMERCIAL USE of any kind, including use within a for-profit
+      organization, providing services to third parties, and incorporation
+      into any product or service offered to third parties.
+   b) REPRODUCTION AND REDISTRIBUTION, in whole or in part, in any form or
+      medium, including republishing the code, mirroring the repository, and
+      distributing derived binaries or packages.
+   c) DERIVATIVE WORKS intended for distribution or public availability,
+      even free of charge.
+   d) SUBLICENSING, selling, renting, lending or assigning the rights
+      granted herein.
+   e) REMOVING OR ALTERING copyright, authorship or license notices.
+   f) USING THE NAME of the project or rights holder to promote derived
+      products or services.
+
+3. MODELS PRODUCED BY THE SOFTWARE
+   Artifacts that the software produces are not covered by this
+   license. Their use remains subject to the source model's own license,
+   which the user is solely responsible for verifying and complying with.
+
+4. THIRD-PARTY COMPONENTS
+   The software invokes third-party tools and libraries distributed under
+   their own licenses, not covered by this one. No third-party code is
+   redistributed in this repository.
+
+5. NO WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED. IN NO EVENT SHALL THE RIGHTS HOLDER BE LIABLE FOR ANY CLAIM,
+   DAMAGES OR OTHER LIABILITY ARISING FROM THE SOFTWARE OR ITS USE.
+
+6. TERMINATION
+   This license terminates automatically and without notice upon any breach.
+   Upon termination, all use must cease and all copies must be destroyed.
+
+7. AUTHORIZATIONS
+   Permissions beyond those granted here — including commercial licensing —
+   must be requested from the rights holder through the project's official
+   repository.

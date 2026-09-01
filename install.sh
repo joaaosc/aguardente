@@ -2,7 +2,7 @@
 #
 # Instalador do aguardente para macOS.
 #
-#   curl -fsSL https://raw.githubusercontent.com/SEU-USUARIO/aguardente/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/joaaosc/aguardente/main/install.sh | bash
 #
 # Resolve tudo: interpretador Python correto, gerenciador de pacotes,
 # acelerador de download, e o proprio programa. Reexecutar e seguro.
@@ -10,7 +10,7 @@
 set -euo pipefail
 
 PYTHON_VERSION="3.12"
-REPO_URL="${AGUARDENTE_REPO:-https://github.com/SEU-USUARIO/aguardente}"
+REPO_URL="${AGUARDENTE_REPO:-https://github.com/joaaosc/aguardente}"
 
 bold=$'\033[1m'; dim=$'\033[2m'; red=$'\033[31m'; green=$'\033[32m'
 yellow=$'\033[33m'; blue=$'\033[34m'; reset=$'\033[0m'

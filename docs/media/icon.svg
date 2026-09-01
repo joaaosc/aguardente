@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512"
+     role="img" aria-label="aguardente">
+  <title>aguardente</title>
+  <desc>Gota em vidro líquido — destilação de modelos</desc>
+
+  <defs>
+    <!-- Material: do topo claro e saturado para a base profunda.
+         O vidro escurece na base porque é onde a espessura é maior. -->
+    <linearGradient id="vidro" x1="0.28" y1="0" x2="0.72" y2="1">
+      <stop offset="0"    stop-color="#7FE8FF"/>
+      <stop offset="0.42" stop-color="#3AA9F5"/>
+      <stop offset="1"    stop-color="#1B4FD8"/>
+    </linearGradient>
+
+    <!-- Brilho especular: a fonte de luz fica acima e à esquerda. -->
+    <radialGradient id="brilho" cx="0.34" cy="0.24" r="0.62">
+      <stop offset="0"   stop-color="#FFFFFF" stop-opacity="0.85"/>
+      <stop offset="0.4" stop-color="#FFFFFF" stop-opacity="0.16"/>
+      <stop offset="1"   stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Luz que atravessa o vidro e volta pela base oposta à fonte. -->
+    <radialGradient id="refracao" cx="0.68" cy="0.82" r="0.45">
+      <stop offset="0" stop-color="#9DF5FF" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#9DF5FF" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Borda: clara em cima, some embaixo. -->
+    <linearGradient id="borda" x1="0.3" y1="0" x2="0.7" y2="1">
+      <stop offset="0"   stop-color="#FFFFFF" stop-opacity="0.9"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0.25"/>
+      <stop offset="1"   stop-color="#FFFFFF" stop-opacity="0.05"/>
+    </linearGradient>
+
+    <!-- A gota, definida uma vez e reaproveitada como forma e recorte. -->
+    <path id="gota"
+          d="M244 66 Q256 46 268 66 C318 134 412 244 412 330 A156 156 0 1 1 100 330 C100 244 194 134 244 66 Z"/>
+    <clipPath id="recorte"><use href="#gota"/></clipPath>
+  </defs>
+
+  <use href="#gota" fill="url(#vidro)"/>
+
+  <g clip-path="url(#recorte)">
+    <use href="#gota" fill="url(#refracao)"/>
+    <use href="#gota" fill="url(#brilho)"/>
+    <!-- Realce especular: a mancha de luz concentrada da superfície curva. -->
+    <ellipse cx="196" cy="250" rx="62" ry="86"
+             fill="#FFFFFF" opacity="0.3" transform="rotate(-24 196 250)"/>
+  </g>
+
+  <use href="#gota" fill="none" stroke="url(#borda)" stroke-width="6"/>
+</svg>
