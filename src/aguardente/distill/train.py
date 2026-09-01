@@ -48,6 +48,12 @@ class RecoveryConfig:
     max_seconds: float | None = None
 
 
+# O histórico de perdas serve para inspeção, não para o treino. Num treino de
+# horas seriam centenas de milhares de floats retidos sem proveito, então
+# guarda-se uma janela recente de tamanho fixo.
+_MAX_LOSS_HISTORY = 2000
+
+
 @dataclass
 class RecoveryResult:
     steps: int = 0
@@ -155,6 +161,8 @@ def recover(
 
                 value = float(loss.detach())
                 result.losses.append(value)
+                if len(result.losses) > _MAX_LOSS_HISTORY:
+                    del result.losses[:len(result.losses) - _MAX_LOSS_HISTORY]
                 if on_step:
                     on_step(result.steps, value)
 
@@ -198,8 +206,23 @@ def _finish(result: RecoveryResult, started: float, student: Any,
 
 
 def _save_checkpoint(student: Any, ckpt: Path, step: int, metric: float) -> None:
+    """Grava o melhor checkpoint de forma atômica.
+
+    Escrever direto sobre `best.pt` significa que uma interrupção no meio da
+    gravação destrói o único checkpoint bom que existia — justamente quando
+    ele mais importa. Grava-se ao lado e renomeia-se, que é atômico no mesmo
+    sistema de arquivos.
+    """
     import torch
 
-    torch.save({"step": step, "metric": metric,
-                "state_dict": {k: v.detach().cpu() for k, v in student.state_dict().items()}},
-               ckpt / "best.pt")
+    destino = ckpt / "best.pt"
+    temporario = ckpt / "best.pt.tmp"
+    try:
+        torch.save(
+            {"step": step, "metric": metric,
+             "state_dict": {k: v.detach().cpu() for k, v in student.state_dict().items()}},
+            temporario,
+        )
+        temporario.replace(destino)
+    finally:
+        temporario.unlink(missing_ok=True)
