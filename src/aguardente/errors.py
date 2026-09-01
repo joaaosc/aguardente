@@ -27,5 +27,13 @@ class UnsupportedArchitecture(AguardenteError):
     """Arquitetura não suportada ou parâmetros insuficientes para o plano de poda."""
 
 
+class StateMismatch(AguardenteError):
+    """Diretório de execução incompatível com os parâmetros solicitados."""
+
+
+class InsufficientResources(AguardenteError):
+    """Recurso de máquina insuficiente para concluir a etapa."""
+
+
 class PlanImpossible(AguardenteError):
     """Alvo de parâmetros solicitado não pode ser alcançado dentro dos limites da arquitetura."""
