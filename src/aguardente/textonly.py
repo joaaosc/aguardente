@@ -680,3 +680,244 @@ def _escrever_indice(parcial: Path, mapa: dict[str, str], total: int) -> None:
     (parcial / "model.safetensors.index.json").write_text(json.dumps(
         {"metadata": {"total_size": total}, "weight_map": dict(sorted(mapa.items()))},
         indent=2) + "\n")
+
+
+# Registro de arquiteturas do exportador da Apple, chaveado pelo model_type do
+# Hugging Face. Cópia de `coreai_models/models/registry.py`, usada só quando o
+# pacote não está instalado — quando está, a lista vem dele.
+APPLE_FALLBACK = frozenset({
+    "gemma3_text", "gpt_oss", "mistral", "mixtral", "muse_glimmer_text",
+    "muse_glimmer_assistant", "phi3", "qwen2", "qwen3", "qwen3_moe", "qwen3_vl",
+})
+
+# Equivalências estruturais: o decoder de origem tem outro nome, mas o mesmo
+# grafo de uma arquitetura que o exportador conhece.
+#
+# `llama → mistral` é a única que exige justificativa. A implementação da Apple
+# em `models/macos/mistral.py` é ponto a ponto LLaMA: atenção causal plena, sem
+# janela deslizante, RMSNorm, MLP SwiGLU e RoPE. Os nomes dos tensores são os
+# mesmos, e a fusão q/k/v acontece dentro do carregador dela.
+EQUIVALENT = {
+    "llama": "mistral",
+    "gemma3": "gemma3_text",
+    "qwen2_5": "qwen2", "qwen2_vl": "qwen2", "qwen2_5_vl": "qwen2",
+    "qwen3_vl": "qwen3", "qwen3_vl_text": "qwen3",
+    "muse_glimmer": "muse_glimmer_text",
+}
+
+# Chaves do config que descrevem componentes descartados ou o processador de
+# imagem, e que não fazem sentido num modelo só de texto.
+MULTIMODAL_KEYS = (
+    "vision_config", "aligner_config", "projector_config", "visual",
+    "vision_tower", "image_token_id", "video_token_id", "image_seq_len",
+    "vision_start_token_id", "vision_end_token_id", "vision_token_id",
+    "scale_factor", "image_token_index", "auto_map", "architectures",
+    *TEXT_CONFIG_KEYS,
+)
+
+# Campos que o decoder precisa e que o config aninhado às vezes omite, deixando
+# que a classe do transformers os preencha. Materializá-los explicitamente evita
+# depender de a classe de destino ter o mesmo default da de origem.
+#
+# Os valores de `llama` foram conferidos contra o config publicado de
+# `deepseek-ai/deepseek-llm-7b-chat`, que é o decoder do DeepSeek-VL.
+CLASS_DEFAULTS = {
+    "llama": {"rope_theta": 10000.0, "rms_norm_eps": 1e-6, "hidden_act": "silu",
+              "initializer_range": 0.02},
+    "mistral": {"rope_theta": 10000.0, "rms_norm_eps": 1e-6, "hidden_act": "silu",
+                "initializer_range": 0.02},
+}
+
+
+def supported_model_types() -> tuple[frozenset[str], bool]:
+    """Arquiteturas aceitas pelo exportador, e se vieram do pacote instalado."""
+    try:
+        from coreai_models.models.registry import list_models
+        return frozenset(list_models()), True
+    except Exception:  # noqa: BLE001 — ausência do pacote é o caso comum
+        return APPLE_FALLBACK, False
+
+
+def emitted_model_type(origem: str) -> str:
+    """Traduz o model_type do decoder para um que o exportador da Apple aceite.
+
+    A conferência acontece no `plan`, antes de qualquer download: descobrir que o
+    exportador não conhece a arquitetura depois de baixar treze gigabytes e podar
+    por horas é o tipo de falha que esta função existe para evitar.
+    """
+    aceitos, do_pacote = supported_model_types()
+    alvo = EQUIVALENT.get(origem, origem)
+    if alvo in aceitos:
+        return alvo
+    fonte = "" if do_pacote else " (lista embutida; o pacote não está instalado)"
+    raise UnsupportedArchitecture(
+        f"o exportador da Apple não converte {origem!r}"
+        + (f", nem seu equivalente {alvo!r}" if alvo != origem else ""),
+        hint=f"Arquiteturas aceitas{fonte}: {', '.join(sorted(aceitos))}.",
+    )
+
+
+def _e_mrope(rope: Any) -> bool:
+    """RoPE multimodal, que divide as dimensões entre tempo, altura e largura.
+
+    Para entrada só de texto os três eixos recebem a mesma posição e o M-RoPE
+    degenera no RoPE padrão, então removê-lo é identidade, não aproximação.
+    Escalas de verdade — o fator linear do Gemma 3, o dinâmico do InternVL —
+    pertencem ao decoder e precisam sobreviver.
+    """
+    if not isinstance(rope, dict):
+        return False
+    return rope.get("type") == "mrope" or "mrope_section" in rope
+
+
+def strip_multimodal(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove do config o que descreve componentes descartados."""
+    limpo = {k: v for k, v in cfg.items() if k not in MULTIMODAL_KEYS}
+    if _e_mrope(limpo.get("rope_scaling")):
+        limpo.pop("rope_scaling")
+    return limpo
+
+
+# Classe causal correspondente a cada model_type aceito pelo exportador.
+CAUSAL_CLASS = {
+    "mistral": "MistralForCausalLM", "mixtral": "MixtralForCausalLM",
+    "qwen2": "Qwen2ForCausalLM", "qwen3": "Qwen3ForCausalLM",
+    "qwen3_moe": "Qwen3MoeForCausalLM", "gemma3_text": "Gemma3ForCausalLM",
+    "phi3": "Phi3ForCausalLM", "gpt_oss": "GptOssForCausalLM",
+}
+
+# Arquivos do tokenizer que acompanham o decoder. `preprocessor_config.json` e
+# `processor_config.json` ficam de fora de propósito: descrevem o processador de
+# imagem, e sua presença faz o transformers tentar montar um processador
+# multimodal sobre um modelo que já não é.
+AUX_FILES = ("tokenizer.json", "tokenizer_config.json", "tokenizer.model",
+             "special_tokens_map.json", "added_tokens.json", "vocab.json",
+             "merges.txt", "chat_template.jinja", "generation_config.json")
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigReport:
+    """Config emitido e as decisões que foram tomadas para chegar nele."""
+
+    config: dict[str, Any] = field(repr=False)
+    source_type: str
+    emitted_type: str
+    defaults_used: tuple[str, ...]
+    dropped_keys: tuple[str, ...]
+
+
+def build_config(cfg: Mapping[str, Any], arch: Arch, layout: TextLayout) -> ConfigReport:
+    """Monta o config.json de um decoder causal a partir do config multimodal."""
+    sub, _ = text_config(cfg)
+    origem = str(sub.get("model_type") or cfg.get("model_type") or "")
+    alvo = emitted_model_type(origem)
+
+    limpo = strip_multimodal(sub)
+    descartadas = tuple(sorted(set(sub) - set(limpo)))
+
+    # Campos que a classe de origem preencheria por default e a de destino
+    # poderia preencher diferente. Materializá-los aqui congela o que o modelo
+    # de origem realmente usava.
+    usados = []
+    for campo, valor in CLASS_DEFAULTS.get(origem, {}).items():
+        if campo not in limpo:
+            limpo[campo] = valor
+            usados.append(campo)
+
+    limpo |= {
+        "model_type": alvo,
+        "architectures": [CAUSAL_CLASS[alvo]],
+        "hidden_size": arch.hidden_size,
+        "intermediate_size": arch.intermediate_size,
+        "num_hidden_layers": arch.num_hidden_layers,
+        "num_attention_heads": arch.num_attention_heads,
+        "num_key_value_heads": arch.num_key_value_heads,
+        "head_dim": arch.head_dim,
+        "vocab_size": arch.vocab_size,
+        "tie_word_embeddings": arch.tie_word_embeddings,
+        "attention_bias": arch.attention_bias,
+    }
+    return ConfigReport(config=limpo, source_type=origem, emitted_type=alvo,
+                        defaults_used=tuple(sorted(usados)), dropped_keys=descartadas)
+
+
+def copy_auxiliary(src: str | Path, dst: str | Path) -> tuple[str, ...]:
+    """Copia tokenizer e afins, limpando o que aponta para o processador de imagem."""
+    src, dst = Path(src), Path(dst)
+    copiados = []
+    for nome in AUX_FILES:
+        origem = src / nome
+        if not origem.is_file():
+            continue
+        if nome == "tokenizer_config.json":
+            dados = json.loads(origem.read_text())
+            # `processor_class` faria o AutoProcessor procurar a torre de visão.
+            dados.pop("processor_class", None)
+            (dst / nome).write_text(json.dumps(dados, ensure_ascii=False, indent=2) + "\n")
+        else:
+            shutil.copy2(origem, dst / nome)
+        copiados.append(nome)
+    return tuple(copiados)
+
+
+def _tokens_dentro_do_vocabulario(dst: Path, vocab: int) -> None:
+    """Token especial acima do vocabulário indica embeddings ampliadas pela torre."""
+    cfg = dst / "tokenizer_config.json"
+    if not cfg.is_file():
+        return
+    declarados = json.loads(cfg.read_text()).get("added_tokens_decoder") or {}
+    altos = [int(i) for i in declarados if int(i) >= vocab]
+    if altos:
+        raise UnsupportedArchitecture(
+            f"o tokenizer declara token de id {max(altos)} para um vocabulário de {vocab}",
+            hint="O modelo multimodal ampliou as embeddings; extrair só o decoder "
+                 "deixaria esses tokens sem vetor.",
+        )
+
+
+def verify_extraction(dst: str | Path, arch: Arch) -> TextLayout:
+    """Relê o que foi escrito e confere que descreve o decoder esperado.
+
+    A conferência é feita sobre os arquivos gravados, não sobre as estruturas em
+    memória que os geraram: é o único jeito de pegar um erro na própria escrita.
+    """
+    dst = Path(dst)
+    headers = {}
+    for p in sorted(dst.glob("*.safetensors")):
+        with open(p, "rb") as f:
+            headers[p.name] = {k: v for k, v in read_header(f)[0].items()
+                               if k != "__metadata__"}
+    if not headers:
+        raise UnsupportedArchitecture(f"{dst} não contém arquivos .safetensors")
+
+    layout = discover_layout(headers)
+    if layout.prefix != ROOT or layout.is_multimodal:
+        raise UnsupportedArchitecture(
+            f"o checkpoint extraído não está na raiz canônica: prefixo {layout.prefix!r}, "
+            f"{len(layout.dropped)} tensor(es) fora do decoder",
+            hint="A renomeação da extração não produziu um decoder causal puro.",
+        )
+    if (erro := reconcile(arch, layout)) != 0:
+        raise UnsupportedArchitecture(
+            f"o checkpoint extraído tem {layout.kept_params:,} parâmetros, e a "
+            f"arquitetura prevê {layout.kept_params + erro:,} (diferença {erro:+,})",
+            hint="A arquitetura calculada não descreve os pesos gravados.",
+        )
+    if layout.num_layers != arch.num_hidden_layers:
+        raise UnsupportedArchitecture(
+            f"o checkpoint extraído tem {layout.num_layers} camadas, e a "
+            f"arquitetura prevê {arch.num_hidden_layers}")
+
+    indice = dst / "model.safetensors.index.json"
+    if indice.is_file():
+        mapa = json.loads(indice.read_text()).get("weight_map") or {}
+        if set(mapa) != set(layout.rename):
+            faltando = sorted(set(layout.rename) - set(mapa))[:3]
+            raise UnsupportedArchitecture(
+                f"o índice não corresponde aos tensores gravados: falta {faltando}")
+    elif len(headers) > 1:
+        raise UnsupportedArchitecture(
+            f"{dst} tem {len(headers)} shards e nenhum índice")
+
+    _tokens_dentro_do_vocabulario(dst, arch.vocab_size)
+    return layout
