@@ -3,14 +3,109 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
+
+from .errors import StateMismatch
 
 STATE_FILE = "state.json"
 STATE_VERSION = 1
+
+# Chave em que cada etapa grava a impressão digital dos parâmetros que a geraram.
+FINGERPRINT = "fingerprint"
+
+LOCK_FILE = "run.lock"
+# Um lock mais antigo que isto pertence a um processo que morreu sem limpá-lo.
+STALE_LOCK_SECONDS = 12 * 3600
+
+
+def _process_alive(pid: int) -> bool:
+    """Indica se o processo existe; sinal 0 apenas consulta, não interrompe."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # existe, mas pertence a outro usuário
+        return True
+    return True
+
+
+def _lock_owner(lock: Path) -> dict[str, Any] | None:
+    try:
+        dados = json.loads(lock.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return dados if isinstance(dados, dict) else None
+
+
+def _lock_is_stale(dono: dict[str, Any], stale_after: float) -> bool:
+    """Um lock é obsoleto quando seu dono morreu ou envelheceu além do limite."""
+    if time.time() - float(dono.get("at") or 0) > stale_after:
+        return True
+    # A verificação por pid só vale na mesma máquina: em volume compartilhado o
+    # número poderia coincidir com um processo local sem qualquer relação.
+    if dono.get("host") != socket.gethostname():
+        return False
+    return not _process_alive(int(dono.get("pid") or 0))
+
+
+@contextmanager
+def run_lock(run_dir: str | Path, *,
+             stale_after: float = STALE_LOCK_SECONDS) -> Iterator[Path]:
+    """Exclusão mútua consultiva entre execuções sobre o mesmo diretório."""
+    d = Path(run_dir).expanduser()
+    d.mkdir(parents=True, exist_ok=True)
+    lock = d / LOCK_FILE
+    marca = json.dumps({"pid": os.getpid(), "at": time.time(),
+                        "host": socket.gethostname()})
+
+    for tentativa in (1, 2):
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.write(fd, marca.encode())
+            os.close(fd)
+            break
+        except FileExistsError:
+            dono = _lock_owner(lock)
+            if tentativa == 1 and (dono is None or _lock_is_stale(dono, stale_after)):
+                lock.unlink(missing_ok=True)
+                continue
+            raise StateMismatch(
+                f"outra execução já está usando {d} "
+                f"(pid {dono.get('pid') if dono else '?'})",
+                hint=f"Aguarde a conclusão, ou remova {lock} se o processo não existe mais.",
+            ) from None
+    try:
+        yield lock
+    finally:
+        dono = _lock_owner(lock)
+        if dono and dono.get("pid") == os.getpid():
+            lock.unlink(missing_ok=True)
+
+
+def _require_same(rotulo: str, gravado: Any, pedido: Any, run_dir: Path) -> None:
+    """Recusa reaproveitar um diretório cujo estado foi criado com outro parâmetro.
+
+    O argumento vazio (ou ausente) herda o valor gravado — é o caso da retomada
+    normal. Só há divergência quando ambos existem e diferem, e nesse caso a
+    execução para: continuar produziria um artefato que não corresponde ao comando.
+    """
+    if not pedido or not gravado or pedido == gravado:
+        return
+    raise StateMismatch(
+        f"o diretório {run_dir} pertence a outra execução — "
+        f"{rotulo} gravado: {gravado}; solicitado: {pedido}",
+        hint="Use outro diretório com -o, ou --restart para descartar o estado e os "
+             "artefatos desta pasta antes de recomeçar.",
+    )
 
 
 class StageStatus(str, Enum):
@@ -60,15 +155,20 @@ class RunState:
 
     @classmethod
     def load_or_create(cls, run_dir: str | Path, *, model: str = "",
-                       target_params: int | None = None) -> RunState:
+                       target_params: int | None = None,
+                       restart: bool = False) -> RunState:
         d = Path(run_dir).expanduser()
         p = d / STATE_FILE
-        if p.is_file():
-            raw = json.loads(p.read_text())
+        if p.is_file() and not restart:
+            raw = cls._read(p)
+            gravado_modelo = str(raw.get("model") or "")
+            gravado_alvo = raw.get("target_params")
+            _require_same("modelo", gravado_modelo, model, d)
+            _require_same("alvo de parâmetros", gravado_alvo, target_params, d)
             state = cls(
                 run_dir=d,
-                model=raw.get("model", model),
-                target_params=raw.get("target_params", target_params),
+                model=gravado_modelo or model,
+                target_params=gravado_alvo if gravado_alvo is not None else target_params,
                 created=raw.get("created", time.time()),
                 version=raw.get("version", STATE_VERSION),
                 stages={k: StageState(status=StageStatus(v.get("status", "pending")),
@@ -87,6 +187,24 @@ class RunState:
         state = cls(run_dir=d, model=model, target_params=target_params)
         state.save()
         return state
+
+    @staticmethod
+    def _read(p: Path) -> dict[str, Any]:
+        """Lê o estado gravado, traduzindo arquivo corrompido em erro acionável."""
+        try:
+            raw = json.loads(p.read_text())
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise StateMismatch(
+                f"{p} está corrompido e não pôde ser lido: {e}",
+                hint="Remova o arquivo para reiniciar a execução, ou use outro diretório com -o.",
+            ) from e
+        except OSError as e:
+            raise StateMismatch(f"não foi possível ler {p}: {e}",
+                                hint="Verifique as permissões do diretório de execução.") from e
+        if not isinstance(raw, dict):
+            raise StateMismatch(f"{p} não contém um objeto JSON válido",
+                                hint="Remova o arquivo para reiniciar a execução.")
+        return raw
 
     def save(self) -> None:
         """Grava o estado em disco de forma atômica."""
@@ -108,8 +226,9 @@ class RunState:
     def stage(self, name: str) -> StageState:
         return self.stages.setdefault(name, StageState())
 
-    def is_done(self, name: str, *, require: Sequence[str] = ()) -> bool:
-        """Verifica se a etapa foi concluída e se as saídas esperadas existem no disco."""
+    def is_done(self, name: str, *, require: Sequence[str] = (),
+                fingerprint: str | None = None) -> bool:
+        """Verifica se a etapa foi concluída, se as saídas existem e se os parâmetros batem."""
         s = self.stage(name)
         if not s.done:
             return False
@@ -117,7 +236,17 @@ class RunState:
             p = s.outputs.get(key)
             if not p or not Path(p).exists():
                 return False
+        if fingerprint is not None:
+            gravado = s.outputs.get(FINGERPRINT)
+            # Estado sem impressão digital vem de uma versão anterior: é aproveitado,
+            # e o chamador avisa. Divergência explícita invalida a etapa.
+            if gravado is not None and gravado != fingerprint:
+                return False
         return True
+
+    def fingerprint_of(self, name: str) -> str | None:
+        """Impressão digital gravada pela etapa, ou None se ela nunca gravou uma."""
+        return self.stage(name).outputs.get(FINGERPRINT)
 
     def begin(self, name: str) -> StageState:
         s = self.stage(name)
