@@ -7,6 +7,81 @@ from typing import Any
 
 from .errors import UnsupportedArchitecture
 
+# Chaves que denunciam arquiteturas fora do escopo: a contagem analítica assume
+# um decoder causal denso, text-only, com as dimensões no nível de topo.
+MOE_KEYS = ("num_experts", "n_routed_experts", "num_local_experts",
+            "moe_intermediate_size", "num_experts_per_tok", "n_shared_experts")
+VISION_KEYS = ("vision_config", "vision_n_layers", "vision_tower", "visual")
+NESTED_KEYS = ("text_config", "language_config", "llm_config")
+
+# Chaves genéricas o bastante para colidir com outro uso: só contam como sinal
+# de arquitetura multimodal quando carregam uma subconfiguração.
+AMBIGUOUS_KEYS = ("visual",)
+
+# Pesos já quantizados chegam com todas as dimensões densas no topo e passariam
+# pelas demais guardas, mas a poda estruturada não sabe fatiar seus tensores.
+QUANT_DTYPES = ("int8", "uint8", "int4", "uint4", "fp8", "float8")
+
+
+def _present(cfg: dict[str, Any], keys: tuple[str, ...]) -> list[str]:
+    """Chaves com valor significativo. Um zero ou vazio explícito é ausência."""
+    achadas = []
+    for k in keys:
+        v = cfg.get(k)
+        if not v:
+            continue
+        if k in AMBIGUOUS_KEYS and not isinstance(v, dict):
+            continue
+        achadas.append(k)
+    return achadas
+
+
+def _quantized(cfg: dict[str, Any]) -> str | None:
+    """Descreve o esquema de quantização declarado no config, se houver."""
+    if cfg.get("quantization_config"):
+        q = cfg["quantization_config"]
+        metodo = q.get("quant_method") if isinstance(q, dict) else None
+        return f"quantization_config ({metodo})" if metodo else "quantization_config"
+    dtype = str(cfg.get("dtype") or cfg.get("torch_dtype") or "").lower()
+    if any(marca in dtype for marca in QUANT_DTYPES):
+        return f"dtype {dtype}"
+    return None
+
+
+def _reject_unsupported(cfg: dict[str, Any]) -> None:
+    """Recusa configs cuja contagem densa produziria um resultado silenciosamente errado."""
+    if moe := _present(cfg, MOE_KEYS):
+        raise UnsupportedArchitecture(
+            f"arquitetura MoE não suportada (config expõe {', '.join(moe)})",
+            hint="A contagem de parâmetros assume uma MLP densa por camada; em um modelo "
+                 "MoE ela erraria por ordens de grandeza. Use um decoder denso.",
+        )
+    if vis := _present(cfg, VISION_KEYS):
+        raise UnsupportedArchitecture(
+            f"arquitetura multimodal não suportada (config expõe {', '.join(vis)})",
+            hint="O pipeline poda e destila apenas o decoder causal de texto.",
+        )
+    if quant := _quantized(cfg):
+        raise UnsupportedArchitecture(
+            f"pesos pré-quantizados não suportados (config expõe {quant})",
+            hint="A poda estruturada e a destilação operam sobre tensores densos em "
+                 "float16. Use o repositório com os pesos originais não quantizados.",
+        )
+    if "hidden_size" not in cfg and (nested := _present(cfg, NESTED_KEYS)):
+        raise UnsupportedArchitecture(
+            f"config.json aninha as dimensões em {', '.join(nested)}",
+            hint="Use o repositório do decoder de texto correspondente, cujo config.json "
+                 "expõe as dimensões no nível de topo.",
+        )
+
+
+def _qk_norm(cfg: dict[str, Any]) -> bool:
+    """Normalização por cabeça em q e k: chave explícita quando houver, senão heurística."""
+    for chave in ("use_qk_norm", "qk_norm", "attention_qk_norm", "qk_layernorm"):
+        if chave in cfg:
+            return bool(cfg[chave])
+    return str(cfg.get("model_type", "")).startswith("qwen3")
+
 
 @dataclass(frozen=True, slots=True)
 class Arch:
@@ -38,29 +113,47 @@ class Arch:
 
     @classmethod
     def from_hf_config(cls, cfg: dict[str, Any]) -> Arch:
-        """Extrai dimensões a partir do config.json."""
+        """Extrai dimensões a partir do config.json de um decoder causal denso."""
+        _reject_unsupported(cfg)
         try:
             hidden = int(cfg["hidden_size"])
             heads = int(cfg["num_attention_heads"])
+            intermediate = int(cfg["intermediate_size"])
+            layers = int(cfg["num_hidden_layers"])
+            vocab = int(cfg["vocab_size"])
         except KeyError as exc:
             raise UnsupportedArchitecture(
                 f"config.json não expõe {exc.args[0]!r}",
                 hint="São suportadas apenas arquiteturas de LLM causal no formato transformers.",
             ) from exc
+        except (TypeError, ValueError) as exc:
+            raise UnsupportedArchitecture(
+                f"config.json tem dimensão com valor inválido: {exc}",
+                hint="As dimensões do config.json precisam ser inteiros.",
+            ) from exc
 
+        if not cfg.get("head_dim") and hidden % heads:
+            raise UnsupportedArchitecture(
+                f"hidden_size ({hidden}) não é múltiplo de num_attention_heads ({heads}) "
+                "e o config.json não declara head_dim",
+                hint="Sem head_dim explícito a dimensão por cabeça seria truncada, e a "
+                     "contagem de parâmetros sairia errada sem qualquer sinal.",
+            )
         head_dim = int(cfg.get("head_dim") or hidden // heads)
         n_kv = int(cfg.get("num_key_value_heads") or heads)
 
         return cls(
             hidden_size=hidden,
-            intermediate_size=int(cfg["intermediate_size"]),
-            num_hidden_layers=int(cfg["num_hidden_layers"]),
+            intermediate_size=intermediate,
+            num_hidden_layers=layers,
             num_attention_heads=heads,
             num_key_value_heads=n_kv,
             head_dim=head_dim,
-            vocab_size=int(cfg["vocab_size"]),
-            tie_word_embeddings=bool(cfg.get("tie_word_embeddings", False)),
-            qk_norm=str(cfg.get("model_type", "")).startswith("qwen3"),
+            vocab_size=vocab,
+            # O padrão segue o do transformers (True); divergir daqui erraria a
+            # contagem pelo tamanho inteiro do tensor de embeddings.
+            tie_word_embeddings=bool(cfg.get("tie_word_embeddings", True)),
+            qk_norm=_qk_norm(cfg),
         )
 
     def with_(self, **changes: int) -> Arch:
