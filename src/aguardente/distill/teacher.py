@@ -44,7 +44,11 @@ class TeacherLogits:
         import torch
 
         for i in range(self.shards):
-            blob = torch.load(self.path / f"{i:06d}.pt", map_location="cpu")
+            # weights_only=True recusa pickles arbitrários: `torch.load` sem
+            # esta restrição executa código durante a desserialização, e estes
+            # shards podem vir de um backup ou de outra máquina.
+            blob = torch.load(self.path / f"{i:06d}.pt", map_location="cpu",
+                              weights_only=True)
             if device:
                 blob = {k: v.to(device) for k, v in blob.items()}
             yield blob
