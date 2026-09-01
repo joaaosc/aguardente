@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from math import prod
 from typing import Any, Iterator, Mapping
 
+from .arch import Arch, count_stored
 from .errors import UnsupportedArchitecture
 
 # Raiz canônica de um decoder causal no formato transformers.
@@ -247,3 +248,166 @@ def discover_layout(headers: Mapping[str, Mapping[str, Any]]) -> TextLayout:
         dropped_params=descartados,
         lm_head=cabeca,
     )
+
+
+# Chaves sob as quais um checkpoint multimodal aninha o config do decoder.
+TEXT_CONFIG_KEYS = ("text_config", "language_config", "llm_config", "decoder_config")
+
+# Campos que costumam ficar só no nível de topo e pertencem ao decoder.
+INHERITED = ("tie_word_embeddings", "torch_dtype", "dtype", "vocab_size",
+             "bos_token_id", "eos_token_id", "pad_token_id")
+
+# Número de cabeças assumido pela classe de config do transformers quando o
+# config aninhado o omite. É hipótese, nunca conclusão: o valor derivado daqui
+# é obrigatoriamente conferido contra as formas de q_proj e k_proj, e uma
+# divergência interrompe. O DeepSeek-VL depende disto — seu `language_config`
+# declara só camadas e vocabulário.
+CLASS_HEADS = {"llama": 32, "mistral": 32}
+
+
+def text_config(cfg: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
+    """Localiza o config do decoder e devolve (config mesclado, chave de origem).
+
+    Quando as dimensões estão no topo, o próprio config é o do decoder — é o
+    caso do Qwen2.5-VL. Caso contrário elas estão aninhadas, sob uma chave que
+    varia por família.
+    """
+    if "hidden_size" in cfg:
+        return dict(cfg), ""
+
+    achadas = [k for k in TEXT_CONFIG_KEYS if isinstance(cfg.get(k), dict)]
+    if not achadas:
+        raise UnsupportedArchitecture(
+            "o config.json não expõe as dimensões no topo nem as aninha em "
+            + ", ".join(TEXT_CONFIG_KEYS),
+            hint="São suportadas arquiteturas de LLM causal no formato transformers.",
+        )
+    if len(achadas) > 1:
+        raise UnsupportedArchitecture(
+            "o config.json aninha mais de um sub-config de texto: "
+            + ", ".join(achadas),
+            hint="Não há como escolher entre eles sem adivinhar.",
+        )
+
+    chave = achadas[0]
+    # O sub-config tem precedência: quando declara um campo, é ele que vale.
+    mesclado = {k: cfg[k] for k in INHERITED if k in cfg} | dict(cfg[chave])
+    return mesclado, chave
+
+
+def _forma(formas: Mapping[str, list[int]], nome: str) -> list[int]:
+    forma = formas.get(nome)
+    if not forma:
+        raise UnsupportedArchitecture(
+            f"o checkpoint não traz a forma de {nome}",
+            hint="O cabeçalho do safetensors precisa declarar `shape` para cada tensor.",
+        )
+    return forma
+
+
+def _cabecas(cfg: Mapping[str, Any], *, q_out: int, kv_out: int,
+             hidden: int) -> tuple[int, int, int]:
+    """Resolve (head_dim, cabeças de query, grupos de chave/valor).
+
+    As formas dão `q_out = cabeças × head_dim`, que tem mais de uma fatoração.
+    A ordem de precedência resolve a ambiguidade sem adivinhar: head_dim
+    declarado, senão número de cabeças declarado, senão o default da classe —
+    e o resultado é sempre conferido contra as formas.
+    """
+    if cfg.get("head_dim"):
+        head_dim = int(cfg["head_dim"])
+        origem = "head_dim do config"
+    elif cfg.get("num_attention_heads"):
+        cabecas = int(cfg["num_attention_heads"])
+        if q_out % cabecas:
+            raise UnsupportedArchitecture(
+                f"q_proj tem {q_out} linhas, que não é múltiplo das "
+                f"{cabecas} cabeças declaradas no config",
+                hint="O config não corresponde aos pesos do checkpoint.",
+            )
+        head_dim = q_out // cabecas
+        origem = "num_attention_heads do config"
+    else:
+        tipo = str(cfg.get("model_type") or "")
+        if tipo not in CLASS_HEADS:
+            raise UnsupportedArchitecture(
+                f"o config não declara head_dim nem num_attention_heads, e não há "
+                f"default conhecido para model_type {tipo!r}",
+                hint="Informe as dimensões no config do decoder de texto.",
+            )
+        head_dim = q_out // CLASS_HEADS[tipo]
+        origem = f"default da classe {tipo}"
+
+    if head_dim <= 0 or q_out % head_dim or kv_out % head_dim:
+        raise UnsupportedArchitecture(
+            f"head_dim {head_dim} ({origem}) não divide as projeções observadas: "
+            f"q_proj tem {q_out} linhas e k_proj tem {kv_out}",
+            hint="As formas dos pesos são a verdade; o config diverge delas.",
+        )
+    cabecas, grupos = q_out // head_dim, kv_out // head_dim
+    if cabecas % grupos:
+        raise UnsupportedArchitecture(
+            f"{cabecas} cabeças não são múltiplo de {grupos} grupos de chave/valor",
+            hint="A poda de cabeças requer divisão exata de grupos GQA.",
+        )
+    return head_dim, cabecas, grupos
+
+
+def arch_from_shapes(headers: Mapping[str, Mapping[str, Any]], layout: TextLayout, *,
+                     cfg: Mapping[str, Any] | None = None) -> Arch:
+    """Reconstrói as dimensões a partir das formas dos tensores.
+
+    Quando o config está incompleto — como no DeepSeek-VL, cujo `language_config`
+    omite hidden_size, intermediate_size e o número de cabeças — as formas são a
+    única fonte confiável. O config entra apenas onde as formas são ambíguas, e
+    mesmo aí o resultado é conferido contra elas.
+    """
+    formas: dict[str, list[int]] = {}
+    for arquivo, header in headers.items():
+        for nome, meta in header.items():
+            if canonico := layout.rename.get(nome):
+                formas[canonico] = list(meta.get("shape") or ())
+
+    vocab, hidden = _forma(formas, f"{ROOT}{EMBED}")[:2]
+    intermediate = _forma(formas, f"{ROOT}layers.0.mlp.gate_proj.weight")[0]
+    q_out = _forma(formas, f"{ROOT}layers.0.self_attn.q_proj.weight")[0]
+    kv_out = _forma(formas, f"{ROOT}layers.0.self_attn.k_proj.weight")[0]
+
+    head_dim, cabecas, grupos = _cabecas(cfg or {}, q_out=q_out, kv_out=kv_out,
+                                         hidden=hidden)
+
+    # A quantidade de normas por camada não está em config algum: o Gemma 3
+    # normaliza também a saída de cada bloco e tem quatro, contra as duas do
+    # Llama. Contá-las pelo sufixo `layernorm.weight` acerta as duas famílias
+    # sem precisar saber de qual se trata, e exclui as normas de q e k, que
+    # terminam em `q_norm.weight` e são contadas à parte. A conferência de forma
+    # evita confundi-las com o bias de q_proj, que no Qwen2 e no InternVL3 tem
+    # exatamente o tamanho de hidden_size.
+    normas = sum(1 for nome, forma in formas.items()
+                 if nome.startswith(f"{ROOT}layers.0.")
+                 and nome.endswith("layernorm.weight") and forma == [hidden])
+
+    return Arch(
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_hidden_layers=layout.num_layers,
+        num_attention_heads=cabecas,
+        num_key_value_heads=grupos,
+        head_dim=head_dim,
+        vocab_size=vocab,
+        tie_word_embeddings=layout.tie_word_embeddings,
+        norms_per_layer=normas,
+        qk_norm=f"{ROOT}layers.0.self_attn.q_norm.weight" in formas,
+        attention_bias=f"{ROOT}layers.0.self_attn.q_proj.bias" in formas,
+    )
+
+
+def reconcile(arch: Arch, layout: TextLayout) -> int:
+    """Diferença entre a contagem analítica e a soma real dos tensores mantidos.
+
+    Zero é o único resultado aceitável antes de escrever qualquer byte: uma
+    divergência significa que a `Arch` não descreve os pesos que serão gravados,
+    e o plano de poda calculado sobre ela cortaria as dimensões erradas.
+    """
+    return count_stored(arch, lm_head_materialized=not layout.tie_word_embeddings) \
+        - layout.kept_params

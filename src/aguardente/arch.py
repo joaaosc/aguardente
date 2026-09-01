@@ -75,6 +75,15 @@ def _reject_unsupported(cfg: dict[str, Any]) -> None:
         )
 
 
+def _norms_per_layer(cfg: dict[str, Any]) -> int:
+    """Quantidade de RMSNorm por camada, que o config.json não declara.
+
+    Gemma 2 e Gemma 3 normalizam também a saída de cada bloco, somando duas
+    normas por camada. Nas demais famílias são duas.
+    """
+    return 4 if str(cfg.get("model_type", "")).startswith("gemma") else 2
+
+
 def _qk_norm(cfg: dict[str, Any]) -> bool:
     """Normalização por cabeça em q e k: chave explícita quando houver, senão heurística."""
     for chave in ("use_qk_norm", "qk_norm", "attention_qk_norm", "qk_layernorm"):
@@ -97,6 +106,13 @@ class Arch:
     tie_word_embeddings: bool = True
     # Modelos como Qwen3 aplicam RMSNorm por cabeça em q e k.
     qk_norm: bool = False
+    # Qwen2 e derivados somam bias em q, k e v. São poucos parâmetros, mas
+    # ignorá-los faz a contagem divergir do total publicado sem motivo real.
+    attention_bias: bool = False
+    # Normas do tamanho de hidden_size por camada. A maioria usa duas, antes da
+    # atenção e antes da MLP; a família Gemma usa quatro, com uma norma extra
+    # depois de cada bloco.
+    norms_per_layer: int = 2
 
     @property
     def heads_per_group(self) -> int:
@@ -154,6 +170,8 @@ class Arch:
             # contagem pelo tamanho inteiro do tensor de embeddings.
             tie_word_embeddings=bool(cfg.get("tie_word_embeddings", True)),
             qk_norm=_qk_norm(cfg),
+            attention_bias=bool(cfg.get("attention_bias", False)),
+            norms_per_layer=_norms_per_layer(cfg),
         )
 
     def with_(self, **changes: int) -> Arch:
@@ -207,6 +225,9 @@ def count_params(a: Arch) -> Breakdown:
     )
     mlp_per_layer = 3 * a.hidden_size * a.intermediate_size  # gate + up + down
 
+    # Bias de q, k e v quando a arquitetura os usa. o_proj não tem bias.
+    bias_per_layer = q_out + 2 * kv_out if a.attention_bias else 0
+
     # RMSNorm por cabeça em q e k (Qwen3)
     qk = 2 * a.head_dim * a.num_hidden_layers if a.qk_norm else 0
 
@@ -214,9 +235,9 @@ def count_params(a: Arch) -> Breakdown:
     return Breakdown(
         embeddings=embeddings,
         lm_head=0 if a.tie_word_embeddings else embeddings,
-        attention=attn_per_layer * a.num_hidden_layers,
+        attention=(attn_per_layer + bias_per_layer) * a.num_hidden_layers,
         mlp=mlp_per_layer * a.num_hidden_layers,
-        norms=2 * a.hidden_size * a.num_hidden_layers + a.hidden_size + qk,
+        norms=a.norms_per_layer * a.hidden_size * a.num_hidden_layers + a.hidden_size + qk,
     )
 
 
