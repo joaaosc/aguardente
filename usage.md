@@ -75,6 +75,23 @@ aguardente fetch Qwen/Qwen3-4B -o teacher/ [--connections 8]
 
 Baixa apenas os arquivos necessários para o modelo (configurações, tokenizers e pesos em `.safetensors`), ignorando variantes e formatos não utilizados.
 
+### `extract` — Decoder de texto de um modelo multimodal
+
+Extrai o decoder causal de um checkpoint de visão e linguagem e grava um repositório `transformers` comum, utilizável fora do aguardente.
+
+```bash
+aguardente extract deepseek-ai/deepseek-vl-7b-chat -o run/dsvl
+aguardente extract ./teacher -o run/dsvl              # de um diretório já baixado
+```
+
+Escreve `run/dsvl/teacher-text/` com os pesos do decoder, um `config.json` de arquitetura causal, e o tokenizer. A torre de visão, o projetor e o processador de imagem ficam de fora.
+
+A cópia é feita no nível dos bytes, sem carregar o modelo: funciona sem `torch` e preserva qualquer precisão, `bfloat16` inclusive.
+
+`--discard-source-weights` consome os shards de origem à medida que os processa, o que reduz o pico de disco pela metade em troca de exigir novo download para refazer a etapa.
+
+A mesma extração acontece dentro do `run`, como etapa entre o download e a poda; o comando avulso existe para inspecionar o resultado antes de investir horas de treino.
+
 ### `run` — Execução completa
 
 ```bash
@@ -139,19 +156,23 @@ Exibe o estado das etapas registradas em `state.json`.
 
 Baixa os arquivos do modelo original via `aria2c`.
 
-### 2. prune
+### 2. extract
+
+Localiza o decoder causal dentro do checkpoint e grava um modelo só de texto. Pulada quando o modelo já é um decoder comum. Confere a contagem de parâmetros do que gravou contra a arquitetura calculada, e valida a configuração de exportação com `--dry-run`.
+
+### 3. prune
 
 Carrega o modelo, avalia a importância estrutural com base em amostras reais de calibração e realiza o corte in-place dos pesos (MLP, grupos de atenção GQA e camadas). Valida que a saída após a poda permanece finita.
 
-### 3. logits
+### 4. logits
 
 Executa o modelo original sobre o conjunto de calibração para pré-computar os top-k logits por posição e gravá-los em shards no disco. Em seguida, libera a memória ocupada pelo modelo teacher.
 
-### 4. recover
+### 5. recover
 
 Treina o modelo podado para minimizar a divergência KL em relação aos logits do teacher combinada com a entropia cruzada. O treinamento inclui verificação periódica de perda/perplexidade e parada antecipada caso haja estagnação.
 
-### 5. export
+### 6. export
 
 Gera o pacote `.aimodel` chamando `coreai.llm.export` com a configuração de plataforma e compressão selecionadas.
 

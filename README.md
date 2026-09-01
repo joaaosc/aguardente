@@ -83,6 +83,34 @@ A redução segue a proporção típica de parâmetros na arquitetura do modelo 
 
 A dimensão `hidden_size` é mantida inalterada para preservar a consistência de embeddings, projeções e normalizações.
 
+### Modelos multimodais
+
+Um modelo de visão e linguagem carrega, no mesmo checkpoint, um decoder causal de texto, uma torre de visão e um projetor entre os dois. O aguardente extrai o decoder e descarta o resto: **o modelo convertido não enxerga imagens.** O que ele preserva é a capacidade de texto, que é o que o Core AI executa.
+
+A extração acontece entre o download e a poda, e o restante do pipeline continua vendo um decoder causal comum.
+
+```bash
+aguardente plan deepseek-ai/deepseek-vl-7b-chat   # mostra o que será descartado
+aguardente extract deepseek-ai/deepseek-vl-7b-chat -o run/dsvl   # só extrai
+aguardente run Qwen/Qwen2.5-VL-3B-Instruct -o run/qwen --target-params 1.0e9
+```
+
+O prefixo do decoder não vem de uma tabela por arquitetura: é descoberto pela estrutura dos tensores, procurando o grupo de camadas cujos nomes formam um bloco transformer denso completo. Famílias conferidas contra os checkpoints publicados:
+
+| Família | Prefixo do decoder | Decoder |
+|---|---|---|
+| DeepSeek-VL | `language_model.model.` | LLaMA |
+| Qwen2-VL, Qwen2.5-VL | `model.` | Qwen2 |
+| Qwen3-VL | `model.language_model.` | Qwen3 |
+| Gemma 3 | `language_model.model.` | Gemma 3 |
+| LLaVA, LLaVA-NeXT | `language_model.model.` | LLaMA, Mistral |
+| SmolVLM, SmolVLM2 | `model.text_model.` | LLaMA |
+| InternVL3 (porte `-hf`) | `language_model.model.` | Qwen2 |
+
+Não são suportados, e a recusa diz o motivo: decoders MoE, atenção latente (DeepSeek-VL2), camadas de cross-attention intercaladas (Llama 3.2 Vision), e checkpoints com projeções fundidas — `qkv_proj` do Phi-3, `query_key_value` do Falcon, `attention.wqkv` do InternLM2 —, que a poda estruturada não sabe fatiar.
+
+O `plan` também confere se o exportador da Apple aceita a arquitetura de destino, antes de qualquer download.
+
 ### Esforço da destilação
 
 `--effort` define **quanto trabalho** se investe para recuperar a qualidade perdida na poda. É um eixo ortogonal ao alvo: `--target-params` decide o tamanho do resultado, `--effort` decide o cuidado com que se chega nele. Um alvo agressivo com esforço baixo é o caminho mais curto para um modelo pequeno e ruim.
