@@ -17,6 +17,10 @@ exports/
 # rascunhos e anotações locais
 .local/
 
+# GUI macOS: entra em etapa própria
+/Package.swift
+/app/
+
 # macOS
 .DS_Store
 uv.lock
