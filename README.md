@@ -42,6 +42,15 @@ aguardente run Qwen/Qwen3-4B -o run/qwen3 --target-params 1.0e9 --effort high --
 
 O comando executa todas as etapas e retoma do ponto onde parou caso seja interrompido.
 
+Em vez do identificador `namespace/nome`, também é aceita a URL copiada do navegador — do Hugging Face diretamente, ou do GitHub, quando o autor publica lá sob o mesmo nome:
+
+```bash
+aguardente plan https://huggingface.co/Qwen/Qwen3-4B      # a URL já contém o identificador
+aguardente plan https://github.com/Qwen/Qwen3-4B          # confirmado contra o Hugging Face
+```
+
+A URL do GitHub nunca é aceita por adivinhação: `owner/repo` só vira o modelo se esse identificador existir de fato no Hugging Face, conferido por uma chamada à API. Quando não existe, o comando para e mostra os repositórios do mesmo autor e os de nome parecido que a API encontrou — nunca inventa um substituto, e nunca decide sozinho qual variante baixar.
+
 Para inspecionar o planejamento e as dimensões estimadas sem baixar pesos:
 
 ```bash

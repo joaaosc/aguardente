@@ -81,9 +81,15 @@ def _get_json(url: str) -> dict[str, Any]:
             return json.loads(bruto)
     except urllib.error.HTTPError as e:
         if e.code == 401:
+            # A API devolve 401 tanto para um identificador que não existe
+            # quanto para um repositório gated sem autenticação — o mesmo
+            # código de status cobre os dois casos, e não há como
+            # distingui-los aqui sem uma segunda chamada.
             raise ProbeError(
                 f"acesso negado a {url}",
-                hint="Modelo gated. Aceite a licença na página do Hugging Face e rode `hf auth login`.",
+                hint="Confira o identificador. Se o repositório existir e for "
+                     "gated, aceite a licença na página do modelo e rode "
+                     "`hf auth login`.",
             ) from e
         if e.code == 404:
             raise ProbeError(f"não encontrado: {url}", hint="Confira o identificador informado.") from e

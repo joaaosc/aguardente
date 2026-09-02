@@ -146,10 +146,13 @@ def list_files(model_id: str, revision: str = "main") -> tuple[RemoteFile, ...]:
             entries = json.loads(bruto)
     except urllib.error.HTTPError as e:
         if e.code == 401:
+            # Este endpoint lista a árvore de arquivos, e devolve 200 mesmo
+            # para um repositório gated — o estado de acesso só entra na hora
+            # de baixar o conteúdo de um arquivo, não na listagem. Um 401
+            # aqui só acontece quando o identificador não existe.
             raise AguardenteError(
-                f"acesso negado a {model_id}",
-                hint="Modelo gated. Aceite a licença na página do Hugging Face "
-                     "e rode `hf auth login`.",
+                f"{model_id} não encontrado no Hugging Face",
+                hint="Confira o identificador (namespace/nome).",
             ) from e
         raise AguardenteError(f"HTTP {e.code} ao listar {model_id}") from e
     except (urllib.error.URLError, TimeoutError) as e:
