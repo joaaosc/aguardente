@@ -78,3 +78,27 @@ def test_require_aria2_error_names_the_fix(monkeypatch):
     with pytest.raises(AguardenteError) as e:
         mod.require_aria2()
     assert "brew install aria2" in (e.value.hint or "")
+
+
+# --------------------------------------------------- mensagem de erro do 401
+#
+# O endpoint de listagem de arquivos devolve 200 mesmo para um repositório
+# gated — o estado de acesso só entra na hora de baixar o conteúdo de um
+# arquivo, não na listagem. Um 401 aqui só pode significar identificador
+# inexistente, nunca "gated".
+
+
+def test_401_na_listagem_e_nao_encontrado(monkeypatch):
+    import urllib.error
+
+    import aguardente.fetch as m
+
+    def levanta(*a, **k):
+        raise urllib.error.HTTPError("url", 401, "erro", {}, None)
+
+    monkeypatch.setattr(m.urllib.request, "urlopen", levanta)
+    with pytest.raises(AguardenteError) as e:
+        m.list_files("org/nao-existe")
+
+    assert "não encontrado" in e.value.message
+    assert "gated" not in e.value.message and "licença" not in (e.value.hint or "")
