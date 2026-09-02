@@ -22,6 +22,7 @@ from .plan import plan_for_target, shrink
 from .pipeline import RunOptions, run_pipeline
 from .preflight import Status, blocking, run_all
 from .probe import probe
+from .source import resolve_source
 from . import ui
 from .ui import StageState
 
@@ -98,12 +99,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def cmd_plan(args: argparse.Namespace) -> int:
     """Calcula o plano de poda e dimensionamento do modelo."""
+    avisos: list[str] = []
+    args.model = resolve_source(args.model, report=avisos.append)
     p = probe(args.model)
     a = p.arch
     b = count_params(a)
 
     ui.title(f"Plano para {p.name}",
              "Estimativas calculadas a partir dos metadados do modelo")
+    for aviso in avisos:
+        ui.step(aviso)
 
     ui.header("Modelo")
     ui.field("arquitetura", p.model_type or "desconhecida",
@@ -329,11 +334,16 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     """Executa o download dos arquivos do modelo."""
     from .fetch import fetch, plan_fetch, require_aria2
 
+    avisos: list[str] = []
+    args.model = resolve_source(args.model, report=avisos.append)
+
     require_aria2()
     fp = plan_fetch(args.model, args.out)
     pendentes = fp.missing()
 
     ui.title(f"Download de {args.model}")
+    for aviso in avisos:
+        ui.step(aviso)
     ui.explain(
         "Download dos arquivos do modelo via aria2c com suporte a retomada.",
         indent=0,
@@ -368,6 +378,8 @@ def cmd_extract(args: argparse.Namespace) -> int:
     from . import textonly
     from .fetch import fetch, plan_fetch, require_aria2
 
+    avisos: list[str] = []
+    args.model = resolve_source(args.model, report=avisos.append)
     origem = Path(args.model).expanduser()
     destino = Path(args.out).expanduser()
 
@@ -376,12 +388,16 @@ def cmd_extract(args: argparse.Namespace) -> int:
         origem = destino / "teacher"
         fp = plan_fetch(args.model, origem)
         ui.title(f"Extração de {args.model}")
+        for aviso in avisos:
+            ui.step(aviso)
         ui.field("download", _fmt_bytes(fp.pending_bytes),
                  note=f"de {_fmt_bytes(fp.total_bytes)}")
         if fp.missing():
             fetch(fp, on_line=lambda linha: ui.step(linha))
     else:
         ui.title(f"Extração de {origem.name}")
+        for aviso in avisos:
+            ui.step(aviso)
 
     p = probe(str(origem))
     if p.layout is None or not p.layout.needs_extraction:
@@ -484,13 +500,20 @@ def _discard_run_dir(out_dir: Path) -> list[str]:
 
 def cmd_run(args: argparse.Namespace) -> int:
     """Executa o pipeline completo."""
-    opts = _options_from(args)
     is_json = getattr(args, "json", False)
+    # Em modo --json o stdout é o fluxo de eventos NDJSON: o aviso de
+    # resolução, se houver, sai só como linha de comentário do relatório final.
+    avisos: list[str] = []
+    args.model = resolve_source(args.model,
+                                report=(avisos.append if not is_json else (lambda _m: None)))
+    opts = _options_from(args)
     event_log = stdout_log() if is_json else None
 
     if not is_json:
         ui.title(f"aguardente · {opts.model}",
                  "Poda estruturada, destilação e conversão para Core AI")
+        for aviso in avisos:
+            ui.step(aviso)
 
     if args.restart and opts.out_dir.is_dir():
         removidos = _discard_run_dir(opts.out_dir)
@@ -696,7 +719,8 @@ def build_parser() -> argparse.ArgumentParser:
     d.set_defaults(func=cmd_doctor)
 
     pl = sub.add_parser("plan", help="inspeciona o modelo e calcula o plano de poda sem baixar pesos")
-    pl.add_argument("model", help="identificador do Hugging Face ou diretório local")
+    pl.add_argument("model", help="identificador do Hugging Face (namespace/nome), "
+                    "URL do Hugging Face ou do GitHub, ou diretório local")
     pl.add_argument("--target-params", type=lambda s: int(float(s)))
     pl.add_argument("--effort", choices=effort.NAMES, default=effort.DEFAULT,
                     help=f"nível de esforço a dimensionar (padrão: {effort.DEFAULT})")
@@ -705,14 +729,16 @@ def build_parser() -> argparse.ArgumentParser:
     pl.set_defaults(func=cmd_plan)
 
     ft = sub.add_parser("fetch", help="baixa os arquivos do modelo via aria2c")
-    ft.add_argument("model", help="identificador do Hugging Face")
+    ft.add_argument("model", help="identificador do Hugging Face, ou URL do Hugging "
+                    "Face ou do GitHub")
     ft.add_argument("-o", "--out", required=True, help="diretório de destino")
     ft.add_argument("--connections", type=int, default=8)
     ft.add_argument("--concurrent", type=int, default=4)
     ft.set_defaults(func=cmd_fetch)
 
     rn = sub.add_parser("run", help="executa o pipeline completo (download, poda, recuperação e conversão)")
-    rn.add_argument("model", help="identificador do Hugging Face ou diretório local")
+    rn.add_argument("model", help="identificador do Hugging Face (namespace/nome), "
+                    "URL do Hugging Face ou do GitHub, ou diretório local")
     rn.add_argument("-o", "--out", required=True, help="diretório da execução")
     rn.add_argument("--skip-checks", action="store_true",
                     help="ignora verificações de pré-requisitos de ambiente")
@@ -734,7 +760,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     ex = sub.add_parser("extract",
                         help="extrai o decoder de texto de um modelo multimodal")
-    ex.add_argument("model", help="identificador do Hugging Face ou diretório local")
+    ex.add_argument("model", help="identificador do Hugging Face (namespace/nome), "
+                    "URL do Hugging Face ou do GitHub, ou diretório local")
     ex.add_argument("-o", "--out", required=True, help="diretório de destino")
     ex.add_argument("--discard-source-weights", action="store_true",
                     help="consome os shards de origem, reduzindo o pico de disco")

@@ -55,7 +55,37 @@ A opção `--export-dry-run` valida os argumentos e a configuração de convers�
 
 ---
 
-## Os comandos
+## Identificando o modelo
+
+Todo comando que recebe um modelo — `plan`, `fetch`, `run`, `extract` — aceita três formas equivalentes:
+
+```bash
+aguardente plan Qwen/Qwen3-4B                              # identificador namespace/nome
+aguardente plan https://huggingface.co/Qwen/Qwen3-4B       # URL colada do navegador
+aguardente plan ./meu-modelo-baixado                        # diretório local já existente
+```
+
+**URL do Hugging Face.** É pura normalização: `namespace/nome` já está na URL, com ou sem `/tree/main`, `/blob/...` ou barra final no fim. Não há consulta de rede extra para isso.
+
+**URL do GitHub.** Muitos autores de modelo publicam o código no GitHub sob o mesmo nome que usam no Hugging Face, e é comum copiar a URL errada por hábito. `owner/repo` da URL do GitHub é tratado como uma *aposta* de identificador do Hugging Face, e a aposta só é aceita depois de confirmada por uma chamada à API — nunca por adivinhação:
+
+```bash
+aguardente plan https://github.com/Qwen/Qwen3-4B
+#   origem       https://github.com/Qwen/Qwen3-4B (GitHub) → Qwen/Qwen3-4B (Hugging Face)
+#                outros modelos do mesmo autor no Hugging Face: Qwen/Qwen3-8B, Qwen/Qwen3-14B, ...
+```
+
+A linha de origem aparece sempre que a URL foi traduzida, para que fique claro o que o comando vai de fato baixar. Quando o `owner/repo` do GitHub **não** existe no Hugging Face, o comando para — nunca baixa o modelo errado — e mostra dois grupos, cada um rotulado pelo que realmente é:
+
+```
+erro: 'algum-autor/Projeto' não existe no Hugging Face.
+  repositórios do autor 'algum-autor':
+    algum-autor/Projeto-7B
+    algum-autor/Projeto-13B-Instruct
+  → Rode novamente com um dos identificadores acima, no formato namespace/nome.
+```
+
+Nenhuma dessas listas vem de busca aproximada por IA ou de heurística de nome: são exatamente os resultados que a API de metadados do Hugging Face devolve para o autor e para o termo de busca, sem reordenar por "parecença" nem preencher lacunas. Se a API não devolver nada, o erro diz isso — não inventa um candidato.
 
 ### `plan` — Planejamento analítico
 
