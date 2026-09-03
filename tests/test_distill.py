@@ -125,6 +125,13 @@ def test_precompute_resumes_without_recomputing(tmp_path):
     assert {p.name: p.stat().st_mtime_ns for p in (tmp_path / "l").glob("*.pt")} == mtimes
 
 
+def test_precompute_respects_max_batches(tmp_path):
+    teacher = tiny_model()
+    out = precompute_logits(teacher, fixed_batches(n=6), tmp_path / "limited", top_k=8, max_batches=2)
+    assert out.shards == 2
+    assert len(list((tmp_path / "limited").glob("*.pt"))) == 2
+
+
 # ---------------------------------------------------------------- recuperacao
 
 def _mean_kd(model, logits) -> float:

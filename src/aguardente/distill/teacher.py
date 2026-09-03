@@ -63,6 +63,7 @@ def precompute_logits(
     out_dir: str | Path,
     *,
     top_k: int = DEFAULT_TOP_K,
+    max_batches: int | None = None,
     on_progress: Any = None,
 ) -> TeacherLogits:
     """Executa o modelo teacher e grava os top-k logits em shards por lote."""
@@ -78,6 +79,8 @@ def precompute_logits(
     try:
         with torch.no_grad():
             for i, batch in enumerate(batches):
+                if max_batches is not None and i >= max_batches:
+                    break
                 shard_path = out / f"{i:06d}.pt"
                 input_ids = batch["input_ids"]
                 if shard_path.is_file() and shard_path.stat().st_size > 0:

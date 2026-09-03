@@ -723,6 +723,7 @@ def stage_logits(ctx: Context, teacher_dir: Path) -> Path | None:
         barra = _Progress(ctx, opts.logit_batches, label="pré-computando", sid="logits")
         result = precompute_logits(
             teacher, batches, out, top_k=opts.top_k,
+            max_batches=opts.logit_batches,
             on_progress=lambda k: barra.update(k, suffix=f"shard {k}"),
         )
         barra.done(suffix=f"{result.shards} shards")
