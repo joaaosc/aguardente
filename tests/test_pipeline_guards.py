@@ -153,3 +153,66 @@ def test_sem_mps_o_teto_cai_e_o_aviso_aparece(tmp_path, monkeypatch):
     ctx.report = linhas.append
     with pytest.raises(InsufficientResources):
         pl.make_plan(ctx)
+
+
+# ------------------------------------------------------- teacher cabe na RAM
+
+
+def test_teacher_maior_que_a_ram_e_recusado(tmp_path, monkeypatch):
+    """O piso de destino não importa aqui: é o modelo de origem que precisa caber."""
+    maquina(monkeypatch, ram_gb=4)  # Qwen3-4B em fp16 são ~8 GB; não cabe em 3 GB úteis
+    # Alvo generoso: o que este teste isola é a guarda de RAM do teacher, não
+    # o cálculo do plano de poda, que tem sua própria bateria de testes.
+    ctx = contexto(tmp_path, skip_recover=True, target_params=2_000_000_000)
+    with pytest.raises(InsufficientResources) as e:
+        pl.make_plan(ctx)
+    assert "não cabe na RAM disponível" in e.value.message
+    assert "--allow-oversized" in e.value.hint
+
+
+def test_teacher_maior_que_a_ram_passa_com_allow_oversized(tmp_path, monkeypatch):
+    maquina(monkeypatch, ram_gb=4)
+    ctx = contexto(tmp_path, skip_recover=True, allow_oversized=True,
+                   target_params=2_000_000_000)
+    linhas = []
+    ctx.report = linhas.append
+    pl.make_plan(ctx)  # não levanta
+    assert any("não cabe na RAM disponível" in l for l in linhas)
+
+
+def test_teacher_dentro_da_ram_e_aceito(tmp_path, monkeypatch):
+    maquina(monkeypatch, ram_gb=24)
+    ctx = contexto(tmp_path, skip_recover=True, target_params=2_000_000_000)
+    pl.make_plan(ctx)  # não levanta
+
+
+# --------------------------------------------------------- lote automático
+
+
+def test_lote_e_calculado_quando_nao_informado(tmp_path, monkeypatch):
+    maquina(monkeypatch, ram_gb=24)
+    ctx = contexto(tmp_path)
+    assert ctx.opts.batch_size is None
+    pl.make_plan(ctx)
+    assert isinstance(ctx.opts.batch_size, int) and ctx.opts.batch_size >= 1
+
+
+def test_lote_informado_nao_e_sobrescrito(tmp_path, monkeypatch):
+    maquina(monkeypatch, ram_gb=24)
+    ctx = contexto(tmp_path, batch_size=6)
+    pl.make_plan(ctx)
+    assert ctx.opts.batch_size == 6
+
+
+def test_lote_automatico_e_menor_em_maquina_pequena(tmp_path, monkeypatch):
+    """Menos RAM sobrando para ativações deveria sugerir um lote menor ou igual."""
+    maquina(monkeypatch, ram_gb=24)
+    grande = contexto(tmp_path / "a")
+    pl.make_plan(grande)
+
+    maquina(monkeypatch, ram_gb=6)
+    pequena = contexto(tmp_path / "b", allow_oversized=True, skip_recover=True,
+                       target_params=2_000_000_000)
+    pl.make_plan(pequena)
+
+    assert pequena.opts.batch_size <= grande.opts.batch_size

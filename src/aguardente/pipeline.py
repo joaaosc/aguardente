@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .arch import count_params
-from .budget import GB, Budget, Machine
+from .budget import GB, Budget, Machine, suggest_batch_size
 from .errors import AguardenteError, InsufficientResources, PlanImpossible
 from .events import EventLog, null_log
 from .plan import PrunePlan, plan_for_target
@@ -93,7 +93,7 @@ class RunOptions:
 
     # calibração
     calib_batches: int = 32
-    batch_size: int = 2
+    batch_size: int | None = None
     seq_len: int = 512
     calib_dataset: str | None = None
     calib_file: str | None = None
@@ -301,6 +301,32 @@ def make_plan(ctx: Context) -> tuple[ModelProbe, PrunePlan | None]:
     dtype_bytes = _training_dtype_bytes(opts)
     budget = Budget.for_machine(Machine.detect(opts.out_dir))
     teto = budget.max_params_for_training(dtype_bytes=dtype_bytes)
+
+    # O teacher precisa caber inteiro na RAM antes de qualquer corte: a poda e
+    # a pré-computação de logits carregam o modelo original, sem gradientes,
+    # mas ainda assim como pesos completos. Um alvo pequeno não ajuda aqui —
+    # é o tamanho do modelo de origem que decide, não o de destino.
+    pesos_teacher = p.text_params * dtype_bytes
+    if pesos_teacher > budget.ram_bytes:
+        aviso_teacher = (f"o modelo original ({pesos_teacher/GB:.1f} GB carregado) não "
+                         f"cabe na RAM disponível ({budget.ram_bytes/GB:.1f} GB)")
+        if not opts.allow_oversized:
+            raise InsufficientResources(
+                aviso_teacher,
+                hint="A poda e a geração de logits carregam o modelo inteiro antes de "
+                     "cortar qualquer coisa. Use uma máquina com mais RAM, escolha um "
+                     "modelo de origem menor, ou --allow-oversized para tentar mesmo "
+                     "assim — o risco aqui é o processo travar por falta de memória.",
+            )
+        ctx.say(f"aviso        {aviso_teacher}")
+
+    if opts.batch_size is None:
+        opts.batch_size = suggest_batch_size(
+            hidden_size=p.arch.hidden_size, seq_len=opts.seq_len,
+            ram_bytes=budget.ram_bytes, dtype_bytes=dtype_bytes,
+            reserved_bytes=pesos_teacher, training=not opts.skip_recover,
+        )
+        ctx.say(f"lote         sugerido pela RAM: {opts.batch_size} amostra(s) por lote")
 
     target = opts.target_params
     if target is None:

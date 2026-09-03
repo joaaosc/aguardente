@@ -13,7 +13,7 @@ from pathlib import Path
 from . import __version__
 from .arch import count_params
 from .budget import (BPW_FP16, BPW_INT4_EMBED_FP16, GB, Budget, Machine,
-                     kv_cache_bytes, training_bytes, weights_bytes)
+                     kv_cache_bytes, suggest_batch_size, training_bytes, weights_bytes)
 from . import effort
 from .errors import AguardenteError
 from .events import stdout_log
@@ -232,7 +232,14 @@ def cmd_plan(args: argparse.Namespace) -> int:
     final_params = plan.target_params if plan else count_params(a).total
 
     nivel = effort.get(getattr(args, "effort", None))
-    lote = getattr(args, "batch_size", 2)
+    lote = args.batch_size
+    if lote is None:
+        lote = suggest_batch_size(
+            hidden_size=a.hidden_size, seq_len=nivel.seq_len,
+            ram_bytes=budget.ram_bytes, reserved_bytes=p.text_params * 2,
+            training=True,
+        )
+        ui.field("lote sugerido pela RAM", str(lote))
 
     ui.header("Estimativa de recursos")
     ui.table(
@@ -743,8 +750,9 @@ def _add_pipeline_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--concurrent", type=int, default=4,
                    help="número de downloads simultâneos no aria2c")
     p.add_argument("--calib-batches", type=int, help=PRESET)
-    p.add_argument("--batch-size", type=int, default=2,
-                   help="amostras por lote; restrição de memória, não de esforço (padrão: 2)")
+    p.add_argument("--batch-size", type=int,
+                   help="amostras por lote; restrição de memória, não de esforço. "
+                        "Padrão: calculado pela RAM disponível")
     p.add_argument("--seq-len", type=int, help=PRESET)
     p.add_argument("--calib-dataset", help="dataset de calibração (namespace/name)")
     p.add_argument("--calib-file", help="arquivo .txt local com amostras separadas por linha em branco")
@@ -796,7 +804,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="disco livre de outra máquina, em GB. Exige --other-ram-gb junto")
     pl.add_argument("--effort", choices=effort.NAMES, default=effort.DEFAULT,
                     help=f"nível de esforço a dimensionar (padrão: {effort.DEFAULT})")
-    pl.add_argument("--batch-size", type=int, default=2)
+    pl.add_argument("--batch-size", type=int,
+                    help="amostras por lote. Padrão: calculado pela RAM disponível")
     pl.add_argument("--no-anim", action="store_true", help="não anima os medidores")
     pl.set_defaults(func=cmd_plan)
 

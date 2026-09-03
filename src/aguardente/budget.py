@@ -131,3 +131,39 @@ class Budget:
     def max_params_for_inference(self, *, bpw: float = BPW_INT4_EMBED_FP16) -> int:
         """Número máximo de parâmetros para inferência dentro da memória disponível."""
         return int(self.ram_bytes * 8 / bpw)
+
+
+# Bytes por token de ativação, como múltiplo de hidden_size × dtype_bytes.
+#
+# Não é uma contagem exata: com SDPA (a implementação de atenção do
+# transformers atual), o PyTorch calcula e descarta blocos da matriz de
+# atenção em vez de materializar tudo de uma vez, então o custo real por
+# token não cresce quadraticamente com seq_len na prática. Mas o autograd
+# ainda retém buffers de q/k/v, das duas projeções da MLP e da própria
+# atenção para o backward, e parte disso escapa do que o gradient
+# checkpointing consegue descartar. O fator é generoso de propósito: errar
+# para um lote menor custa tempo; errar para maior derruba a etapa.
+_FATOR_ATIVACAO_INFERENCIA = 8
+_FATOR_ATIVACAO_TREINO = 16
+
+
+def suggest_batch_size(*, hidden_size: int, seq_len: int, ram_bytes: int,
+                       dtype_bytes: int = 2, reserved_bytes: int = 0,
+                       training: bool = False, minimum: int = 1,
+                       maximum: int = 32) -> int:
+    """Sugere um tamanho de lote que não deveria estourar a RAM disponível.
+
+    `reserved_bytes` é o que já está ocupado antes de processar o primeiro
+    lote — normalmente os pesos do modelo carregado. O que sobra é dividido
+    pelo custo estimado de um lote de tamanho 1, e o resultado nunca passa de
+    `maximum`: um lote muito grande economiza pouco tempo e amplia o risco de
+    um travamento tardio, depois de já ter carregado o modelo inteiro.
+    """
+    margem = ram_bytes - reserved_bytes
+    if margem <= 0:
+        return minimum
+    fator = _FATOR_ATIVACAO_TREINO if training else _FATOR_ATIVACAO_INFERENCIA
+    por_amostra = fator * hidden_size * dtype_bytes * seq_len
+    if por_amostra <= 0:
+        return minimum
+    return max(minimum, min(maximum, int(margem // por_amostra)))
