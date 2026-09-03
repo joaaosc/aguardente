@@ -281,3 +281,152 @@ def test_lote_automatico_e_menor_em_maquina_pequena(tmp_path, monkeypatch):
     pl.make_plan(pequena)
 
     assert pequena.opts.batch_size <= grande.opts.batch_size
+
+
+# ----------------------------------------------------- correções da revisão
+
+
+def test_run_sem_batch_size_nao_quebra_o_painel_de_esforco():
+    """`aguardente run` sem --batch-size chegava ao painel com None e estourava."""
+    from aguardente import cli, effort
+
+    args = cli.build_parser().parse_args(["run", "org/m", "-o", "run"])
+    assert args.batch_size is None
+    cli._effort_panel(effort.get(effort.DEFAULT), [], animate=False)
+
+
+def test_fingerprint_do_export_muda_com_o_student(tmp_path):
+    """Sem isto, trocar de student reaproveitava o bundle exportado do anterior."""
+    assert (fingerprint(opts(tmp_path, student="org/a"), "export")
+            != fingerprint(opts(tmp_path, student="org/b"), "export"))
+
+
+def test_student_grande_demais_e_barrado_pelo_teto_de_treino(tmp_path, monkeypatch):
+    """O teto de treino vale para um student pronto tanto quanto para um alvo."""
+    maquina(monkeypatch, ram_gb=8)
+    ctx = contexto(tmp_path, student="org/gigante")
+    with pytest.raises(InsufficientResources):
+        pl.make_plan(ctx)
+
+
+def test_student_grande_demais_passa_com_allow_oversized(tmp_path, monkeypatch):
+    maquina(monkeypatch, ram_gb=8)
+    ctx = contexto(tmp_path, student="org/gigante", allow_oversized=True)
+    pl.make_plan(ctx)
+    assert ctx.plan is None
+
+
+def test_plano_e_emitido_tambem_no_caminho_do_student(tmp_path, monkeypatch):
+    """A GUI decodifica `plan`; sem o evento ela recebe etapas sem plano."""
+    maquina(monkeypatch, ram_gb=24)
+    eventos = []
+
+    class _Log:
+        def plan(self, stages):
+            eventos.append(stages)
+
+        def __getattr__(self, _nome):
+            return lambda *a, **kw: None
+
+    ctx = contexto(tmp_path, student="org/pequeno")
+    ctx.events = _Log()
+    monkeypatch.setattr(pl, "probe", lambda ref: ModelProbe(
+        ref=ref, arch=QWEN3_4B, model_type="qwen3",
+        stored_params=200_000_000 if ref == "org/pequeno" else count_params(QWEN3_4B).total))
+    pl.make_plan(ctx)
+
+    assert len(eventos) == 1
+    assert [e["id"] for e in eventos[0]] == list(pl.STAGES[:1] + pl.STAGES[2:])
+
+
+def test_amostras_nao_crescem_com_o_lote(tmp_path, monkeypatch):
+    """Um lote maior deve percorrer as mesmas amostras em menos passos."""
+    from aguardente.effort import LOTE_DE_REFERENCIA
+
+    amostras = 16 * LOTE_DE_REFERENCIA
+    assert pl._lotes_para(amostras, LOTE_DE_REFERENCIA) == 16
+    assert pl._lotes_para(amostras, 4 * LOTE_DE_REFERENCIA) == 4
+    # Textos suficientes para formar lotes cheios: `make_batches` descarta o
+    # último bloco incompleto.
+    assert pl._textos_para(4, 32, folga=8) >= 4 * 32
+
+
+def test_checkpoints_de_outra_configuracao_sao_descartados(tmp_path):
+    """`recover` só olha o arquivo em disco; o pipeline precisa limpar antes."""
+    ctx = contexto(tmp_path, lr=1e-5)
+    ckpt = ctx.opts.out_dir / "ckpt"
+    ckpt.mkdir(parents=True)
+    (ckpt / "last.pt").write_bytes(b"x")
+    (ckpt / "best.pt").write_bytes(b"x")
+    (ckpt / pl.FINGERPRINT_FILE).write_text("impressao-de-outra-execucao")
+
+    pl._preparar_checkpoints(ctx, ckpt)
+
+    assert not (ckpt / "last.pt").exists() and not (ckpt / "best.pt").exists()
+    assert (ckpt / pl.FINGERPRINT_FILE).read_text() == fingerprint(ctx.opts, "recover")
+
+
+def test_checkpoints_da_mesma_configuracao_sobrevivem(tmp_path):
+    ctx = contexto(tmp_path)
+    ckpt = ctx.opts.out_dir / "ckpt"
+    ckpt.mkdir(parents=True)
+    (ckpt / "last.pt").write_bytes(b"x")
+    (ckpt / pl.FINGERPRINT_FILE).write_text(fingerprint(ctx.opts, "recover"))
+
+    pl._preparar_checkpoints(ctx, ckpt)
+
+    assert (ckpt / "last.pt").exists()
+
+
+def test_logits_de_outra_configuracao_sao_descartados(tmp_path):
+    """Trocar de teacher ou de --seq-len não pode reaproveitar shards antigos."""
+    ctx = contexto(tmp_path, seq_len=256)
+    logits = ctx.opts.logits_dir
+    logits.mkdir(parents=True)
+    (logits / "000000.pt").write_bytes(b"shard antigo")
+    (logits / "manifest.json").write_text('{"top_k": 128}')
+    (logits / pl.FINGERPRINT_FILE).write_text("impressao-de-outra-execucao")
+
+    pl._preparar_logits(ctx, logits)
+
+    assert not (logits / "000000.pt").exists()
+    assert not (logits / "manifest.json").exists()
+    assert (logits / pl.FINGERPRINT_FILE).read_text() == fingerprint(ctx.opts, "logits")
+
+
+def test_logits_da_mesma_configuracao_sobrevivem_para_retomada(tmp_path):
+    """Uma etapa interrompida com os mesmos parâmetros retoma de onde parou."""
+    ctx = contexto(tmp_path)
+    logits = ctx.opts.logits_dir
+    logits.mkdir(parents=True)
+    (logits / "000000.pt").write_bytes(b"shard valido")
+    (logits / pl.FINGERPRINT_FILE).write_text(fingerprint(ctx.opts, "logits"))
+
+    pl._preparar_logits(ctx, logits)
+
+    assert (logits / "000000.pt").exists()
+
+
+def test_shards_sem_marca_sao_descartados(tmp_path):
+    """Interrompido antes da gravação atômica do manifesto: não dá para confiar."""
+    ctx = contexto(tmp_path)
+    logits = ctx.opts.logits_dir
+    logits.mkdir(parents=True)
+    (logits / "000000.pt").write_bytes(b"shard orfao")
+
+    pl._preparar_logits(ctx, logits)
+
+    assert not (logits / "000000.pt").exists()
+
+
+def test_limpeza_de_checkpoints_precede_a_medicao_de_disco():
+    """Cobrar do orçamento bytes prestes a serem liberados reprova o que caberia.
+
+    A ordem das duas chamadas é a correção inteira, e ela não tem efeito
+    observável sem um student de verdade em disco: a asserção é sobre a fonte.
+    """
+    import inspect
+
+    fonte = inspect.getsource(pl.stage_recover)
+    assert (fonte.index("_preparar_checkpoints")
+            < fonte.index("os checkpoints da recuperação"))

@@ -25,6 +25,13 @@ CONTROLLED = ("calib_batches", "seq_len", "logit_batches", "top_k",
 
 DEFAULT = "medium"
 
+# Lote de referência com que os presets foram calibrados. O número de amostras
+# de um nível é `lotes × este valor`, e não `lotes × --batch-size`: quem escolhe
+# um lote maior por ter mais RAM processa as mesmas amostras em menos passos,
+# não um conjunto de dados maior. Sem essa âncora, dobrar o lote dobraria disco
+# e tempo em silêncio — exatamente o que a nota sobre `batch_size` nega.
+LOTE_DE_REFERENCIA = 2
+
 
 @dataclass(frozen=True, slots=True)
 class Effort:
@@ -53,12 +60,22 @@ class Effort:
     def values(self) -> dict[str, Any]:
         return {campo: getattr(self, campo) for campo in CONTROLLED}
 
-    def logit_bytes(self, batch_size: int) -> int:
+    @property
+    def logit_samples(self) -> int:
+        """Amostras de logits do teacher que o nível pré-computa."""
+        return self.logit_batches * LOTE_DE_REFERENCIA
+
+    @property
+    def calib_samples(self) -> int:
+        """Amostras de calibração que o nível usa para pontuar a poda."""
+        return self.calib_batches * LOTE_DE_REFERENCIA
+
+    def logit_bytes(self) -> int:
         """Espaço em disco dos logits pré-computados, em bytes."""
         from .distill.teacher import estimate_logit_bytes
 
-        amostras = self.logit_batches * batch_size
-        return estimate_logit_bytes(amostras, self.seq_len, top_k=self.top_k)[0]
+        return estimate_logit_bytes(self.logit_samples, self.seq_len,
+                                    top_k=self.top_k)[0]
 
     @property
     def work(self) -> float:
@@ -68,9 +85,9 @@ class Effort:
         treino soma forward e backward, com peso 3. O número só tem significado
         relativo, e é isso que se mostra ao usuário.
         """
-        pontuacao = self.calib_batches * self.seq_len
-        logits = self.logit_batches * self.seq_len
-        treino = self.epochs * self.logit_batches * self.seq_len * 3
+        pontuacao = self.calib_samples * self.seq_len
+        logits = self.logit_samples * self.seq_len
+        treino = self.epochs * self.logit_samples * self.seq_len * 3
         return float(pontuacao + logits + treino)
 
 
@@ -151,7 +168,7 @@ def resolve(effort: Effort, informado: dict[str, Any]) -> tuple[dict[str, Any], 
     return valores, sorted(sobrescritos)
 
 
-def comparison(batch_size: int = 2) -> Iterator[dict[str, Any]]:
+def comparison() -> Iterator[dict[str, Any]]:
     """Linhas da tabela comparativa entre os níveis."""
     for e in LEVELS:
         yield {
@@ -161,7 +178,8 @@ def comparison(batch_size: int = 2) -> Iterator[dict[str, Any]]:
             "top_k": e.top_k,
             "seq_len": e.seq_len,
             "logit_batches": e.logit_batches,
-            "logit_bytes": e.logit_bytes(batch_size),
+            "logit_samples": e.logit_samples,
+            "logit_bytes": e.logit_bytes(),
             "cost": relative_cost(e),
         }
 

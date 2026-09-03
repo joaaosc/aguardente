@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -12,6 +13,7 @@ from typing import Any, Callable
 
 from .arch import count_params
 from .budget import GB, Budget, Machine, suggest_batch_size
+from .effort import LOTE_DE_REFERENCIA
 from .errors import AguardenteError, InsufficientResources, PlanImpossible
 from .events import EventLog, null_log
 from .plan import PrunePlan, plan_for_target
@@ -24,6 +26,11 @@ STAGES = ("fetch", "extract", "prune", "logits", "recover", "export")
 
 # Folga exigida sobre a estimativa antes de começar a escrever em disco.
 DISK_MARGIN = 1.15
+
+# Marca gravada junto dos checkpoints de recuperação. O estado só registra a
+# impressão digital de uma etapa concluída; um treino interrompido não deixa
+# registro, e é justamente ele que deixa checkpoints para trás.
+FINGERPRINT_FILE = "fingerprint.txt"
 
 # Parâmetros que determinam a saída de cada etapa. Alterá-los invalida o
 # trabalho já gravado: a impressão digital é persistida no estado e conferida
@@ -39,7 +46,10 @@ FINGERPRINT_FIELDS: dict[str, tuple[str, ...]] = {
     "recover": ("model", "student", "target_params", "top_k", "seq_len", "batch_size",
                 "logit_batches", "calib_batches", "calib_dataset", "calib_file",
                 "epochs", "lr", "alpha", "temperature", "grad_accum", "no_checkpointing"),
-    "export": ("model", "target_params", "platform", "compression",
+    # `student` entra aqui pelo mesmo motivo que entra em `prune` e `recover`:
+    # trocar de student produz outro modelo treinado, e o bundle exportado do
+    # student anterior não corresponde mais ao que se pediu.
+    "export": ("model", "student", "target_params", "platform", "compression",
                "compute_precision", "max_context_length"),
 }
 
@@ -287,14 +297,124 @@ def _ensure_disk(ctx: Context, needed: int, what: str) -> None:
     )
 
 
-def _training_dtype_bytes(opts: RunOptions) -> int:
+def _preparar_artefatos(ctx: Context, diretorio: Path, stage: str, *, aviso: str) -> Path:
+    """Garante que os arquivos parciais em `diretorio` pertencem a esta configuração.
+
+    `_resume` decide se uma etapa *concluída* pode ser reaproveitada, mas o
+    estado só registra a impressão digital quando a etapa termina — e é
+    justamente a etapa interrompida que deixa arquivos parciais para trás. Quem
+    os reaproveita depois olha só para o disco: `recover` carrega `last.pt` sem
+    perguntar nada, e `precompute_logits` reaproveita qualquer shard não vazio.
+
+    A marca fica junto dos próprios arquivos, e não no estado, porque é o único
+    lugar que sobrevive a uma interrupção. Sem ela, mudar de teacher ou de
+    `--seq-len` reaproveitaria shards do teacher anterior enquanto o manifesto
+    passaria a anunciar os parâmetros novos, e mudar o alvo faria a retomada do
+    treino carregar pesos de outro formato.
+
+    Configuração igual preserva o diretório: é assim que uma etapa interrompida
+    retoma de onde parou em vez de recomeçar.
+    """
+    fp = fingerprint(ctx.opts, stage)
+    marca = diretorio / FINGERPRINT_FILE
+    anterior = marca.read_text().strip() if marca.is_file() else None
+    if anterior != fp:
+        tinha_estado = anterior is not None or any(diretorio.glob("*"))
+        shutil.rmtree(diretorio, ignore_errors=True)
+        if tinha_estado:
+            ctx.say(f"             {aviso}")
+    diretorio.mkdir(parents=True, exist_ok=True)
+    marca.write_text(fp)
+    return diretorio
+
+
+def _preparar_checkpoints(ctx: Context, ckpt_dir: Path) -> Path:
+    """Descarta checkpoints de recuperação gravados sob outra configuração."""
+    return _preparar_artefatos(ctx, ckpt_dir, "recover",
+                               aviso="checkpoints de outra configuração descartados")
+
+
+def _preparar_logits(ctx: Context, logits_dir: Path) -> Path:
+    """Descarta shards de logits gerados sob outra configuração.
+
+    O manifesto sozinho não basta: ele só guarda `top_k`, é reescrito ao final
+    com os parâmetros novos, e some quando a etapa é interrompida antes da
+    gravação atômica. Trocar de teacher, de `--seq-len` ou de arquivo de
+    calibração deixava os shards antigos no lugar, e o treino seguia contra o
+    sinal do teacher anterior sem um aviso sequer.
+    """
+    return _preparar_artefatos(ctx, logits_dir, "logits",
+                               aviso="logits de outra configuração descartados")
+
+
+def _lotes_para(amostras: int, batch_size: int) -> int:
+    """Passos necessários para percorrer `amostras` em lotes de `batch_size`.
+
+    O nível de esforço fixa quantas amostras existem; `--batch-size` só decide
+    em quantos passos elas são percorridas. Multiplicar um pelo outro faria o
+    conjunto de dados — e o disco, e o tempo — crescer junto com a RAM da
+    máquina, que é exatamente o que a nota sobre `batch_size` em `effort` nega.
+    """
+    return max(1, math.ceil(amostras / max(1, batch_size)))
+
+
+def _textos_para(lotes: int, batch_size: int, *, folga: int) -> int:
+    """Textos a carregar para formar `lotes` lotes cheios de `batch_size`.
+
+    `make_batches` descarta o último bloco incompleto, então pedir só o número
+    de amostras deixaria a etapa um lote curta sempre que a divisão não fosse
+    exata — silenciosamente, porque menos shards não é erro. A folga cobre as
+    amostras que os filtros de comprimento do dataset descartam.
+    """
+    return lotes * max(1, batch_size) + folga
+
+
+def _guard_training_ceiling(ctx: Context, params: int, teto: float, budget: Budget, *,
+                            descricao: str, hint_alternativa: str) -> None:
+    """Barra um modelo que não cabe no teto de treino desta máquina.
+
+    Vale tanto para o alvo da poda quanto para um student externo: o que decide
+    é o tamanho do que vai treinar. Com `--skip-recover` não há treino, e o teto
+    deixa de valer; com `--allow-oversized` o usuário assume o risco e o
+    programa só avisa.
+    """
+    if params <= teto or ctx.opts.skip_recover:
+        return
+    aviso = (f"{descricao} excede o teto de treino desta máquina "
+             f"({teto/1e9:.2f} B para {budget.ram_bytes/GB:.0f} GB de orçamento)")
+    if not ctx.opts.allow_oversized:
+        raise InsufficientResources(aviso, hint=hint_alternativa)
+    ctx.say(f"aviso        {aviso}")
+
+
+def training_dtype_bytes(device: str | None = None) -> int:
     """Bytes por peso no treino: 2 em MPS (float16), 4 nos demais (float32)."""
     try:
         from .loading import pick_device
-        device = pick_device(opts.device)
+        resolvido = pick_device(device)
     except Exception:  # noqa: BLE001 — sem torch o plano ainda precisa de um número
-        device = opts.device or "mps"
-    return 2 if device == "mps" else 4
+        resolvido = device or "mps"
+    return 2 if resolvido == "mps" else 4
+
+
+def _training_dtype_bytes(opts: RunOptions) -> int:
+    return training_dtype_bytes(opts.device)
+
+
+def suggested_batch_size(p: ModelProbe, budget: Budget, *, seq_len: int,
+                         dtype_bytes: int, training: bool) -> int:
+    """Lote sugerido pela RAM — a mesma conta em `plan` e em `run`.
+
+    O `plan` existe para antecipar o que o `run` vai fazer; calcular o lote a
+    partir de entradas diferentes nos dois fazia o plano anunciar um número que
+    a execução não usaria — o dobro dele em qualquer máquina sem MPS, onde o
+    treino cai para float32.
+    """
+    return suggest_batch_size(
+        hidden_size=p.arch.hidden_size, seq_len=seq_len,
+        ram_bytes=budget.ram_bytes, dtype_bytes=dtype_bytes,
+        reserved_bytes=p.text_params * dtype_bytes, training=training,
+    )
 
 
 # --------------------------------------------------------------------- plano
@@ -329,13 +449,14 @@ def make_plan(ctx: Context) -> tuple[ModelProbe, PrunePlan | None]:
         ctx.say(f"aviso        {aviso_teacher}")
 
     if opts.batch_size is None:
-        opts.batch_size = suggest_batch_size(
-            hidden_size=p.arch.hidden_size, seq_len=opts.seq_len,
-            ram_bytes=budget.ram_bytes, dtype_bytes=dtype_bytes,
-            reserved_bytes=pesos_teacher, training=not opts.skip_recover,
+        opts.batch_size = suggested_batch_size(
+            p, budget, seq_len=opts.seq_len, dtype_bytes=dtype_bytes,
+            training=not opts.skip_recover,
         )
         ctx.say(f"lote         sugerido pela RAM: {opts.batch_size} amostra(s) por lote")
 
+    student_probe = None
+    target = None
     if opts.student:
         # Um student externo substitui a cirurgia de poda: não há alvo de
         # parâmetros a planejar, só a compatibilidade a checar. O vocabulário
@@ -350,34 +471,46 @@ def make_plan(ctx: Context) -> tuple[ModelProbe, PrunePlan | None]:
                      "significa palavras diferentes em cada tokenizer invalida a "
                      "divergência KL. Escolha um student derivado do mesmo tokenizer.",
             )
+        # O teto de treino vale igual para um student pronto: quem decide se
+        # cabe é o tamanho do que vai treinar, não a origem dos pesos. Sem esta
+        # guarda, um student grande demais só falharia na recuperação, depois
+        # do download do teacher e de horas de pré-computação de logits.
+        _guard_training_ceiling(
+            ctx, student_probe.stored_params, teto, budget,
+            descricao=f"o student de {student_probe.stored_params/1e9:.2f} B",
+            hint_alternativa="Escolha um student menor, use --skip-recover para pular o "
+                             "treino, ou --allow-oversized para prosseguir assumindo o "
+                             "risco de esgotar a memória na etapa de recuperação.",
+        )
         ctx.say(f"student      externo: {opts.student} "
                 f"({student_probe.stored_params/1e9:.2f} B, vocabulário compatível)")
-        ctx.plan = None
-        return p, None
-
-    target = opts.target_params
-    if target is None:
-        target = teto
-        ctx.say(f"alvo         sugerido pela RAM: {target/1e9:.2f} B parâmetros")
-    elif target > teto and not opts.skip_recover:
-        aviso = (f"o alvo de {target/1e9:.2f} B excede o teto de treino desta máquina "
-                 f"({teto/1e9:.2f} B para {budget.ram_bytes/GB:.0f} GB de orçamento)")
-        if not opts.allow_oversized:
-            raise InsufficientResources(
-                aviso,
-                hint=f"Use --target-params {teto:.0f} ou menos, --skip-recover para pular o "
-                     "treino, ou --allow-oversized para prosseguir assumindo o risco de "
-                     "esgotar a memória na etapa de recuperação.",
+    else:
+        target = opts.target_params
+        if target is None:
+            target = teto
+            ctx.say(f"alvo         sugerido pela RAM: {target/1e9:.2f} B parâmetros")
+        else:
+            _guard_training_ceiling(
+                ctx, target, teto, budget,
+                descricao=f"o alvo de {target/1e9:.2f} B",
+                hint_alternativa=f"Use --target-params {teto:.0f} ou menos, --skip-recover "
+                                 "para pular o treino, ou --allow-oversized para prosseguir "
+                                 "assumindo o risco de esgotar a memória na etapa de "
+                                 "recuperação.",
             )
-        ctx.say(f"aviso        {aviso}")
 
     if dtype_bytes == 4 and not opts.skip_recover:
         ctx.say("aviso        sem MPS o treino usa float32: o consumo de memória dobra "
                 "em relação ao cálculo padrão")
 
+    poda = ({"id": "prune", "title": "Student externo",
+             "rationale": "Baixa o student informado no lugar da poda estruturada."}
+            if opts.student else
+            {"id": "prune", "title": "Poda estruturada",
+             "rationale": "Corta camadas e canais do modelo até atingir o tamanho-alvo dimensionado pela RAM."})
     stages_info = [
         {"id": "fetch", "title": "Download", "rationale": "Baixa os pesos originais do modelo e tokenizador via aria2c."},
-        {"id": "prune", "title": "Poda estruturada", "rationale": "Corta camadas e canais do modelo até atingir o tamanho-alvo dimensionado pela RAM."},
+        poda,
         {"id": "logits", "title": "Geração de logits", "rationale": "Gera saídas de calibração do modelo professor para orientar o processo de destilação."},
         {"id": "recover", "title": "Recuperação", "rationale": "Treino de destilação para recuperar a perplexidade perdida na poda estruturada."},
         {"id": "export", "title": "Conversão Core AI", "rationale": "Converte e quantiza o modelo para execução acelerada via Apple Core AI no Neural Engine / GPU."},
@@ -387,6 +520,10 @@ def make_plan(ctx: Context) -> tuple[ModelProbe, PrunePlan | None]:
     if p.layout is not None and p.layout.is_multimodal:
         ctx.say(f"modelo       multimodal: {p.dropped_params/1e9:.2f} B de visão e "
                 f"projetor serão descartados")
+
+    if student_probe is not None:
+        ctx.plan = None
+        return p, None
 
     total = count_params(p.arch).total
     if total <= target:
@@ -562,7 +699,7 @@ def _stage_fetch_student(ctx: Context) -> Path:
     entrega no mesmo formato que a poda entregaria, para que `logits` e
     `recover` não precisem saber a diferença.
     """
-    from .fetch import fetch_model, require_aria2
+    from .fetch import fetch, plan_fetch, require_aria2
 
     opts, state = ctx.opts, ctx.state
     out = opts.pruned_dir
@@ -572,22 +709,34 @@ def _stage_fetch_student(ctx: Context) -> Path:
         ctx.say(f"student      já presente: {out}")
         return out
 
+    # Um student externo pode ter vários GB, e nada garante que caibam. As
+    # demais etapas que escrevem em volume medem antes de começar; esta não
+    # media, e encher o volume no meio do download degrada o sistema inteiro.
+    local = Path(ref).expanduser()
+    plano_remoto = None
+    if local.is_dir():
+        necessario = sum(f.stat().st_size for f in local.rglob("*") if f.is_file())
+    else:
+        require_aria2()
+        plano_remoto = plan_fetch(ref, out)
+        necessario = plano_remoto.pending_bytes
+    _ensure_disk(ctx, necessario, "o download do student")
+
     state.begin("prune")
     ctx.events.stage_start("prune", 3, len(STAGES),
                            rationale="Baixa o student externo no lugar da poda estruturada.")
     t0 = time.perf_counter()
 
-    local = Path(ref).expanduser()
     try:
-        if local.is_dir():
-            ctx.say(f"student      copiando de {local}")
+        if plano_remoto is None:
+            ctx.say(f"student      copiando de {local} ({necessario/GB:.2f} GB)")
             shutil.rmtree(out, ignore_errors=True)
             shutil.copytree(local, out)
         else:
-            require_aria2()
-            ctx.say(f"student      baixando {ref}")
-            fetch_model(ref, out, on_line=lambda linha: ctx.say(f"             {linha.strip()}")
-                       if linha.strip() else None)
+            ctx.say(f"student      baixando {ref} ({necessario/GB:.2f} GB pendentes)")
+            fetch(plano_remoto, connections=opts.connections, concurrent=opts.concurrent,
+                  on_line=lambda linha: ctx.say(f"             {linha.strip()}")
+                  if linha.strip() else None)
     except Exception as e:
         state.fail("prune", str(e))
         raise
@@ -631,15 +780,18 @@ def stage_prune(ctx: Context, teacher_dir: Path) -> Path:
     with _Activity(ctx, f"carregando o modelo (device={device})"):
         model, tokenizer = load_causal_lm(str(teacher_dir), device=device)
 
-    n_texts = opts.calib_batches * opts.batch_size + 8
+    amostras = opts.calib_batches * LOTE_DE_REFERENCIA
+    lotes = _lotes_para(amostras, opts.batch_size)
+    n_texts = _textos_para(lotes, opts.batch_size, folga=8)
     texts = (load_texts_from_file(opts.calib_file, limit=n_texts) if opts.calib_file
              else load_texts(dataset=opts.calib_dataset, limit=n_texts))
     batches = make_batches(tokenizer, texts, batch_size=opts.batch_size,
                            seq_len=opts.seq_len, device=device)
 
     try:
-        with _Activity(ctx, f"medindo importância em {opts.calib_batches} lotes"):
-            scores = score_model(model, batches, max_batches=opts.calib_batches)
+        with _Activity(ctx, f"medindo importância em {amostras} amostras "
+                            f"({lotes} lote(s) de {opts.batch_size})"):
+            scores = score_model(model, batches, max_batches=lotes)
         t = ctx.plan.target
         keep_layers = scores.keep_layers(t.num_hidden_layers)
         report = prune_model(
@@ -696,10 +848,15 @@ def stage_logits(ctx: Context, teacher_dir: Path) -> Path | None:
         ctx.say(f"logits       já concluídos: {out}")
         return out
 
-    n = opts.logit_batches * opts.batch_size
+    n = opts.logit_batches * LOTE_DE_REFERENCIA
+    lotes = _lotes_para(n, opts.batch_size)
     size, _ = estimate_logit_bytes(n, opts.seq_len, top_k=opts.top_k)
-    ctx.say(f"logits       top-{opts.top_k} · {opts.logit_batches} lotes "
+    ctx.say(f"logits       top-{opts.top_k} · {n} amostras em {lotes} lote(s) "
             f"≈ {size/GB:.2f} GB em disco")
+    # Descartar antes de medir: shards de outra configuração ainda ocupam disco
+    # aqui, e cobrá-los do orçamento reprovaria uma etapa que caberia depois da
+    # limpeza que vem logo a seguir.
+    _preparar_logits(ctx, out)
     _ensure_disk(ctx, size, "a pré-computação de logits")
 
     state.begin("logits")
@@ -715,15 +872,15 @@ def stage_logits(ctx: Context, teacher_dir: Path) -> Path | None:
             ctx.metrics["ppl_teacher"] = ppl.value
             ctx.say(f"             perplexidade do teacher: {ppl.value:.2f}")
 
-        n_texts = n + 16
+        n_texts = _textos_para(lotes, opts.batch_size, folga=16)
         texts = (load_texts_from_file(opts.calib_file, limit=n_texts) if opts.calib_file
                  else load_texts(dataset=opts.calib_dataset, limit=n_texts))
         batches = make_batches(tokenizer, texts, batch_size=opts.batch_size,
                                seq_len=opts.seq_len, device=device)
-        barra = _Progress(ctx, opts.logit_batches, label="pré-computando", sid="logits")
+        barra = _Progress(ctx, lotes, label="pré-computando", sid="logits")
         result = precompute_logits(
             teacher, batches, out, top_k=opts.top_k,
-            max_batches=opts.logit_batches,
+            max_batches=lotes,
             on_progress=lambda k: barra.update(k, suffix=f"shard {k}"),
         )
         barra.done(suffix=f"{result.shards} shards")
@@ -789,7 +946,21 @@ def stage_recover(ctx: Context, pruned_dir: Path, logits_dir: Path | None) -> Pa
         if opts.measure:
             evaluate = lambda: perplexity_on_wikitext(student, tokenizer, device=device).value
 
-        ckpt_dir = opts.out_dir / "ckpt"
+        # Cada checkpoint retomável guarda os pesos e o estado do AdamW — dois
+        # momentos em float32 por parâmetro treinável. Com o `.tmp` da troca
+        # atômica e o `best.pt` ao lado, o diretório chega a algumas vezes o
+        # tamanho do student, e era o único artefato do pipeline que ninguém
+        # media antes de começar a escrever.
+        #
+        # A limpeza vem primeiro: os checkpoints da configuração anterior ainda
+        # ocupam disco neste ponto, e medir antes de descartá-los reprovaria uma
+        # etapa que caberia justamente nos bytes prestes a serem liberados.
+        ckpt_dir = _preparar_checkpoints(ctx, opts.out_dir / "ckpt")
+
+        pesos_bytes = sum(p.numel() * p.element_size() for p in student.parameters())
+        momentos = sum(p.numel() * 4 * 2 for p in student.parameters() if p.requires_grad)
+        _ensure_disk(ctx, 2 * (pesos_bytes + momentos) + pesos_bytes,
+                     "os checkpoints da recuperação")
         if (ckpt_dir / "last.pt").is_file():
             ctx.say("             checkpoint encontrado — retomando o treino de onde parou")
 

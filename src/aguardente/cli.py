@@ -16,13 +16,14 @@ from pathlib import Path
 from . import __version__
 from .arch import count_params
 from .budget import (BPW_FP16, BPW_INT4_EMBED_FP16, GB, Budget, Machine,
-                     kv_cache_bytes, suggest_batch_size, training_bytes, weights_bytes)
+                     kv_cache_bytes, training_bytes, weights_bytes)
 from . import effort
 from .errors import AguardenteError
 from .events import stdout_log
 from .errors import PlanImpossible
 from .plan import plan_for_target, shrink
-from .pipeline import DISK_MARGIN, RunOptions, run_pipeline
+from .pipeline import (DISK_MARGIN, RunOptions, run_pipeline, suggested_batch_size,
+                       training_dtype_bytes)
 from .preflight import Status, blocking, check_pipeline_deps, check_python, run_all
 from .probe import probe
 from .source import resolve_source
@@ -104,7 +105,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         )
         return completed.returncode
 
-    result = check_pipeline_deps()
+    result = check_pipeline_deps(deep=True)
     if result.status is not Status.OK:
         ui.error(
             "instalação concluída, mas a stack não pôde ser importada",
@@ -115,7 +116,46 @@ def cmd_install(args: argparse.Namespace) -> int:
 
     ui.blank()
     ui.done("dependências do pipeline instaladas", hint=result.detail)
+
+    if _e_ambiente_de_uv_tool():
+        ui.blank()
+        ui.note(
+            "este é um ambiente `uv tool`, e o que foi instalado agora não entra no "
+            "recibo da ferramenta: um `uv tool upgrade aguardente` reconstrói o "
+            "ambiente a partir do recibo e remove estas dependências. Para gravá-las "
+            "de forma durável, reinstale com "
+            f"`uv tool install --python 3.12 --force {shlex.join(_com_extras(dependencies))}`."
+        )
+
+    faltando = [c for c in _requisitos_externos() if c.status is not Status.OK]
+    if faltando:
+        ui.blank()
+        ui.note("o pipeline também depende de programas fora do Python, e estes ainda "
+                "não estão prontos: "
+                + "; ".join(f"{c.name} ({c.detail})" for c in faltando)
+                + ". Execute `aguardente doctor` para o diagnóstico completo.")
     return 0
+
+
+def _e_ambiente_de_uv_tool() -> bool:
+    """Detecta se o executável atual vive num ambiente gerenciado por `uv tool`.
+
+    Importa porque `uv pip install` nesse ambiente não é registrado no recibo da
+    ferramenta: o próximo `uv tool upgrade` reconstrói tudo e descarta o que foi
+    instalado por fora, devolvendo o usuário ao mesmo erro de dependência.
+    """
+    return "uv" in Path(sys.prefix).parts and "tools" in Path(sys.prefix).parts
+
+
+def _com_extras(dependencies: list[str]) -> list[str]:
+    """Comando equivalente que grava as dependências no recibo da ferramenta."""
+    return [arg for dep in dependencies for arg in ("--with", dep)] + ["aguardente"]
+
+
+def _requisitos_externos() -> list:
+    """Verificações do ambiente que `aguardente install` não resolve sozinho."""
+    from .preflight import check_arch, check_aria2, check_macos
+    return [check_macos(), check_arch(), check_aria2()]
 
 
 # ------------------------------------------------------------------ doctor
@@ -131,7 +171,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     ui.blank()
 
     verbose = getattr(args, "verbose", False)
-    results = run_all()
+    # O `doctor` existe para diagnosticar: aqui vale pagar o import de cada
+    # pacote para distinguir "ausente" de "presente mas quebrado". O `run` não
+    # paga esse custo — a RAM importada fica residente pela execução inteira.
+    results = run_all(deep_pipeline=True)
     width = max(len(r.name) for r in results)
     state_of = {Status.OK: StageState.OK, Status.WARN: StageState.SKIPPED,
                 Status.FAIL: StageState.FAILED}
@@ -257,7 +300,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 "--other-ram-gb e --other-disk-gb precisam ser usados juntos",
                 hint="Informe os dois para avaliar a outra máquina.")
         _secao_outra_maquina(a, p, args.other_ram_gb, args.other_disk_gb,
-                             args.target_params)
+                             args.target_params, effort.get(getattr(args, "effort", None)))
 
     teto = budget.max_params_for_training()
     target = args.target_params or teto
@@ -307,11 +350,12 @@ def cmd_plan(args: argparse.Namespace) -> int:
     nivel = effort.get(getattr(args, "effort", None))
     lote = args.batch_size
     if lote is None:
-        lote = suggest_batch_size(
-            hidden_size=a.hidden_size, seq_len=nivel.seq_len,
-            ram_bytes=budget.ram_bytes, reserved_bytes=p.text_params * 2,
-            training=True,
-        )
+        # A mesma conta que `run` fará, com as mesmas entradas: sem MPS o treino
+        # cai para float32 e o lote cabível é outro. Estimar aqui com números
+        # diferentes anunciaria um lote que a execução não usaria.
+        dtype_bytes = training_dtype_bytes(getattr(args, "device", None))
+        lote = suggested_batch_size(p, budget, seq_len=nivel.seq_len,
+                                    dtype_bytes=dtype_bytes, training=True)
         ui.field("lote sugerido pela RAM", str(lote))
 
     ui.header("Estimativa de recursos")
@@ -322,11 +366,11 @@ def cmd_plan(args: argparse.Namespace) -> int:
          ("memória por 2.048 tokens", _fmt_bytes(kv_cache_bytes(final, 2048))),
          ("memória por 8.192 tokens", _fmt_bytes(kv_cache_bytes(final, 8192))),
          ("RAM estimada no treino", _fmt_bytes(training_bytes(final_params))),
-         (f"logits em disco (--effort {nivel.name})", _fmt_bytes(nivel.logit_bytes(lote)))],
+         (f"logits em disco (--effort {nivel.name})", _fmt_bytes(nivel.logit_bytes()))],
         align_right=(1,),
     )
 
-    _effort_panel(nivel, [], batch_size=lote, animate=not getattr(args, "no_anim", False))
+    _effort_panel(nivel, [], animate=not getattr(args, "no_anim", False))
 
     if plan and training_bytes(final_params) > budget.ram_bytes:
         ui.warn("o treino pode exceder a memória disponível",
@@ -348,7 +392,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
 
 def _secao_outra_maquina(a, p, ram_gb: float, disk_gb: float,
-                         target_params: int | None) -> None:
+                         target_params: int | None, nivel) -> None:
     """Avalia conversão e destilação numa máquina descrita só por RAM e disco.
 
     Não toca a máquina atual nem baixa nada: usa as mesmas contas do plano
@@ -388,13 +432,18 @@ def _secao_outra_maquina(a, p, ram_gb: float, disk_gb: float,
     extracao = weights_bytes(p.text_params, BPW_FP16) if p.is_multimodal else 0
     poda = weights_bytes(final_params, BPW_FP16)
     bundle = weights_bytes(final_params, BPW_INT4_EMBED_FP16)
-    pico = download + extracao + poda + bundle
+    # Os logits pré-computados costumam ser o maior artefato do pipeline, e são
+    # guardados por `_ensure_disk` como qualquer outra etapa. Omiti-los aqui
+    # anunciava "conversão viável" para máquinas onde a execução real aborta.
+    logits = nivel.logit_bytes()
+    pico = download + extracao + poda + bundle + logits
     disco_viavel = disk_gb * GB >= pico * DISK_MARGIN
 
     ui.field("disco no pico (estimado)", _fmt_bytes(pico),
              note=f"download {_fmt_bytes(download)}"
                   + (f" + extração {_fmt_bytes(extracao)}" if extracao else "")
-                  + f" + poda {_fmt_bytes(poda)} + bundle {_fmt_bytes(bundle)}")
+                  + f" + poda {_fmt_bytes(poda)} + bundle {_fmt_bytes(bundle)}"
+                  + f" + logits {_fmt_bytes(logits)} (--effort {nivel.name})")
 
     ui.blank()
     ui.field("conversão (poda + export)", "viável" if disco_viavel else "inviável",
@@ -409,8 +458,7 @@ def _secao_outra_maquina(a, p, ram_gb: float, disk_gb: float,
 # ------------------------------------------------------------------ effort
 
 
-def _effort_panel(nivel, sobrescritos, *, batch_size: int = 2,
-                  animate: bool = True) -> None:
+def _effort_panel(nivel, sobrescritos, *, animate: bool = True) -> None:
     """Painel do nível escolhido: escala, o que muda e o que custa."""
     ui.header("Esforço da destilação")
     ui.meter_line(effort.index(nivel), total=len(effort.LEVELS),
@@ -420,7 +468,7 @@ def _effort_panel(nivel, sobrescritos, *, batch_size: int = 2,
     ui.blank()
     ui.field("custo relativo", f"{effort.relative_cost(nivel):.2f}× do nível "
                                f"{effort.DEFAULT}")
-    ui.field("logits em disco", _fmt_bytes(nivel.logit_bytes(batch_size)))
+    ui.field("logits em disco", _fmt_bytes(nivel.logit_bytes()))
     ui.field("épocas de recuperação", str(nivel.epochs))
     ui.field("profundidade top-k", str(nivel.top_k))
     if sobrescritos:
@@ -432,7 +480,6 @@ def _effort_panel(nivel, sobrescritos, *, batch_size: int = 2,
 def cmd_effort(args: argparse.Namespace) -> int:
     """Explica a escala de esforço sem tocar em nenhum modelo."""
     animar = not getattr(args, "no_anim", False)
-    lote = getattr(args, "batch_size", 2)
 
     ui.title("Esforço da destilação",
              "Quanto trabalho investir para recuperar a qualidade perdida na poda")
@@ -458,13 +505,15 @@ def cmd_effort(args: argparse.Namespace) -> int:
         ["nível", "épocas", "top-k", "seq", "lotes", "logits em disco", "custo"],
         [(l["name"], str(l["epochs"]), str(l["top_k"]), str(l["seq_len"]),
           str(l["logit_batches"]), _fmt_bytes(l["logit_bytes"]), f"{l['cost']:.2f}×")
-         for l in effort.comparison(lote)],
+         for l in effort.comparison()],
         align_right=(1, 2, 3, 4, 5, 6),
     )
     ui.blank()
     ui.explain(
-        f"Disco estimado com --batch-size {lote}. O custo é o tempo relativo ao nível "
-        f"{effort.DEFAULT}, calculado pelos tokens processados em cada etapa.",
+        f"O nível fixa quantas amostras existem, então o disco não depende de "
+        f"--batch-size: um lote maior processa as mesmas amostras em menos passos. "
+        f"O custo é o tempo relativo ao nível {effort.DEFAULT}, calculado pelos "
+        f"tokens processados em cada etapa.",
     )
 
     ui.blank()
@@ -700,8 +749,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         if opts.target_params:
             ui.field("alvo", _fmt_params(opts.target_params))
         if not opts.skip_recover:
-            _effort_panel(args.effort_level, args.effort_overrides,
-                          batch_size=opts.batch_size)
+            _effort_panel(args.effort_level, args.effort_overrides)
         ui.blank()
         ui.rule()
 
@@ -915,8 +963,6 @@ def build_parser() -> argparse.ArgumentParser:
     rn.set_defaults(func=cmd_run)
 
     ef = sub.add_parser("effort", help="explica os níveis de agressividade da destilação")
-    ef.add_argument("--batch-size", type=int, default=2,
-                    help="lote usado para estimar o disco dos logits (padrão: 2)")
     ef.add_argument("--no-anim", action="store_true", help="não anima os medidores")
     ef.set_defaults(func=cmd_effort)
 
