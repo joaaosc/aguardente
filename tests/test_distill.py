@@ -559,3 +559,68 @@ def test_recover_flushes_pending_gradients_on_interrupt(tmp_path):
     assert res.stopped_by == "interrupted"
     # Com 3 lotes e grad_accum=2, a interrupção no 3º lote deve escoar o lote residual, totalizando 2 passos
     assert res.steps == 2
+
+
+def test_recover_keeps_accumulation_window_aligned_across_epochs(tmp_path):
+    """Um passo residual fecha a janela; a época seguinte recomeça com grad_accum cheio."""
+    teacher = tiny_model()
+    logits = precompute_logits(teacher, fixed_batches(n=5), tmp_path / "l", top_k=8)
+
+    janelas: list[int] = []
+    estado = {"lotes": 0}
+    clip_original = torch.nn.utils.clip_grad_norm_
+
+    def espia_clip(params, norm, *a, **kw):
+        janelas.append(estado["lotes"])
+        estado["lotes"] = 0
+        return clip_original(params, norm, *a, **kw)
+
+    import aguardente.distill.train as modulo
+    kd_original = modulo.kd_loss
+
+    def espia_kd(*a, **kw):
+        estado["lotes"] += 1
+        return kd_original(*a, **kw)
+
+    torch.nn.utils.clip_grad_norm_ = espia_clip
+    modulo.kd_loss = espia_kd
+    try:
+        recover(tiny_model(seed=1), logits,
+                RecoveryConfig(epochs=2, grad_accum=4, gradient_checkpointing=False),
+                device="cpu")
+    finally:
+        torch.nn.utils.clip_grad_norm_ = clip_original
+        modulo.kd_loss = kd_original
+
+    # 5 lotes por época: 4 acumulados + 1 residual, e a época seguinte
+    # recomeça do zero em vez de herdar o desalinhamento.
+    assert janelas == [4, 1, 4, 1]
+
+
+def test_precompute_discards_shards_generated_with_other_top_k(tmp_path):
+    """Mudar top-k não pode reaproveitar shards com K antigo."""
+    teacher = tiny_model()
+    d = tmp_path / "logits"
+    precompute_logits(teacher, fixed_batches(n=2), d, top_k=8)
+    assert torch.load(d / "000000.pt", weights_only=True)["values"].shape[-1] == 8
+
+    novo = precompute_logits(teacher, fixed_batches(n=2), d, top_k=32)
+    k_real = torch.load(d / "000000.pt", weights_only=True)["values"].shape[-1]
+    assert novo.top_k == k_real == 32
+
+
+def test_precompute_reports_progress_for_reused_shards(tmp_path):
+    teacher = tiny_model()
+    d = tmp_path / "logits"
+    precompute_logits(teacher, fixed_batches(n=4), d, top_k=8)
+
+    vistos: list[int] = []
+    precompute_logits(teacher, fixed_batches(n=4), d, top_k=8, on_progress=vistos.append)
+    assert vistos == [1, 2, 3, 4]
+
+
+def test_kd_loss_rejects_degenerate_sequence_length():
+    s = torch.randn(2, 1, 32)
+    v, idx = s.topk(8, dim=-1)
+    with pytest.raises(ValueError, match="pelo menos 2 posições"):
+        kd_loss(s, v, idx, labels=torch.randint(0, 32, (2, 1)))
