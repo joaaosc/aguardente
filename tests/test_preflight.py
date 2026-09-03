@@ -201,11 +201,25 @@ def test_dependencia_presente_mas_incompativel_vira_aviso(monkeypatch):
         return type("Module", (), {"__version__": "2.9.0"})()
 
     monkeypatch.setattr(pf.importlib, "import_module", fake_import)
-    result = pf.check_pipeline_deps()
+    result = pf.check_pipeline_deps(deep=True)
     assert result.status is pf.Status.WARN
     assert "coreai_opt não carrega" in result.detail
     assert "aguardente install" in result.hint
     assert "RuntimeError" in result.debug
+
+
+def test_verificacao_rasa_nao_importa_a_stack_inteira(monkeypatch):
+    """No `run`, importar transformers custa segundos e RAM residente à toa."""
+    monkeypatch.setattr(pf.importlib.util, "find_spec", lambda name: object())
+    importados = []
+
+    def fake_import(name):
+        importados.append(name)
+        return type("Module", (), {"__version__": "2.9.0"})()
+
+    monkeypatch.setattr(pf.importlib, "import_module", fake_import)
+    assert pf.check_pipeline_deps().status is pf.Status.OK
+    assert importados == ["torch"]
 
 
 def test_probe_forca_locale_c(monkeypatch):
