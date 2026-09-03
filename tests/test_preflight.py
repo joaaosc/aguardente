@@ -184,6 +184,30 @@ def test_stack_do_pipeline_pode_ser_promovida_a_bloqueio():
     assert pf.blocking([aviso, ok], warn_as_fail=("stack do pipeline",)) == [aviso]
 
 
+def test_python_free_threaded_e_rejeitado(monkeypatch):
+    monkeypatch.setattr(pf.sysconfig, "get_config_var", lambda name: 1)
+    result = pf.check_python()
+    assert result.status is pf.Status.FAIL
+    assert "free-threaded" in result.detail
+    assert "Python 3.12" in result.hint
+
+
+def test_dependencia_presente_mas_incompativel_vira_aviso(monkeypatch):
+    monkeypatch.setattr(pf.importlib.util, "find_spec", lambda name: object())
+
+    def fake_import(name):
+        if name == "coreai_opt":
+            raise RuntimeError("ABI incompatível")
+        return type("Module", (), {"__version__": "2.9.0"})()
+
+    monkeypatch.setattr(pf.importlib, "import_module", fake_import)
+    result = pf.check_pipeline_deps()
+    assert result.status is pf.Status.WARN
+    assert "coreai_opt não carrega" in result.detail
+    assert "aguardente install" in result.hint
+    assert "RuntimeError" in result.debug
+
+
 def test_probe_forca_locale_c(monkeypatch):
     """As mensagens de erro precisam vir em inglês para o diagnóstico por texto funcionar."""
     capturado = {}

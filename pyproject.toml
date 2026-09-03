@@ -15,7 +15,7 @@ pipeline = [
     "accelerate>=1.12,<2.0",
     "coreai-torch",
     "coreai-opt",
-    "coreai-models @ git+https://github.com/apple/coreai-models@main#subdirectory=python",
+    "coreai-models @ git+https://github.com/apple/coreai-models@8cec4f879b353ea8416d0c04f0bf00231fbacfb0#subdirectory=python",
 ]
 dev = ["pytest>=8.0"]
 

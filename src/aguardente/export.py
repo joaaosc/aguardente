@@ -66,8 +66,8 @@ def build_command(
     if base is None:
         raise AguardenteError(
             "coreai.llm.export não encontrado — o exportador da Apple não está instalado",
-            hint="uv pip install -e '.[pipeline]'  (traz coreai-models do GitHub; "
-                 "o pacote homônimo no PyPI é de terceiro e NÃO serve)",
+            hint="Execute `aguardente install` para instalar o exportador oficial da Apple; "
+                 "o pacote homônimo na PyPI é de terceiro e não serve.",
         )
 
     cmd = [*base, str(model_dir), "--platform", platform,

@@ -14,7 +14,7 @@ OK = CheckResult("aria2c", Status.OK, "1.37.0")
 
 
 AVISO = CheckResult("stack do pipeline", Status.WARN, "faltam: torch",
-                    hint="uv pip install 'aguardente[pipeline]'")
+                    hint="aguardente install")
 
 
 @pytest.fixture

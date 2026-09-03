@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import os
 import platform
 import shutil
 import subprocess
 import sys
+import sysconfig
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -242,6 +245,11 @@ def check_aria2() -> CheckResult:
 def check_python() -> CheckResult:
     v = sys.version_info[:3]
     txt = ".".join(map(str, v))
+    if sysconfig.get_config_var("Py_GIL_DISABLED") == 1:
+        return CheckResult(
+            "Python", Status.FAIL, f"{txt} free-threaded",
+            "A stack Core AI ainda não suporta o ABI free-threaded. Use Python 3.12 convencional.",
+        )
     if not ((3, 11) <= v[:2] < (3, 14)):
         return CheckResult("Python", Status.FAIL, txt,
                            "coreai-opt exige >=3.11,<3.14. Use `uv venv --python 3.12`.")
@@ -258,13 +266,26 @@ def check_arch() -> CheckResult:
 
 def check_pipeline_deps() -> CheckResult:
     """Verifica se os pacotes opcionais de execução do pipeline estão instalados."""
-    import importlib.util
     missing = [m for m in ("torch", "transformers", "coreai_torch", "coreai_opt")
                if importlib.util.find_spec(m) is None]
     if missing:
         return CheckResult("stack do pipeline", Status.WARN, f"faltam: {', '.join(missing)}",
-                           "Instale as dependências completas com: uv pip install 'aguardente[pipeline]'")
-    import torch  # noqa: PLC0415
+                           "Instale as dependências completas com: aguardente install")
+
+    loaded = {}
+    for module in ("torch", "transformers", "coreai_torch", "coreai_opt"):
+        try:
+            loaded[module] = importlib.import_module(module)
+        except Exception as exc:  # noqa: BLE001 — diagnóstico de dependência quebrada
+            detail = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+            return CheckResult(
+                "stack do pipeline", Status.WARN,
+                f"{module} não carrega: {detail}",
+                "Reinstale as dependências completas com: aguardente install",
+                debug=f"{type(exc).__name__}: {exc}",
+            )
+
+    torch = loaded["torch"]
     return CheckResult("stack do pipeline", Status.OK, f"torch {torch.__version__}")
 
 

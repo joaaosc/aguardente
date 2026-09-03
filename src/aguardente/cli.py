@@ -5,9 +5,12 @@ from __future__ import annotations
 import argparse
 import errno
 import os
+import shlex
 import shutil
+import subprocess
 import sys
 import time
+from importlib.metadata import PackageNotFoundError, requires
 from pathlib import Path
 
 from . import __version__
@@ -20,7 +23,7 @@ from .events import stdout_log
 from .errors import PlanImpossible
 from .plan import plan_for_target, shrink
 from .pipeline import DISK_MARGIN, RunOptions, run_pipeline
-from .preflight import Status, blocking, run_all
+from .preflight import Status, blocking, check_pipeline_deps, check_python, run_all
 from .probe import probe
 from .source import resolve_source
 from . import ui
@@ -43,6 +46,76 @@ DEBUG_ENV = "AGUARDENTE_DEBUG"
 
 # Subdiretórios derivados de uma execução, descartados por --restart.
 ARTIFACT_DIRS = ("teacher", "pruned", "logits", "student", "bundle", "ckpt")
+
+
+# ----------------------------------------------------------------- install
+
+
+def _pipeline_requirements() -> list[str]:
+    """Lê a extra ``pipeline`` dos metadados do pacote instalado."""
+    try:
+        declared = requires("aguardente") or []
+    except PackageNotFoundError as exc:
+        raise AguardenteError(
+            "os metadados do aguardente não foram encontrados",
+            hint="Instale o programa com `uv tool install aguardente` antes de instalar o pipeline.",
+        ) from exc
+
+    markers = ("extra == 'pipeline'", 'extra == "pipeline"')
+    return [item.partition(";")[0].strip()
+            for item in declared if any(marker in item for marker in markers)]
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    """Instala as dependências opcionais no ambiente do executável atual."""
+    python = check_python()
+    if python.status is not Status.OK:
+        raise AguardenteError(
+            f"Python {python.detail} não é compatível com o pipeline",
+            hint=python.hint or "Reinstale com `uv tool install --python 3.12 aguardente`.",
+        )
+
+    uv = shutil.which("uv")
+    if uv is None:
+        raise AguardenteError(
+            "o comando uv não foi encontrado",
+            hint="Instale com `curl -LsSf https://astral.sh/uv/install.sh | sh`.",
+        )
+
+    dependencies = _pipeline_requirements()
+    if not dependencies:
+        raise AguardenteError(
+            "a lista de dependências do pipeline está vazia",
+            hint="Reinstale o aguardente a partir do repositório atualizado.",
+        )
+
+    command = [uv, "pip", "install", "--python", sys.executable, *dependencies]
+    ui.title("Instalação do pipeline", f"Python {sys.version_info.major}.{sys.version_info.minor}")
+    ui.blank()
+    ui.explain("Instala as dependências no mesmo ambiente usado por este comando.", indent=0)
+    ui.blank()
+    ui.command(shlex.join(command), label="executando")
+    completed = subprocess.run(command, check=False)
+    if completed.returncode:
+        ui.error(
+            "instalação não concluída",
+            cause=f"O uv encerrou com código {completed.returncode}.",
+            action="Revise a mensagem acima, corrija a causa e execute `aguardente install` novamente.",
+        )
+        return completed.returncode
+
+    result = check_pipeline_deps()
+    if result.status is not Status.OK:
+        ui.error(
+            "instalação concluída, mas a stack não pôde ser importada",
+            cause=result.detail,
+            action="Execute `aguardente doctor --verbose` para inspecionar o ambiente.",
+        )
+        return 1
+
+    ui.blank()
+    ui.done("dependências do pipeline instaladas", hint=result.detail)
+    return 0
 
 
 # ------------------------------------------------------------------ doctor
@@ -793,6 +866,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"aguardente {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
 
+    ins = sub.add_parser("install", help="instala todas as dependências do pipeline")
+    ins.set_defaults(func=cmd_install)
+
     d = sub.add_parser("doctor", help="verifica o ambiente e dependências")
     d.add_argument("-v", "--verbose", action="store_true",
                    help="exibe a saída bruta dos comandos que falharam")
@@ -891,7 +967,7 @@ def main(argv: list[str] | None = None) -> int:
     except ModuleNotFoundError as e:
         return _falha(
             f"dependência ausente: {e.name}",
-            "Instale a stack completa com `uv pip install 'aguardente[pipeline]'` e "
+            "Instale a stack completa com `aguardente install` e "
             "confirme com `aguardente doctor`.", exc=e)
     except OSError as e:
         if e.errno == errno.ENOSPC:

@@ -32,7 +32,7 @@ def test_modulo_ausente_aponta_a_instalacao(monkeypatch, capsys):
     falhar_com(monkeypatch, ModuleNotFoundError("No module named 'torch'", name="torch"))
     assert cli.main(["doctor"]) == 1
     saida = erro(capsys)
-    assert "dependência ausente: torch" in saida and "aguardente[pipeline]" in saida
+    assert "dependência ausente: torch" in saida and "aguardente install" in saida
 
 
 def test_disco_cheio_e_identificado_pelo_errno(monkeypatch, capsys):
