@@ -5,7 +5,7 @@ import pytest
 from aguardente import pipeline as pl
 from aguardente.arch import Arch, count_params
 from aguardente.budget import GB, Machine
-from aguardente.errors import InsufficientResources
+from aguardente.errors import AguardenteError, InsufficientResources
 from aguardente.pipeline import Context, RunOptions, fingerprint
 from aguardente.probe import ModelProbe
 from aguardente.state import FINGERPRINT, RunState
@@ -202,6 +202,71 @@ def test_lote_informado_nao_e_sobrescrito(tmp_path, monkeypatch):
     ctx = contexto(tmp_path, batch_size=6)
     pl.make_plan(ctx)
     assert ctx.opts.batch_size == 6
+
+
+# -------------------------------------------------------------- student externo
+
+
+QWEN3_4B_OUTRO_VOCAB = Arch(hidden_size=2560, intermediate_size=9728, num_hidden_layers=36,
+                            num_attention_heads=32, num_key_value_heads=8, head_dim=128,
+                            vocab_size=99999, tie_word_embeddings=True)
+
+
+def maquina_com_student(monkeypatch, *, vocab_compativel, ram_gb=24):
+    """Como `maquina()`, mas `probe` devolve arquiteturas diferentes por ref —
+    necessário para simular teacher e student com vocabulários distintos."""
+    monkeypatch.setattr(Machine, "detect",
+                        classmethod(lambda cls, path="/": Machine(ram_gb * GB, 500 * GB, 8, True)))
+    monkeypatch.setattr(pl, "_training_dtype_bytes", lambda o: 2)
+    arch_student = QWEN3_4B if vocab_compativel else QWEN3_4B_OUTRO_VOCAB
+
+    def fake_probe(ref):
+        arch = arch_student if ref == "org/student" else QWEN3_4B
+        return ModelProbe(ref=ref, arch=arch, model_type="qwen3",
+                          stored_params=count_params(arch).total)
+
+    monkeypatch.setattr(pl, "probe", fake_probe)
+
+
+def test_student_com_vocabulario_compativel_e_aceito(tmp_path, monkeypatch):
+    maquina_com_student(monkeypatch, vocab_compativel=True)
+    ctx = contexto(tmp_path, student="org/student", skip_recover=True)
+    _, plano = pl.make_plan(ctx)
+
+    assert plano is None  # não há cirurgia de poda a planejar
+
+
+def test_student_com_vocabulario_incompativel_e_recusado(tmp_path, monkeypatch):
+    maquina_com_student(monkeypatch, vocab_compativel=False)
+    ctx = contexto(tmp_path, student="org/student", skip_recover=True)
+
+    with pytest.raises(AguardenteError) as e:
+        pl.make_plan(ctx)
+
+    assert "vocabulário" in e.value.message
+    assert "151,936" in e.value.message or "99,999" in e.value.message
+
+
+def test_student_pula_a_cirurgia_de_poda(tmp_path, monkeypatch):
+    """`stage_prune` desvia para `_stage_fetch_student` em vez de podar."""
+    maquina_com_student(monkeypatch, vocab_compativel=True)
+    ctx = contexto(tmp_path, student=str(tmp_path / "modelo-pronto"), skip_recover=True)
+    (tmp_path / "modelo-pronto").mkdir()
+    (tmp_path / "modelo-pronto" / "config.json").write_text("{}")
+    pl.make_plan(ctx)
+
+    out = pl.stage_prune(ctx, tmp_path / "teacher")
+
+    assert out == ctx.opts.pruned_dir
+    assert (ctx.opts.pruned_dir / "config.json").is_file()
+
+
+def test_fingerprint_da_poda_muda_com_o_student(tmp_path):
+    """Trocar de student precisa refazer a etapa, mesmo com o resto igual."""
+    assert (fingerprint(opts(tmp_path, student="org/a"), "prune")
+            != fingerprint(opts(tmp_path, student="org/b"), "prune"))
+    assert (fingerprint(opts(tmp_path, student="org/a"), "prune")
+            != fingerprint(opts(tmp_path), "prune"))
 
 
 def test_lote_automatico_e_menor_em_maquina_pequena(tmp_path, monkeypatch):

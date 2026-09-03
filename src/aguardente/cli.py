@@ -534,6 +534,7 @@ def _options_from(args: argparse.Namespace) -> RunOptions:
         model=args.model,
         out_dir=Path(args.out).expanduser(),
         target_params=args.target_params,
+        student=args.student,
         connections=args.connections,
         concurrent=args.concurrent,
         batch_size=args.batch_size,
@@ -745,6 +746,10 @@ def _add_pipeline_args(p: argparse.ArgumentParser) -> None:
                         f"recuperar a qualidade perdida na poda (padrão: {effort.DEFAULT})")
     p.add_argument("--target-params", type=lambda s: int(float(s)),
                    help="alvo de parâmetros (ex.: 1.0e9). Padrão: baseado na RAM disponível")
+    p.add_argument("--student",
+                   help="usa este modelo pronto como student, em vez de podar o "
+                        "teacher — identificador do Hugging Face ou diretório local. "
+                        "Precisa ter o mesmo vocab_size do teacher")
     p.add_argument("--connections", type=int, default=8,
                    help="número de conexões por servidor no aria2c")
     p.add_argument("--concurrent", type=int, default=4,

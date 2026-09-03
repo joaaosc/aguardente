@@ -207,6 +207,16 @@ Localiza o decoder causal dentro do checkpoint e grava um modelo só de texto. P
 
 Carrega o modelo, avalia a importância estrutural com base em amostras reais de calibração e realiza o corte in-place dos pesos (MLP, grupos de atenção GQA e camadas). Valida que a saída após a poda permanece finita.
 
+**De onde vem o student.** Por padrão, o student não é uma arquitetura nova: é o próprio teacher, com pedaços cortados fora — mesmos pesos herdados, mesmo tokenizer, só `intermediate_size`, cabeças de atenção e camadas menores. A cirurgia (`prune/surgery.py`) fatia as matrizes existentes; a escolha do que cortar vem de `prune/scoring.py`, que mede num forward real sobre dados de calibração a magnitude de ativação de cada neurônio da MLP e de cada grupo de atenção, e a similaridade de cosseno entre entrada e saída de cada camada — uma camada quase-identidade contribui pouco e é a primeira candidata a sair, com a primeira e a última sempre protegidas.
+
+**Um student pronto.** `--student <modelo>` substitui essa cirurgia por um modelo já existente — um identificador do Hugging Face ou um diretório local. Nesse caso não há alvo de parâmetros a calcular: a etapa `prune` baixa (ou copia) o modelo indicado no lugar de podar, e a recuperação treina esse student contra os logits do teacher, exatamente como faria com o resultado da poda.
+
+A única exigência é o `vocab_size` do student bater com o do teacher, checada antes de qualquer download: a destilação por logits compara probabilidade token a token, e um índice que aponta para palavras diferentes em cada tokenizer invalida a divergência KL. Vocabulário igual não garante o mesmo tokenizer — é uma condição necessária, verificável sem baixar peso algum, não uma prova completa de compatibilidade.
+
+```bash
+aguardente run Qwen/Qwen3-4B -o run/custom --student Qwen/Qwen2.5-1.5B-Instruct --skip-recover
+```
+
 ### 4. logits
 
 Executa o modelo original sobre o conjunto de calibração para pré-computar os top-k logits por posição e gravá-los em shards no disco. Em seguida, libera a memória ocupada pelo modelo teacher.

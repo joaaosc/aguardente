@@ -32,11 +32,11 @@ DISK_MARGIN = 1.15
 FINGERPRINT_FIELDS: dict[str, tuple[str, ...]] = {
     # A extração depende apenas do modelo de origem.
     "extract": ("model",),
-    "prune": ("model", "target_params", "calib_batches", "batch_size", "seq_len",
-              "calib_dataset", "calib_file"),
+    "prune": ("model", "student", "target_params", "calib_batches", "batch_size",
+              "seq_len", "calib_dataset", "calib_file"),
     "logits": ("model", "top_k", "seq_len", "batch_size", "logit_batches",
                "calib_dataset", "calib_file"),
-    "recover": ("model", "target_params", "top_k", "seq_len", "batch_size",
+    "recover": ("model", "student", "target_params", "top_k", "seq_len", "batch_size",
                 "logit_batches", "calib_batches", "calib_dataset", "calib_file",
                 "epochs", "lr", "alpha", "temperature", "grad_accum", "no_checkpointing"),
     "export": ("model", "target_params", "platform", "compression",
@@ -86,6 +86,14 @@ class RunOptions:
     model: str
     out_dir: Path
     target_params: int | None = None
+
+    # Um student pronto, em vez de podar o teacher. Substitui inteiramente a
+    # cirurgia (`prune`): a etapa passa a baixar ou copiar este modelo, e a
+    # recuperação treina a partir dele. Precisa falar o mesmo vocabulário do
+    # teacher — a divergência KL da destilação compara logits token a token,
+    # e índices que significam palavras diferentes em cada tokenizer não têm
+    # o que ser comparado.
+    student: str | None = None
 
     # download
     connections: int = 8
@@ -328,6 +336,25 @@ def make_plan(ctx: Context) -> tuple[ModelProbe, PrunePlan | None]:
         )
         ctx.say(f"lote         sugerido pela RAM: {opts.batch_size} amostra(s) por lote")
 
+    if opts.student:
+        # Um student externo substitui a cirurgia de poda: não há alvo de
+        # parâmetros a planejar, só a compatibilidade a checar. O vocabulário
+        # é o mínimo — sem ele os índices que a destilação por logits compara
+        # não significam a mesma coisa nos dois lados.
+        student_probe = probe(opts.student)
+        if student_probe.arch.vocab_size != p.arch.vocab_size:
+            raise AguardenteError(
+                f"o vocabulário do student ({student_probe.arch.vocab_size:,}) não "
+                f"bate com o do teacher ({p.arch.vocab_size:,})",
+                hint="A destilação por logits compara token a token: um índice que "
+                     "significa palavras diferentes em cada tokenizer invalida a "
+                     "divergência KL. Escolha um student derivado do mesmo tokenizer.",
+            )
+        ctx.say(f"student      externo: {opts.student} "
+                f"({student_probe.stored_params/1e9:.2f} B, vocabulário compatível)")
+        ctx.plan = None
+        return p, None
+
     target = opts.target_params
     if target is None:
         target = teto
@@ -527,6 +554,51 @@ def _conferir_exportador(ctx: Context, model_dir: Path) -> None:
         ctx.say(f"             {linha}")
 
 
+def _stage_fetch_student(ctx: Context) -> Path:
+    """Traz o student externo para `pruned_dir`, no lugar da cirurgia de poda.
+
+    A compatibilidade de vocabulário já foi conferida em `make_plan`, antes de
+    qualquer download. Esta etapa só busca o modelo — local ou remoto — e o
+    entrega no mesmo formato que a poda entregaria, para que `logits` e
+    `recover` não precisem saber a diferença.
+    """
+    from .fetch import fetch_model, require_aria2
+
+    opts, state = ctx.opts, ctx.state
+    out = opts.pruned_dir
+    ref = opts.student
+
+    if _resume(ctx, "prune"):
+        ctx.say(f"student      já presente: {out}")
+        return out
+
+    state.begin("prune")
+    ctx.events.stage_start("prune", 3, len(STAGES),
+                           rationale="Baixa o student externo no lugar da poda estruturada.")
+    t0 = time.perf_counter()
+
+    local = Path(ref).expanduser()
+    try:
+        if local.is_dir():
+            ctx.say(f"student      copiando de {local}")
+            shutil.rmtree(out, ignore_errors=True)
+            shutil.copytree(local, out)
+        else:
+            require_aria2()
+            ctx.say(f"student      baixando {ref}")
+            fetch_model(ref, out, on_line=lambda linha: ctx.say(f"             {linha.strip()}")
+                       if linha.strip() else None)
+    except Exception as e:
+        state.fail("prune", str(e))
+        raise
+
+    dt = time.perf_counter() - t0
+    state.finish("prune", outputs={"dir": out, FINGERPRINT: fingerprint(opts, "prune")},
+                 metrics={"seconds": dt})
+    ctx.events.stage_end("prune", True, int(dt * 1000))
+    return out
+
+
 def stage_prune(ctx: Context, teacher_dir: Path) -> Path:
     """Etapa 2: Avaliação de importância e poda estruturada."""
     from .calibration import load_texts, load_texts_from_file, make_batches
@@ -535,6 +607,9 @@ def stage_prune(ctx: Context, teacher_dir: Path) -> Path:
 
     opts, state = ctx.opts, ctx.state
     out = opts.pruned_dir
+
+    if opts.student:
+        return _stage_fetch_student(ctx)
 
     if ctx.plan is None:
         ctx.say("poda         não necessária")
@@ -840,7 +915,7 @@ def run_pipeline(opts: RunOptions, *, report: Reporter = print,
             from .export import available
             if not available():
                 ctx.say("aviso        coreai.llm.export não está disponível no ambiente")
-                ctx.say("             instale via: uv pip install -e '.[pipeline]'")
+                ctx.say("             instale via: aguardente install")
                 ctx.say("             ou use --skip-export para desativar a exportação")
                 ctx.say()
 
