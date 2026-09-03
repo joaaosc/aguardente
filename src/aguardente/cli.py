@@ -19,7 +19,7 @@ from .errors import AguardenteError
 from .events import stdout_log
 from .errors import PlanImpossible
 from .plan import plan_for_target, shrink
-from .pipeline import RunOptions, run_pipeline
+from .pipeline import DISK_MARGIN, RunOptions, run_pipeline
 from .preflight import Status, blocking, run_all
 from .probe import probe
 from .source import resolve_source
@@ -178,6 +178,14 @@ def cmd_plan(args: argparse.Namespace) -> int:
     ui.field("treinável até", _fmt_params(budget.max_params_for_training()))
     ui.field("comprimido cabe até", _fmt_params(budget.max_params_for_inference()))
 
+    if args.other_ram_gb is not None or args.other_disk_gb is not None:
+        if args.other_ram_gb is None or args.other_disk_gb is None:
+            raise AguardenteError(
+                "--other-ram-gb e --other-disk-gb precisam ser usados juntos",
+                hint="Informe os dois para avaliar a outra máquina.")
+        _secao_outra_maquina(a, p, args.other_ram_gb, args.other_disk_gb,
+                             args.target_params)
+
     teto = budget.max_params_for_training()
     target = args.target_params or teto
     if args.target_params and args.target_params > teto:
@@ -257,6 +265,65 @@ def cmd_plan(args: argparse.Namespace) -> int:
         ui.command(f"aguardente run {args.model} -o run/ --effort {nivel.name} --measure",
                    label="para converter este modelo")
     return 0
+
+
+def _secao_outra_maquina(a, p, ram_gb: float, disk_gb: float,
+                         target_params: int | None) -> None:
+    """Avalia conversão e destilação numa máquina descrita só por RAM e disco.
+
+    Não toca a máquina atual nem baixa nada: usa as mesmas contas do plano
+    local (`Budget`, `plan_for_target`), só que sobre uma `Machine` hipotética.
+    A pergunta que decide viabilidade de destilação não é "cabe o modelo na
+    RAM", e sim "o piso de poda desta arquitetura cabe no teto de treino" —
+    são números diferentes, e o segundo costuma ser bem menor.
+    """
+    m = Machine.other(ram_gb=ram_gb, disk_gb=disk_gb)
+    budget = Budget.for_machine(m)
+    teto = budget.max_params_for_training()
+    alvo = target_params or teto
+
+    ui.header(f"Outra máquina ({ram_gb:g} GB RAM, {disk_gb:g} GB disco)")
+    ui.field("RAM utilizável", f"{m.usable_ram_bytes / GB:.1f} GB")
+    ui.field("teto de treino", _fmt_params(teto))
+
+    plano = None
+    if count_params(a).total <= alvo:
+        destilacao_viavel = True
+        final_params = count_params(a).total
+    else:
+        try:
+            plano = plan_for_target(a, alvo)
+            destilacao_viavel = True
+            final_params = plano.target_params
+        except PlanImpossible:
+            destilacao_viavel = False
+            final_params = count_params(shrink(a, 1.0)).total
+            ui.field("piso de poda", _fmt_params(final_params),
+                     note="limite das embeddings e dos cortes por eixo")
+
+    # Estimativa de pico de disco: soma das etapas sem descartar nada no
+    # caminho, de propósito — é o teto do que o pipeline pode vir a usar de
+    # uma vez, não uma previsão exata do que sobra em cada etapa.
+    download = weights_bytes(p.stored_params, BPW_FP16)
+    extracao = weights_bytes(p.text_params, BPW_FP16) if p.is_multimodal else 0
+    poda = weights_bytes(final_params, BPW_FP16)
+    bundle = weights_bytes(final_params, BPW_INT4_EMBED_FP16)
+    pico = download + extracao + poda + bundle
+    disco_viavel = disk_gb * GB >= pico * DISK_MARGIN
+
+    ui.field("disco no pico (estimado)", _fmt_bytes(pico),
+             note=f"download {_fmt_bytes(download)}"
+                  + (f" + extração {_fmt_bytes(extracao)}" if extracao else "")
+                  + f" + poda {_fmt_bytes(poda)} + bundle {_fmt_bytes(bundle)}")
+
+    ui.blank()
+    ui.field("conversão (poda + export)", "viável" if disco_viavel else "inviável",
+             note=None if disco_viavel else
+             f"faltam ~{_fmt_bytes(pico * DISK_MARGIN - disk_gb * GB)} de disco")
+    ui.field("destilação (recuperação)", "viável" if destilacao_viavel else "inviável",
+             note=None if destilacao_viavel else
+             "o piso de poda excede o teto de treino desta máquina — só "
+             "--skip-recover chegaria a um resultado nela")
 
 
 # ------------------------------------------------------------------ effort
@@ -722,6 +789,11 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("model", help="identificador do Hugging Face (namespace/nome), "
                     "URL do Hugging Face ou do GitHub, ou diretório local")
     pl.add_argument("--target-params", type=lambda s: int(float(s)))
+    pl.add_argument("--other-ram-gb", type=float,
+                    help="RAM de outra máquina, em GB — avalia a viabilidade lá, "
+                         "sem tocar na máquina atual. Exige --other-disk-gb junto")
+    pl.add_argument("--other-disk-gb", type=float,
+                    help="disco livre de outra máquina, em GB. Exige --other-ram-gb junto")
     pl.add_argument("--effort", choices=effort.NAMES, default=effort.DEFAULT,
                     help=f"nível de esforço a dimensionar (padrão: {effort.DEFAULT})")
     pl.add_argument("--batch-size", type=int, default=2)

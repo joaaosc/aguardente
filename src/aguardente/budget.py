@@ -71,6 +71,20 @@ class Machine:
         """Memória utilizável após reserva de margem para o sistema."""
         return max(0, self.ram_bytes - headroom_bytes(self.ram_bytes))
 
+    @classmethod
+    def other(cls, *, ram_gb: float, disk_gb: float) -> Machine:
+        """Uma máquina hipotética, descrita só pelo que entra no cálculo do orçamento.
+
+        Serve para avaliar a viabilidade de um plano em outro computador sem
+        executar nada nele — o caso comum é checar se a máquina de um colega
+        aguenta o treino antes de levar o modelo até lá. `cpu_count` não entra
+        em nenhuma conta de orçamento, e `arm64` é assumido porque o pipeline
+        (MPS, Core AI) só roda em Apple Silicon; ficam de fora de propósito,
+        em vez de aceitar um valor que não seria usado para nada.
+        """
+        return cls(ram_bytes=int(ram_gb * GB), free_disk_bytes=int(disk_gb * GB),
+                   cpu_count=0, arm64=True)
+
 
 def weights_bytes(params: int, bits_per_weight: float = BPW_FP16) -> int:
     return int(params * bits_per_weight / 8)

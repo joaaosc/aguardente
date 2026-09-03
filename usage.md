@@ -97,6 +97,19 @@ Analisa a arquitetura do modelo a partir do `config.json` e dos metadados remoto
 
 Caso `--target-params` não seja especificado, o alvo é sugerido com base na RAM da máquina.
 
+**Viabilidade em outra máquina.** `--other-ram-gb` e `--other-disk-gb` (sempre juntos) avaliam se a conversão e a destilação caberiam num computador diferente do atual, sem tocar nele — útil para checar, antes de levar o modelo até lá, se a máquina de um colega aguenta o treino:
+
+```bash
+aguardente plan Qwen/Qwen3-4B --other-ram-gb 24 --other-disk-gb 480
+```
+
+A seção "Outra máquina" mostra dois vereditos separados, porque são perguntas diferentes:
+
+- **conversão (poda + export)** depende de disco: baixar o checkpoint original, gravar a cópia podada e o bundle comprimido, tudo cabendo ao mesmo tempo;
+- **destilação (recuperação)** depende de RAM de treino: o *piso de poda* da arquitetura — o menor tamanho que os limites por eixo permitem alcançar — precisa caber no teto de treino da máquina. É essa comparação, não o tamanho do modelo em si, que decide se a etapa `recover` é executável ali.
+
+Quando a destilação não é viável, a mensagem aponta `--skip-recover` como saída: a máquina ainda pode podar e exportar o modelo, só não treina a recuperação de qualidade.
+
 ### `fetch` — Download isolado
 
 ```bash
