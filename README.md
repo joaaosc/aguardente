@@ -16,19 +16,25 @@
 
 ## Instalação
 
-Via script de instalação:
+Requer o [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/joaaosc/aguardente/main/install.sh | bash
+uv tool install --python 3.12 "aguardente[pipeline] @ git+https://github.com/joaaosc/aguardente"
 ```
 
-Ou a partir de um clone do repositório:
+> **Nota:** As dependências do Core AI exigem Python `>=3.11,<3.14`. `--python 3.12` fixa a versão usada pelo `uv` para o programa, sem tocar no Python do sistema.
+
+Depois, confirme o restante do ambiente (Xcode, Metal Toolchain, `aria2`):
 
 ```bash
-git clone https://github.com/joaaosc/aguardente && cd aguardente && ./install.sh
+aguardente doctor
 ```
 
-> **Nota:** As dependências do Core AI exigem Python `>=3.11,<3.14`. O instalador configura o ambiente com a versão adequada automaticamente via `uv`.
+Se o programa já estiver instalado sem a extra `pipeline` (por exemplo, via `uv tool install aguardente`):
+
+```bash
+aguardente install
+```
 
 ---
 

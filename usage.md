@@ -3,9 +3,11 @@
 Documento de referência para comandos, opções e resolução de problemas.
 
 - [Diagnóstico do ambiente](#diagnóstico-do-ambiente)
+- [Instalação do pipeline](#instalação-do-pipeline)
 - [Execução de teste](#execução-de-teste)
 - [Comandos](#os-comandos)
 - [Detalhamento do pipeline](#detalhamento-do-pipeline)
+- [Arquitetura interna](#arquitetura-interna)
 - [Retomada de execução](#retomada-de-execução)
 - [Otimização de memória](#otimização-de-memória)
 - [Resolução de problemas](#resolução-de-problemas)
@@ -36,6 +38,22 @@ Quando uma verificação falha, a instrução exibida ao lado já indica a corre
 
 ```bash
 aguardente doctor --verbose
+```
+
+---
+
+## Instalação do pipeline
+
+```bash
+aguardente install
+```
+
+Instala `torch`, `transformers` e os pacotes Core AI no mesmo ambiente Python usado pelo executável. O comando exige Python 3.11–3.13 convencional; builds free-threaded não são compatíveis com toda a stack.
+
+Depois da instalação, confirme o ambiente:
+
+```bash
+aguardente doctor
 ```
 
 ---
@@ -231,6 +249,55 @@ Gera o pacote `.aimodel` chamando `coreai.llm.export` com a configuração de pl
 
 ---
 
+## Arquitetura interna
+
+A seção anterior descreve o que cada etapa faz. Esta descreve como — o algoritmo por trás de `plan`, `prune`, `distill` (as etapas `logits` + `recover`) e `export`.
+
+### plan
+
+`plan` só lê `config.json`. Nenhum peso é baixado. A partir das dimensões declaradas (`hidden_size`, `intermediate_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`, `vocab_size`), `arch.count_params` reconstrói a contagem de parâmetros por componente — embeddings, atenção e MLP, camada por camada — usando a mesma fórmula que o `transformers` usa para instanciar o modelo.
+
+Duas grandezas decidem se um alvo é alcançável:
+
+- **Piso de poda** — o menor tamanho que a arquitetura ainda aceita, aplicando `shrink(arch, t=1.0)`: reduz `intermediate_size` até uma fração mínima da MLP, depois os grupos KV até uma fração mínima da atenção, depois `num_hidden_layers` até uma fração mínima de camadas. As três reduções são sequenciais, não simultâneas — a MLP encolhe primeiro porque concentra a maior parte dos parâmetros; só depois de esgotada a margem ali é que atenção e profundidade entram.
+- **Teto de treino** — quanto a máquina aguenta treinar sem estourar RAM: `ram_utilizável × 0,75 ÷ bytes_por_parâmetro`, em que `bytes_por_parâmetro` cobre pesos e gradientes no dtype do dispositivo (2 bytes em MPS, 4 em CPU) mais os dois momentos do AdamW (+8 bytes). Os 0,75 são a margem que sobra para ativações, que dependem do lote e do comprimento de sequência e por isso não entram na conta fixa.
+
+Entre o piso e o teto sem alvo explícito, `plan_for_target` busca por bisseção (64 iterações) o fator `t ∈ [0, 1]` que aproxima mais o alvo pedido, alinhando `intermediate_size` a blocos de 128 — o tamanho de bloco que a quantização per-block do exportador espera.
+
+### prune
+
+A cirurgia de `prune` aplica as dimensões que `plan` calculou diretamente sobre os tensores do checkpoint, sem re-treinar do zero: `_slice_linear_out`/`_slice_linear_in` (`prune/surgery.py`) recortam linhas e colunas das matrizes de `gate_proj`, `up_proj`, `down_proj` (MLP) e de `q_proj`, `k_proj`, `v_proj`, `o_proj` (atenção), preservando blocos contíguos de `head_dim` por cabeça para manter a estrutura GQA — os grupos de query continuam apontando para os mesmos grupos KV depois do corte.
+
+A escolha de **quais** linhas cortar vem de `prune/scoring.py`, medida num forward real sobre lotes de calibração, via hooks:
+
+- **Neurônios da MLP** — RMS da ativação na entrada de `down_proj`; neurônios com sinal fraco em dados reais são os primeiros a sair.
+- **Grupos de atenção** — RMS da saída de `v_proj`, agregada por grupo KV.
+- **Camadas** — *block influence*: `1 − similaridade_de_cosseno(entrada, saída)` do bloco transformer inteiro. Uma camada quase-identidade (entrada ≈ saída, influência ≈ 0) contribui pouco e é candidata a sair primeiro; a primeira e a última camada ficam sempre protegidas.
+
+Todos os três scores são médias sobre os lotes de calibração processados, não um cálculo analítico — por isso a qualidade do corte depende de os lotes serem representativos do uso real do modelo.
+
+### distill (`logits` + `recover`)
+
+A etapa `logits` roda o modelo original (teacher) uma vez sobre o conjunto de calibração e grava, para cada posição, só os `top_k` valores de logit e seus índices no vocabulário — não a distribuição completa. Isso reduz o custo de armazenamento de `vocab_size` para `top_k` valores por token (6 bytes por entrada: 2 do valor em fp16, 4 do índice), e é o que faz caber em disco o suficiente para calibrar sem manter o teacher inteiro em memória durante o treino.
+
+A etapa `recover` treina o student contra esses logits com `kd_loss` (`distill/loss.py`), a combinação clássica de Hinton para destilação:
+
+```
+loss = α · KL(softmax(student_topk / T) ‖ softmax(teacher_topk / T)) · T²  +  (1 − α) · cross_entropy(student, próximo_token)
+```
+
+`T` (temperatura) suaviza as duas distribuições antes da divergência — sem isso o gradiente vem quase só dos tokens de maior probabilidade. O termo `T²` compensa a escala do gradiente que a temperatura reduz. `α` (padrão 0,9) pesa a imitação do teacher contra o aprendizado direto do próximo token; o `student_logits` é indexado pelos mesmos índices de vocabulário do teacher via `gather`, por isso o `vocab_size` dos dois precisa bater.
+
+O laço de treino usa AdamW, taxa de aprendizado com warmup linear seguido de decaimento por cosseno, acumulação de gradiente, `clip_grad_norm_`, avaliação periódica de perplexidade com parada antecipada por platô, e checkpoint automático — pesos, estado do otimizador e a posição exata no fluxo de lotes, retomável sem repetir trabalho.
+
+### export
+
+`export` chama o exportador oficial da Apple, `coreai.llm.export`, como subprocesso — localizado direto no PATH ou, quando só o módulo `coreai_models` está instalado, via `uv run coreai.llm.export`. Os argumentos controlam plataforma (`macOS`), compressão (`4bit` por padrão: int4 por bloco de 32 valores, ~4,50 bits por peso), precisão de computação (`float16`) e comprimento máximo de contexto; `--export-dry-run` valida esses argumentos sem gravar o bundle.
+
+O resultado é um diretório com `metadata.json` e o pacote `.aimodel`. A partir dele, `xcrun coreai-build inspect` examina o modelo exportado e `xcrun coreai-build compile` gera a versão compilada AOT (`.aimodelc`) para execução no dispositivo — passos fora do `aguardente`, já no toolchain da Apple.
+
+---
+
 ## Retomada de execução
 
 O progresso é mantido no arquivo `state.json` no diretório de saída. Caso a execução seja interrompida, reiniciar o mesmo comando pula as etapas já finalizadas:
@@ -281,7 +348,7 @@ Se o treinamento exceder a capacidade de memória da máquina, considere as segu
 | `Xcode: sem resposta` | Primeira execução do `xcodebuild` demorada | Execute `xcodebuild -version` no Terminal e repita o diagnóstico. |
 | `Xcode: diretório ativo inexistente` | O caminho selecionado sumiu após atualizar ou mover o Xcode | Execute `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`. |
 | `sudo: comando bloqueado` em máquina gerenciada | Política de MDM impede alterar o diretório ativo | Exporte `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` no shell. |
-| `stack do pipeline` como falha no `run` | `torch` ou pacotes Core AI ausentes | Instale com `uv pip install 'aguardente[pipeline]'`; no `doctor` a mesma condição é apenas um aviso. |
+| `stack do pipeline` como falha no `run` | `torch` ou pacotes Core AI ausentes | Instale com `aguardente install`; no `doctor` a mesma condição é apenas um aviso. |
 | `coreai-build não encontrado` | Metal Toolchain ausente | Execute `xcodebuild -downloadComponent MetalToolchain`. |
 | `aria2c não encontrado` | Utilitário não instalado | Instale via `brew install aria2`. |
 | `coreai-opt exige >=3.11,<3.14` | Versão do Python incompatível | Crie o ambiente virtual com Python 3.12 (`uv venv --python 3.12`). |
@@ -321,7 +388,7 @@ Se o treinamento exceder a capacidade de memória da máquina, considere as segu
 
 | Sintoma | Causa provável | Ação recomendada |
 |---|---|---|
-| `coreai.llm.export não encontrado` | Dependência não instalada | Execute o instalador `./install.sh` ou instale o pacote correspondente. |
+| `coreai.llm.export não encontrado` | Dependência não instalada | Execute `aguardente install` ou instale o pacote correspondente. |
 | `coreai.llm.export falhou (código N)` | Parâmetros de exportação rejeitados | Execute com `--export-dry-run` para inspecionar os argumentos. |
 
 ---
