@@ -88,14 +88,15 @@ def precompute_logits(
                 k = min(top_k, logits.size(-1))
                 values, indices = logits.topk(k, dim=-1)
 
-                torch.save(
-                    {
-                        "input_ids": input_ids.detach().cpu(),
-                        "values": values.detach().half().cpu(),
-                        "indices": indices.detach().to(torch.int32).cpu(),
-                    },
-                    shard_path,
-                )
+                payload = {
+                    "input_ids": input_ids.detach().cpu(),
+                    "values": values.detach().half().cpu(),
+                    "indices": indices.detach().to(torch.int32).cpu(),
+                }
+                if "attention_mask" in batch:
+                    payload["attention_mask"] = batch["attention_mask"].detach().to(torch.int8).cpu()
+
+                torch.save(payload, shard_path)
                 shards += 1
                 samples += int(input_ids.size(0))
                 seq_len = int(input_ids.size(1))

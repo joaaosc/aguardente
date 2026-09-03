@@ -15,6 +15,7 @@ from aguardente.distill.teacher import estimate_logit_bytes, precompute_logits
 from aguardente.distill.train import (
     RecoveryConfig,
     _load_checkpoint,
+    _lr_at,
     _save_checkpoint_resumavel,
     recover,
 )
@@ -339,3 +340,101 @@ def test_checkpoint_written_when_metric_improves(tmp_path):
 ])
 def test_recovery_fraction(teacher, pruned, recovered, expected):
     assert recovery_fraction(teacher, pruned, recovered) == pytest.approx(expected)
+
+
+# ---------------------------------------------------------------- novas garantias teóricas
+
+def test_kd_loss_ignores_padding_tokens_with_mask():
+    torch.manual_seed(0)
+    s = torch.randn(2, 6, 64)
+    v, idx = s.topk(8, dim=-1)
+    mask = torch.tensor([[1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 0, 0]])
+    labels = torch.randint(0, 64, (2, 6))
+
+    loss1 = kd_loss(s, v, idx, labels=labels, mask=mask, alpha=0.5)
+
+    # Altera valores exclusivamente nas posições mascaradas (padding)
+    s2 = s.clone()
+    s2[:, 4:, :] += 100.0
+    v2 = v.clone()
+    v2[:, 4:, :] += 50.0
+    labels2 = labels.clone()
+    labels2[:, 4:] = 12
+
+    loss2 = kd_loss(s2, v2, idx, labels=labels2, mask=mask, alpha=0.5)
+    assert float(loss1) == pytest.approx(float(loss2), rel=1e-5)
+
+
+def test_kd_loss_sequence_length_invariance():
+    torch.manual_seed(0)
+    s = torch.randn(2, 5, 64)
+    v, idx = (s + 0.5).topk(8, dim=-1)
+    loss_short = kd_loss(s, v, idx, alpha=1.0)
+
+    # Duplica ao longo da dimensão de tempo mantendo a distribuição por token
+    s_long = s.repeat(1, 10, 1)
+    v_long = v.repeat(1, 10, 1)
+    idx_long = idx.repeat(1, 10, 1)
+    loss_long = kd_loss(s_long, v_long, idx_long, alpha=1.0)
+
+    assert float(loss_short) == pytest.approx(float(loss_long), rel=1e-4)
+
+
+def test_kd_loss_fp16_numerical_stability():
+    torch.manual_seed(0)
+    s = torch.randn(2, 8, 128, dtype=torch.float16)
+    v = torch.randn(2, 8, 16, dtype=torch.float16)
+    idx = torch.randint(0, 128, (2, 8, 16), dtype=torch.int32)
+    labels = torch.randint(0, 128, (2, 8))
+
+    loss = kd_loss(s, v, idx, labels=labels, alpha=0.9, temperature=3.0)
+    assert torch.isfinite(loss).all()
+    assert float(loss) > 0.0
+
+
+def test_precompute_saves_and_yields_attention_mask(tmp_path):
+    teacher = tiny_model()
+    mask = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]], dtype=torch.int8)
+    batches = [{"input_ids": torch.randint(0, 256, (2, 4)), "attention_mask": mask}]
+    out = precompute_logits(teacher, batches, tmp_path / "mask_shards", top_k=8)
+
+    loaded = next(iter(out.batches()))
+    assert "attention_mask" in loaded
+    assert torch.equal(loaded["attention_mask"], mask)
+
+
+def test_lr_at_has_min_floor():
+    cfg = RecoveryConfig(learning_rate=1e-4)
+    lr_end = _lr_at(100, 100, cfg)
+    assert lr_end == pytest.approx(1e-5)
+
+
+def test_recover_restores_best_checkpoint(tmp_path):
+    teacher = tiny_model()
+    batches = fixed_batches(n=4)
+    logits = precompute_logits(teacher, batches, tmp_path / "l", top_k=8)
+
+    student = tiny_model(seed=1)
+    ckpt = tmp_path / "ck"
+    # Simula melhora inicial (10.0) seguida de degradação posterior (50.0, 60.0, 70.0)
+    seq = iter([10.0, 50.0, 60.0, 70.0])
+    recover(student, logits,
+            RecoveryConfig(epochs=2, grad_accum=2, eval_every=2, gradient_checkpointing=False),
+            device="cpu", evaluate=lambda: next(seq), checkpoint_dir=ckpt)
+
+    best_blob = torch.load(ckpt / "best.pt", weights_only=True)
+    for k, v in student.state_dict().items():
+        assert torch.equal(v, best_blob["state_dict"][k])
+
+
+def test_recover_steps_trailing_batches(tmp_path):
+    teacher = tiny_model()
+    batches = fixed_batches(n=5)
+    logits = precompute_logits(teacher, batches, tmp_path / "l", top_k=8)
+
+    student = tiny_model(seed=1)
+    res = recover(student, logits,
+                  RecoveryConfig(epochs=1, grad_accum=2, gradient_checkpointing=False),
+                  device="cpu")
+    # 5 lotes com grad_accum=2 devem gerar 3 passos de otimizador (2 regulares + 1 residual)
+    assert res.steps == 3

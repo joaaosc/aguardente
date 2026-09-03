@@ -80,13 +80,15 @@ def _build_optimizer(model: Any, cfg: RecoveryConfig) -> Any:
     )
 
 
-def _lr_at(step: int, total: int, cfg: RecoveryConfig) -> float:
-    """Calcula a taxa de aprendizado com warmup linear e decaimento por cosseno."""
+def _lr_at(step: int, total: int, cfg: RecoveryConfig, *, min_lr_fraction: float = 0.1) -> float:
+    """Calcula a taxa de aprendizado com warmup linear e decaimento por cosseno até um piso mínimo."""
     warmup = max(1, int(total * cfg.warmup_fraction))
     if step < warmup:
         return cfg.learning_rate * step / warmup
     progress = (step - warmup) / max(1, total - warmup)
-    return cfg.learning_rate * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+    min_lr = cfg.learning_rate * min_lr_fraction
+    return min_lr + (cfg.learning_rate - min_lr) * cosine
 
 
 def recover(
@@ -113,6 +115,8 @@ def recover(
 
     if cfg.gradient_checkpointing and hasattr(student, "gradient_checkpointing_enable"):
         student.gradient_checkpointing_enable()
+        if hasattr(student, "enable_input_require_grads"):
+            student.enable_input_require_grads()
         if hasattr(student, "config"):
             student.config.use_cache = False
 
@@ -160,10 +164,13 @@ def recover(
                 for group in optimizer.param_groups:
                     group["lr"] = lr
 
-                out = student(input_ids=batch["input_ids"])
+                mask = batch.get("attention_mask")
+                kwargs = {"attention_mask": mask} if mask is not None else {}
+                out = student(input_ids=batch["input_ids"], **kwargs)
                 loss = kd_loss(
                     out.logits, batch["values"], batch["indices"],
                     labels=batch["input_ids"],
+                    mask=mask,
                     alpha=cfg.alpha, temperature=cfg.temperature,
                 )
                 (loss / cfg.grad_accum).backward()
@@ -207,6 +214,15 @@ def recover(
                             _checkpoint_automatico()
                             return _finish(result, started, student, ckpt)
 
+            # Efetua o passo residual de otimizador caso o número de lotes não seja múltiplo exato de grad_accum
+            if lotes_feitos % cfg.grad_accum != 0:
+                torch.nn.utils.clip_grad_norm_(student.parameters(), cfg.max_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                result.steps += 1
+                if cfg.checkpoint_every and result.steps % cfg.checkpoint_every == 0:
+                    _checkpoint_automatico()
+
             result.epochs_completed = epoch + 1
     except KeyboardInterrupt:
         result.stopped_by = "interrupted"
@@ -221,6 +237,12 @@ def _finish(result: RecoveryResult, started: float, student: Any,
     student.eval()
     if hasattr(student, "config"):
         student.config.use_cache = True
+    # Restaura o melhor modelo registrado durante as avaliações, se houver
+    if ckpt and (ckpt / "best.pt").is_file():
+        import torch
+        dev = next(student.parameters()).device
+        blob = torch.load(ckpt / "best.pt", map_location=dev, weights_only=True)
+        student.load_state_dict(blob["state_dict"], assign=False)
     if ckpt:
         (ckpt / "recovery.json").write_text(result.to_json())
         # Um treino que chegou até aqui por completar as épocas não precisa
