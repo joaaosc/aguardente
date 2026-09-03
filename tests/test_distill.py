@@ -19,6 +19,7 @@ from aguardente.distill.train import (
     _save_checkpoint_resumavel,
     recover,
 )
+from aguardente.errors import AguardenteError
 from aguardente.plan import PrunePlan
 from aguardente.prune.surgery import prune_model
 from aguardente.verify import recovery_fraction
@@ -438,3 +439,46 @@ def test_recover_steps_trailing_batches(tmp_path):
                   device="cpu")
     # 5 lotes com grad_accum=2 devem gerar 3 passos de otimizador (2 regulares + 1 residual)
     assert res.steps == 3
+
+
+def test_precompute_raises_on_non_finite_logits(tmp_path):
+    class NanTeacher:
+        training = False
+
+        def eval(self):
+            pass
+
+        def train(self, mode):
+            pass
+
+        def __call__(self, **kwargs):
+            return type("Out", (), {"logits": torch.tensor([[[float("nan")]]])})()
+
+    with pytest.raises(AguardenteError, match="não finitos"):
+        precompute_logits(NanTeacher(), fixed_batches(n=1), tmp_path / "nan_logits", top_k=8)
+
+
+def test_recover_raises_on_divergent_loss(tmp_path):
+    teacher = tiny_model()
+    batches = fixed_batches(n=2)
+    logits = precompute_logits(teacher, batches, tmp_path / "l", top_k=8)
+
+    class NanStudent:
+        def parameters(self):
+            yield torch.nn.Parameter(torch.randn(2, 2))
+
+        def named_parameters(self):
+            yield "weight", torch.nn.Parameter(torch.randn(2, 2))
+
+        def train(self):
+            pass
+
+        def eval(self):
+            pass
+
+        def __call__(self, **kwargs):
+            # Retorna logits com NaN
+            return type("Out", (), {"logits": torch.full((2, 16, 256), float("nan"))})()
+
+    with pytest.raises(AguardenteError, match="divergiu"):
+        recover(NanStudent(), logits, RecoveryConfig(epochs=1), device="cpu")

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
+from ..errors import AguardenteError
+
 if TYPE_CHECKING:  # pragma: no cover
     import torch
 
@@ -85,6 +87,11 @@ def precompute_logits(
                     continue
 
                 logits = teacher(**batch).logits
+                if not torch.isfinite(logits).all():
+                    raise AguardenteError(
+                        "o modelo teacher produziu valores não finitos (NaN ou Inf) durante a geração de logits",
+                        hint="Verifique se os pesos do modelo original ou o dispositivo estão corrompendo os tensores.",
+                    )
                 k = min(top_k, logits.size(-1))
                 values, indices = logits.topk(k, dim=-1)
 

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from .loss import kd_loss
 from .teacher import TeacherLogits
+from ..errors import AguardenteError
 
 if TYPE_CHECKING:  # pragma: no cover
     import torch
@@ -173,6 +174,14 @@ def recover(
                     mask=mask,
                     alpha=cfg.alpha, temperature=cfg.temperature,
                 )
+
+                value = float(loss.detach())
+                if not math.isfinite(value):
+                    raise AguardenteError(
+                        f"a perda de destilação divergiu (loss={value}) no passo {result.steps}",
+                        hint="A taxa de aprendizado pode estar alta demais. Tente reduzir com --lr ou usar um nível de esforço mais conservador.",
+                    )
+
                 (loss / cfg.grad_accum).backward()
                 lotes_feitos += 1
 
@@ -184,7 +193,6 @@ def recover(
                     if cfg.checkpoint_every and result.steps % cfg.checkpoint_every == 0:
                         _checkpoint_automatico()
 
-                value = float(loss.detach())
                 result.losses.append(value)
                 if len(result.losses) > _MAX_LOSS_HISTORY:
                     del result.losses[:len(result.losses) - _MAX_LOSS_HISTORY]
