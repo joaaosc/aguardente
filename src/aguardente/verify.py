@@ -61,8 +61,10 @@ def perplexity(
                 targets = window.clone()
                 targets[:, :-target_len] = -100
 
+                valid = int((targets[:, 1:] != -100).sum().item())
+                if valid <= 0:
+                    continue
                 out = model(input_ids=window, labels=targets)
-                valid = max(1, target_len - 1)
                 nll_sum += out.loss.detach().double().cpu() * valid
                 counted += valid
                 windows += 1

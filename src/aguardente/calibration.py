@@ -69,12 +69,35 @@ def load_texts_from_file(path: str, *, limit: int = 256, min_chars: int = 200) -
 
     from .errors import AguardenteError
 
-    raw = Path(path).expanduser().read_text(encoding="utf-8", errors="replace")
-    out = [p.strip() for p in raw.split("\n\n") if len(p.strip()) >= min_chars][:limit]
+    p = Path(path).expanduser()
+    if not p.is_file():
+        raise AguardenteError(
+            f"arquivo de calibração não encontrado: {path}",
+            hint="Verifique o caminho informado em --calib-file.",
+        )
+
+    raw = p.read_text(encoding="utf-8", errors="replace")
+    out = [par.strip() for par in raw.split("\n\n") if len(par.strip()) >= min_chars][:limit]
+    if not out:
+        # Fallback: agrupa linhas contínuas quando o arquivo não usar quebras duplas
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        current: list[str] = []
+        current_len = 0
+        for line in lines:
+            current.append(line)
+            current_len += len(line)
+            if current_len >= min_chars:
+                out.append(" ".join(current))
+                current = []
+                current_len = 0
+                if len(out) >= limit:
+                    break
+        if current and len(out) < limit and current_len >= min_chars:
+            out.append(" ".join(current))
     if not out:
         raise AguardenteError(
             f"{path} não contém parágrafos com >= {min_chars} caracteres",
-            hint="Separe os blocos de texto por linhas em branco.",
+            hint="Separe os blocos de texto por linhas em branco ou forneça textos mais longos.",
         )
     return out
 
@@ -90,6 +113,7 @@ def make_batches(
     """Tokeniza e agrupa as amostras em batches de tamanho fixo."""
     import torch
 
+    ensure_pad_token(tokenizer)
     for i in range(0, len(texts), batch_size):
         chunk = texts[i:i + batch_size]
         if len(chunk) < batch_size:
