@@ -92,8 +92,8 @@ def load_texts_from_file(path: str, *, limit: int = 256, min_chars: int = 200) -
                 current_len = 0
                 if len(out) >= limit:
                     break
-        if current and len(out) < limit and current_len >= min_chars:
-            out.append(" ".join(current))
+        # O resto de `current` fica sempre abaixo de `min_chars` — o laço fecha um
+        # bloco assim que o limiar é atingido — então não há bloco final a emitir.
     if not out:
         raise AguardenteError(
             f"{path} não contém parágrafos com >= {min_chars} caracteres",

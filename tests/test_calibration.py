@@ -43,15 +43,25 @@ def test_load_texts_from_file_with_paragraphs(tmp_path):
 
 
 def test_load_texts_from_file_with_line_fallback(tmp_path):
+    # O fallback por linhas só roda quando a divisão por linha em branco não
+    # produz nenhum parágrafo do tamanho pedido: com um texto sem "\n\n" o
+    # arquivo inteiro já vira um parágrafo único e o fallback nunca é exercido.
     p = tmp_path / "data_lines.txt"
-    line1 = "Primeira linha com texto suficiente para compor o bloco de calibração. "
-    line2 = "Segunda linha dando continuidade ao conteúdo do arquivo de texto comum. "
-    line3 = "Terceira linha finalizando o conjunto com mais de duzentos caracteres no total."
-    p.write_text(f"{line1}\n{line2}\n{line3}", encoding="utf-8")
+    paragrafos = [f"Parágrafo curto número {i} do arquivo de calibração." for i in range(6)]
+    p.write_text("\n\n".join(paragrafos), encoding="utf-8")
+    assert all(len(par) < 100 for par in paragrafos), "nenhum parágrafo pode atingir min_chars"
 
-    texts = load_texts_from_file(str(p), min_chars=150)
+    texts = load_texts_from_file(str(p), min_chars=100)
     assert len(texts) >= 1
-    assert len(texts[0]) >= 150
+    assert all(len(t) >= 100 for t in texts)
+
+
+def test_load_texts_from_file_line_fallback_respects_limit(tmp_path):
+    p = tmp_path / "muitas_linhas.txt"
+    p.write_text("\n\n".join("A" * 60 for _ in range(40)), encoding="utf-8")
+
+    texts = load_texts_from_file(str(p), limit=3, min_chars=100)
+    assert len(texts) == 3
 
 
 def test_load_texts_from_file_missing_raises():
