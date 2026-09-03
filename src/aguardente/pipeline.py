@@ -788,6 +788,10 @@ def stage_recover(ctx: Context, pruned_dir: Path, logits_dir: Path | None) -> Pa
         if opts.measure:
             evaluate = lambda: perplexity_on_wikitext(student, tokenizer, device=device).value
 
+        ckpt_dir = opts.out_dir / "ckpt"
+        if (ckpt_dir / "last.pt").is_file():
+            ctx.say("             checkpoint encontrado — retomando o treino de onde parou")
+
         with _Activity(ctx, "treinando") as atividade:
             def _passo(s: int, l: float) -> None:
                 if s and s % 5 == 0:
@@ -795,9 +799,11 @@ def stage_recover(ctx: Context, pruned_dir: Path, logits_dir: Path | None) -> Pa
                     ctx.events.progress("recover", s)
 
             res = recover(student, logits, cfg, device=device, evaluate=evaluate,
-                          checkpoint_dir=opts.out_dir / "ckpt", on_step=_passo)
+                          checkpoint_dir=ckpt_dir, on_step=_passo)
             atividade.update(f"{res.steps} passos em {res.seconds:.0f}s "
                              f"(critério de parada: {res.stopped_by})")
+        if res.resumed_from:
+            ctx.say(f"             {res.resumed_from} passo(s) já feitos antes da retomada")
 
         save_pruned(student, tokenizer, out)
 

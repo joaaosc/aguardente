@@ -12,7 +12,12 @@ from transformers import LlamaConfig, LlamaForCausalLM
 from aguardente.arch import Arch, count_params
 from aguardente.distill.loss import kd_loss
 from aguardente.distill.teacher import estimate_logit_bytes, precompute_logits
-from aguardente.distill.train import RecoveryConfig, recover
+from aguardente.distill.train import (
+    RecoveryConfig,
+    _load_checkpoint,
+    _save_checkpoint_resumavel,
+    recover,
+)
 from aguardente.plan import PrunePlan
 from aguardente.prune.surgery import prune_model
 from aguardente.verify import recovery_fraction
@@ -197,6 +202,116 @@ def test_recovery_respects_time_budget(tmp_path):
                                   gradient_checkpointing=False),
                    device="cpu")
     assert res2.stopped_by == "time"
+
+
+# ---------------------------------------------------------------- checkpoint
+
+def test_checkpoint_e_salvo_periodicamente(tmp_path):
+    teacher = tiny_model()
+    logits = precompute_logits(teacher, fixed_batches(n=8), tmp_path / "l", top_k=8)
+    student = tiny_model(seed=1)
+    ckpt = tmp_path / "ckpt"
+
+    vistos = []
+
+    def registra(passo, perda):
+        vistos.append((passo, (ckpt / "last.pt").is_file()))
+
+    recover(student, logits,
+            RecoveryConfig(epochs=2, grad_accum=1, checkpoint_every=2,
+                           gradient_checkpointing=False),
+            device="cpu", checkpoint_dir=ckpt, on_step=registra)
+
+    marcos = [existe for passo, existe in vistos if passo > 0 and passo % 2 == 0]
+    assert marcos and all(marcos)
+
+
+def test_checkpoint_e_removido_ao_terminar_normalmente(tmp_path):
+    teacher = tiny_model()
+    logits = precompute_logits(teacher, fixed_batches(n=6), tmp_path / "l", top_k=8)
+    student = tiny_model(seed=1)
+    ckpt = tmp_path / "ckpt"
+
+    res = recover(student, logits,
+                  RecoveryConfig(epochs=2, grad_accum=1, checkpoint_every=1,
+                                 gradient_checkpointing=False),
+                  device="cpu", checkpoint_dir=ckpt)
+
+    assert res.stopped_by == "epochs"
+    assert not (ckpt / "last.pt").is_file()
+    assert (ckpt / "recovery.json").is_file()
+
+
+def test_interrupcao_salva_checkpoint(tmp_path):
+    teacher = tiny_model()
+    logits = precompute_logits(teacher, fixed_batches(n=6), tmp_path / "l", top_k=8)
+    student = tiny_model(seed=1)
+    ckpt = tmp_path / "ckpt"
+
+    def interrompe(passo, perda):
+        if passo >= 2:
+            raise KeyboardInterrupt
+
+    res = recover(student, logits,
+                  RecoveryConfig(epochs=5, grad_accum=1, gradient_checkpointing=False),
+                  device="cpu", checkpoint_dir=ckpt, on_step=interrompe)
+
+    assert res.stopped_by == "interrupted"
+    assert res.steps == 2
+    assert (ckpt / "last.pt").is_file()
+
+
+def test_retomada_processa_o_total_certo_de_passos(tmp_path):
+    teacher = tiny_model()
+    logits = precompute_logits(teacher, fixed_batches(n=8), tmp_path / "l", top_k=8)
+
+    cfg = RecoveryConfig(epochs=4, grad_accum=1, gradient_checkpointing=False)
+    referencia = recover(tiny_model(seed=1), logits, cfg, device="cpu")
+    assert referencia.stopped_by == "epochs"
+
+    parou_em = referencia.steps // 2
+
+    def interrompe(passo, perda):
+        if passo >= parou_em:
+            raise KeyboardInterrupt
+
+    ckpt = tmp_path / "ckpt"
+    student = tiny_model(seed=1)
+    parcial = recover(student, logits, cfg, device="cpu",
+                      checkpoint_dir=ckpt, on_step=interrompe)
+    assert parcial.stopped_by == "interrupted"
+    assert parcial.steps == parou_em
+
+    final = recover(student, logits, cfg, device="cpu", checkpoint_dir=ckpt)
+    assert final.resumed_from == parou_em
+    assert final.steps == referencia.steps
+    assert final.stopped_by == "epochs"
+    assert not (ckpt / "last.pt").is_file()
+
+
+def test_retomada_preserva_estado_do_otimizador(tmp_path):
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    student = tiny_model(seed=2)
+    optimizer = torch.optim.AdamW(student.parameters(), lr=1e-3)
+
+    batch = fixed_batches(n=1)[0]
+    out = student(input_ids=batch["input_ids"], labels=batch["input_ids"])
+    out.loss.backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+    _save_checkpoint_resumavel(student, optimizer, ckpt, step=1, lotes_feitos=1,
+                               best=0.5, stale=1)
+
+    novo_student = tiny_model(seed=2)
+    novo_optimizer = torch.optim.AdamW(novo_student.parameters(), lr=1e-3)
+    assert not novo_optimizer.state
+
+    estado = _load_checkpoint(ckpt, novo_student, novo_optimizer, device="cpu")
+
+    assert estado == {"step": 1, "lotes_feitos": 1, "best": 0.5, "stale": 1}
+    assert novo_optimizer.state
 
 
 def test_checkpoint_written_when_metric_improves(tmp_path):
