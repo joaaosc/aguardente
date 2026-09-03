@@ -482,3 +482,50 @@ def test_recover_raises_on_divergent_loss(tmp_path):
 
     with pytest.raises(AguardenteError, match="divergiu"):
         recover(NanStudent(), logits, RecoveryConfig(epochs=1), device="cpu")
+
+
+def test_kd_loss_rejects_invalid_parameters():
+    s = torch.randn(2, 4, 16)
+    v = torch.randn(2, 4, 8)
+    idx = torch.randint(0, 16, (2, 4, 8))
+
+    with pytest.raises(ValueError, match="temperature"):
+        kd_loss(s, v, idx, temperature=0.0)
+    with pytest.raises(ValueError, match="temperature"):
+        kd_loss(s, v, idx, temperature=-1.0)
+    with pytest.raises(ValueError, match="alpha"):
+        kd_loss(s, v, idx, alpha=-0.1)
+    with pytest.raises(ValueError, match="alpha"):
+        kd_loss(s, v, idx, alpha=1.1)
+
+
+def test_kd_loss_masks_left_padding():
+    s = torch.randn(1, 4, 16)
+    v, idx = s.topk(8, dim=-1)
+    # Left padding: token 0 é pad (0), tokens 1, 2, 3 são reais (1)
+    mask = torch.tensor([[0, 1, 1, 1]])
+    labels = torch.randint(0, 16, (1, 4))
+    loss1 = kd_loss(s, v, idx, labels=labels, mask=mask, alpha=0.5)
+
+    # Altera os logits e rótulo do token de preenchimento à esquerda (índice 0)
+    s2 = s.clone()
+    s2[:, 0, :] += 50.0
+    labels2 = labels.clone()
+    labels2[:, 0] = 5
+
+    loss2 = kd_loss(s2, v, idx, labels=labels2, mask=mask, alpha=0.5)
+    assert float(loss1) == pytest.approx(float(loss2), rel=1e-5)
+
+
+def test_precompute_overwrites_corrupt_empty_shards(tmp_path):
+    teacher = tiny_model()
+    empty_shard = tmp_path / "000000.pt"
+    empty_shard.touch()
+    assert empty_shard.stat().st_size == 0
+
+    batches = fixed_batches(n=1)
+    out = precompute_logits(teacher, batches, tmp_path, top_k=8)
+
+    assert empty_shard.stat().st_size > 0
+    loaded = next(iter(out.batches()))
+    assert "values" in loaded

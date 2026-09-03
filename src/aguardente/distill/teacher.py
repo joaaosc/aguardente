@@ -80,7 +80,7 @@ def precompute_logits(
             for i, batch in enumerate(batches):
                 shard_path = out / f"{i:06d}.pt"
                 input_ids = batch["input_ids"]
-                if shard_path.exists():
+                if shard_path.is_file() and shard_path.stat().st_size > 0:
                     shards += 1
                     samples += int(input_ids.size(0))
                     seq_len = int(input_ids.size(1))
@@ -103,7 +103,13 @@ def precompute_logits(
                 if "attention_mask" in batch:
                     payload["attention_mask"] = batch["attention_mask"].detach().to(torch.int8).cpu()
 
-                torch.save(payload, shard_path)
+                tmp_shard = shard_path.with_suffix(".pt.tmp")
+                try:
+                    torch.save(payload, tmp_shard)
+                    tmp_shard.replace(shard_path)
+                finally:
+                    tmp_shard.unlink(missing_ok=True)
+
                 shards += 1
                 samples += int(input_ids.size(0))
                 seq_len = int(input_ids.size(1))
@@ -113,5 +119,7 @@ def precompute_logits(
         teacher.train(was_training)
 
     meta = {"top_k": top_k, "shards": shards, "samples": samples, "seq_len": seq_len}
-    (out / _MANIFEST).write_text(json.dumps(meta, indent=2))
+    tmp_manifest = out / f"{_MANIFEST}.tmp"
+    tmp_manifest.write_text(json.dumps(meta, indent=2))
+    tmp_manifest.replace(out / _MANIFEST)
     return TeacherLogits(path=out, **meta)

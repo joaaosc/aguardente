@@ -34,6 +34,11 @@ def kd_loss(
     import torch
     import torch.nn.functional as F
 
+    if temperature <= 0.0:
+        raise ValueError(f"temperature deve ser estritamente positiva, recebido {temperature}")
+    if not (0.0 <= alpha <= 1.0):
+        raise ValueError(f"alpha deve estar no intervalo [0.0, 1.0], recebido {alpha}")
+
     if labels is not None:
         # Alinhamento causal para predição de próximo token:
         # a posição t prediz o token t + 1.
@@ -41,13 +46,17 @@ def kd_loss(
         t_vals = teacher_values[:, :-1].contiguous()
         t_idx = teacher_indices[:, :-1].contiguous()
         s_labels = labels[:, 1:].contiguous()
-        s_mask = mask[:, 1:].contiguous() if mask is not None else None
+        if mask is not None:
+            # Uma transição causal t -> t+1 só é válida se tanto a entrada em t quanto o alvo em t+1 forem tokens reais
+            s_mask = (mask[:, :-1].bool() & mask[:, 1:].bool()).contiguous()
+        else:
+            s_mask = None
     else:
         s_logits = student_logits
         t_vals = teacher_values
         t_idx = teacher_indices
         s_labels = None
-        s_mask = mask
+        s_mask = mask.bool().contiguous() if mask is not None else None
 
     # Extrai os logits do aluno correspondentes às top-k escolhas do professor.
     selected = s_logits.gather(-1, t_idx.long())
