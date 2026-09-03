@@ -17,9 +17,12 @@ exports/
 # rascunhos e anotações locais
 .local/
 
-# GUI macOS: entra em etapa própria
-/Package.swift
-/app/
+# Swift / Xcode: artefatos de build
+.build/
+.swiftpm/
+DerivedData/
+*.xcresult
+*.xcuserstate
 
 # macOS
 .DS_Store
