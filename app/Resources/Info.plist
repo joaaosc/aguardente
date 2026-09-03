@@ -16,10 +16,13 @@
 	<string>Aguardente</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<!-- Os dois valores abaixo são reescritos por scripts/build-app.sh a partir
+	     do pacote Python e da contagem de commits. Editá-los aqui não tem
+	     efeito: a versão tem uma fonte só, `src/aguardente/__init__.py`. -->
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.0</string>
+	<string>0.0.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>0</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>LSMinimumSystemVersion</key>

@@ -70,6 +70,12 @@ resolver_identidade() {
 	printf '%s' "$achados"
 }
 
+# A versão vem do pacote Python, e não de um número repetido no Info.plist. Três
+# declarações independentes divergem na primeira correção; uma só não tem como.
+versao_do_pacote() {
+	sed -n 's/^__version__ = "\(.*\)"/\1/p' src/aguardente/__init__.py | head -1
+}
+
 # ---------------------------------------------------------------- compilação
 
 passo "Compilando em release"
@@ -106,6 +112,17 @@ cp "$BINARIO" "$BUNDLE/Contents/MacOS/$EXECUTAVEL"
 cp app/Resources/Info.plist "$BUNDLE/Contents/Info.plist"
 iconutil -c icns "$ICONSET" -o "$BUNDLE/Contents/Resources/AppIcon.icns"
 printf 'APPL????' > "$BUNDLE/Contents/PkgInfo"
+
+VERSAO="$(versao_do_pacote)"
+[ -n "$VERSAO" ] || { echo "não foi possível ler __version__ do pacote" >&2; exit 1; }
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSAO" \
+	"$BUNDLE/Contents/Info.plist"
+# CFBundleVersion precisa crescer a cada envio para a notarização, mesmo quando a
+# versão exibida não muda. A contagem de commits é monotônica e não exige
+# lembrar de incrementar nada à mão.
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(git rev-list --count HEAD)" \
+	"$BUNDLE/Contents/Info.plist"
+echo "versão $VERSAO (build $(git rev-list --count HEAD))"
 
 # As dependências do pipeline são permissivas (BSD-3 e Apache-2.0) e permitem
 # redistribuição sob licença restrita, mas exigem que a atribuição viaje junto.
