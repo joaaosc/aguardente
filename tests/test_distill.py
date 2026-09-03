@@ -529,3 +529,26 @@ def test_precompute_overwrites_corrupt_empty_shards(tmp_path):
     assert empty_shard.stat().st_size > 0
     loaded = next(iter(out.batches()))
     assert "values" in loaded
+
+
+def test_recover_flushes_pending_gradients_on_interrupt(tmp_path):
+    teacher = tiny_model()
+    batches = fixed_batches(n=3)
+    logits = precompute_logits(teacher, batches, tmp_path / "l", top_k=8)
+
+    student = tiny_model(seed=1)
+    called = [0]
+
+    def interrompe(step, loss):
+        called[0] += 1
+        if called[0] == 3:
+            raise KeyboardInterrupt
+
+    res = recover(
+        student, logits,
+        RecoveryConfig(epochs=1, grad_accum=2, gradient_checkpointing=False),
+        device="cpu", on_step=interrompe, checkpoint_dir=tmp_path / "ck",
+    )
+    assert res.stopped_by == "interrupted"
+    # Com 3 lotes e grad_accum=2, a interrupção no 3º lote deve escoar o lote residual, totalizando 2 passos
+    assert res.steps == 2

@@ -151,6 +151,13 @@ def recover(
             _save_checkpoint_resumavel(student, optimizer, ckpt, result.steps,
                                        lotes_feitos, best, stale)
 
+    def _flush_gradientes() -> None:
+        if lotes_feitos % cfg.grad_accum != 0:
+            torch.nn.utils.clip_grad_norm_(student.parameters(), cfg.max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            result.steps += 1
+
     try:
         for epoch in range(epoca_inicial, cfg.epochs):
             # Só a época em que o treino parou pula lotes; as seguintes
@@ -185,7 +192,7 @@ def recover(
                 (loss / cfg.grad_accum).backward()
                 lotes_feitos += 1
 
-                if (i + 1) % cfg.grad_accum == 0:
+                if lotes_feitos % cfg.grad_accum == 0:
                     torch.nn.utils.clip_grad_norm_(student.parameters(), cfg.max_grad_norm)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -201,6 +208,7 @@ def recover(
 
                 if cfg.max_seconds and time.perf_counter() - started > cfg.max_seconds:
                     result.stopped_by = "time"
+                    _flush_gradientes()
                     _checkpoint_automatico()
                     return _finish(result, started, student, ckpt)
 
@@ -219,21 +227,15 @@ def recover(
                         stale += 1
                         if stale >= cfg.plateau_patience:
                             result.stopped_by = "plateau"
+                            _flush_gradientes()
                             _checkpoint_automatico()
                             return _finish(result, started, student, ckpt)
 
-            # Efetua o passo residual de otimizador caso o número de lotes não seja múltiplo exato de grad_accum
-            if lotes_feitos % cfg.grad_accum != 0:
-                torch.nn.utils.clip_grad_norm_(student.parameters(), cfg.max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                result.steps += 1
-                if cfg.checkpoint_every and result.steps % cfg.checkpoint_every == 0:
-                    _checkpoint_automatico()
-
+            _flush_gradientes()
             result.epochs_completed = epoch + 1
     except KeyboardInterrupt:
         result.stopped_by = "interrupted"
+        _flush_gradientes()
         _checkpoint_automatico()
 
     return _finish(result, started, student, ckpt)
