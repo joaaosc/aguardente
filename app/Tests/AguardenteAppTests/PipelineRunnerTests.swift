@@ -90,3 +90,56 @@ struct PipelineRunnerTests {
         #expect(runner.stage("export")?.state == .pending)
     }
 }
+
+@Suite("Configuração da execução")
+@MainActor
+struct ConfiguracaoTests {
+
+    @Test("Sem alvo informado, --target-params não é enviado")
+    func semAlvoNaoEnviaFlag() {
+        let runner = PipelineRunner()
+        runner.modelName = "org/qualquer-modelo"
+        runner.targetParams = nil
+
+        let args = runner.argumentos(destino: "/tmp/saida")
+
+        #expect(!args.contains("--target-params"))
+        #expect(args.contains("org/qualquer-modelo"))
+        #expect(args.contains("--json"))
+    }
+
+    @Test("Com alvo informado, o valor vai como inteiro")
+    func comAlvoEnviaValor() {
+        let runner = PipelineRunner()
+        runner.targetParams = 1.44e9
+
+        let args = runner.argumentos(destino: "/tmp/saida")
+
+        let indice = args.firstIndex(of: "--target-params")
+        #expect(indice != nil)
+        #expect(args[indice! + 1] == "1440000000")
+    }
+
+    @Test("Alvo zero equivale a automático")
+    func alvoZeroEAutomatico() {
+        let runner = PipelineRunner()
+        runner.targetParams = 0
+
+        #expect(!runner.argumentos(destino: "/tmp/saida").contains("--target-params"))
+    }
+
+    @Test("O destino informado chega ao comando")
+    func destinoChegaAoComando() {
+        let runner = PipelineRunner()
+        let args = runner.argumentos(destino: "/Users/alguem/Documents/Aguardente")
+
+        let indice = args.firstIndex(of: "-o")
+        #expect(indice != nil)
+        #expect(args[indice! + 1] == "/Users/alguem/Documents/Aguardente")
+    }
+
+    @Test("O destino padrão é absoluto")
+    func destinoPadraoEAbsoluto() {
+        #expect(Preferences.destinoPadrao.hasPrefix("/"))
+    }
+}

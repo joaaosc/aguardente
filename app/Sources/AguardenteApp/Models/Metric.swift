@@ -1,15 +1,21 @@
 import Foundation
 
 public struct Metric: Identifiable, Sendable, Equatable, Hashable {
-    public let id: String
     public let key: String
     public let label: String
     public let value: Double
     public let unit: String
     public let meetsTarget: Bool
 
-    public init(id: String = UUID().uuidString, key: String, label: String? = nil, value: Double, unit: String = "", meetsTarget: Bool = true) {
-        self.id = id
+    /// A chave da métrica é a identidade.
+    ///
+    /// Com um `UUID` novo a cada construção, atualizar o valor de uma métrica
+    /// produzia um elemento de identidade diferente, e o SwiftUI tratava a
+    /// atualização como remoção mais inserção — a linha reanimava do zero a
+    /// cada número recebido. A chave é estável e já é única dentro da etapa.
+    public var id: String { key }
+
+    public init(key: String, label: String? = nil, value: Double, unit: String = "", meetsTarget: Bool = true) {
         self.key = key
         self.label = label ?? Metric.defaultLabel(for: key)
         self.value = value

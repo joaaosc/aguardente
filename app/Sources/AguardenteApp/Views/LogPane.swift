@@ -69,6 +69,16 @@ public struct LogPane: View {
                                 Text(line.formattedTime)
                                     .foregroundStyle(.tertiary)
 
+                                // Severidade transmitida só por cor é invisível
+                                // para quem não a distingue; o símbolo carrega a
+                                // mesma informação de forma independente.
+                                if let simbolo = line.levelSymbol {
+                                    Image(systemName: simbolo)
+                                        .foregroundStyle(style(for: line.level))
+                                        .accessibilityLabel(line.level.lowercased().hasPrefix("err")
+                                                            ? "Erro" : "Aviso")
+                                }
+
                                 Text(line.text)
                                     .foregroundStyle(style(for: line.level))
                                     .frame(maxWidth: .infinity, alignment: .leading)

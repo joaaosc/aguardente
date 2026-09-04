@@ -13,11 +13,20 @@ public struct ReportSheet: View {
         self.runner = runner
     }
 
+    /// Sem alvo informado quem dimensiona é o pipeline, pela RAM da máquina —
+    /// e o relatório precisa dizer isso, não inventar um número.
+    private var alvoDescrito: String {
+        guard let alvo = runner.targetParams, alvo > 0 else {
+            return "automático (dimensionado pela RAM)"
+        }
+        return String(format: "%.2f B", alvo / 1e9)
+    }
+
     private var reportMarkdown: String {
         var md = "# Relatório de Execução · aguardente\n\n"
         md += "**Modelo:** `\(runner.modelName)`  \n"
         md += "**Destino:** `\(runner.outDir)`  \n"
-        md += "**Alvo de Parâmetros:** \(String(format: "%.2f B", runner.targetParams / 1e9))  \n"
+        md += "**Alvo de Parâmetros:** \(alvoDescrito)  \n"
         md += "**Estado:** \(runner.phase.description)  \n"
         md += "**Tempo Total:** \(formatDuration(runner.elapsed))\n\n"
 

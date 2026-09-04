@@ -2,12 +2,22 @@ import SwiftUI
 
 public struct RootView: View {
     private let runner: PipelineRunner
-    @State private var selection: Stage.ID?
+    // A seleção e a visibilidade do log são estado de cena: o macOS espera que
+    // a janela reabra como o usuário a deixou.
+    @SceneStorage("etapaSelecionada") private var selection: Stage.ID?
+    @SceneStorage("logVisivel") private var isLogVisible = false
     @State private var showReport = false
-    @State private var isLogVisible = false
+    @State private var confirmandoLimpeza = false
+    @State private var motor: BinaryResolver.Resolution = BinaryResolver.resolve()
 
     public init(runner: PipelineRunner) {
         self.runner = runner
+    }
+
+    /// O CLI que o aplicativo executa está instalado?
+    private var motorAusente: Bool {
+        if case .notFound = motor { return true }
+        return false
     }
 
     private var displayedStage: Stage? {
@@ -19,7 +29,9 @@ public struct RootView: View {
             StageList(runner: runner, selection: $selection)
                 .navigationSplitViewColumnWidth(min: 200, ideal: 230, max: 320)
         } detail: {
-            if let stage = displayedStage {
+            if motorAusente {
+                motorNaoEncontrado
+            } else if let stage = displayedStage {
                 StageDetail(stage: stage, isLogVisible: isLogVisible)
             } else {
                 ContentUnavailableView(
@@ -77,9 +89,10 @@ public struct RootView: View {
                 Menu {
                     Button("Relatório…", systemImage: "doc.text") { showReport = true }
                     Button("Revelar no Finder", systemImage: "folder") { runner.revealOutput() }
+                        .disabled(!runner.hasOutput)
                     Divider()
                     Button("Limpar execução", systemImage: "arrow.counterclockwise", role: .destructive) {
-                        runner.reset()
+                        confirmandoLimpeza = true
                     }
                 } label: {
                     Label("Mais", systemImage: "ellipsis")
@@ -88,6 +101,44 @@ public struct RootView: View {
         }
         .sheet(isPresented: $showReport) {
             ReportSheet(runner: runner)
+        }
+        // Descartar uma execução de horas é irreversível, e a ação fica a um
+        // clique de distância no menu e a um atalho de distância no teclado.
+        .confirmationDialog("Limpar a execução atual?",
+                            isPresented: $confirmandoLimpeza,
+                            titleVisibility: .visible) {
+            Button("Limpar execução", role: .destructive) { runner.reset() }
+            Button("Cancelar", role: .cancel) {}
+        } message: {
+            Text("O progresso exibido e os registros desta execução são descartados. "
+                 + "Os arquivos já gravados em \(runner.outDir) permanecem no disco.")
+        }
+    }
+
+    /// Primeira barreira real de quem instala só o aplicativo.
+    ///
+    /// O `.app` não converte nada sozinho: ele executa o CLI, que por sua vez
+    /// exige Python, torch e aria2. Sem essa tela o erro virava uma linha no
+    /// log, que começa oculto — a janela apenas dizia "Falhou" sem explicar o
+    /// que instalar.
+    @ViewBuilder
+    private var motorNaoEncontrado: some View {
+        ContentUnavailableView {
+            Label("Motor de conversão não encontrado", systemImage: "shippingbox")
+        } description: {
+            Text("O aplicativo executa o programa `aguardente`, que precisa estar "
+                 + "instalado à parte junto com Python 3.12, torch e aria2.")
+        } actions: {
+            if case .notFound(let comando) = motor {
+                Text(comando)
+                    .font(.system(.callout, design: .monospaced))
+                    .textSelection(.enabled)
+                    .padding(10)
+                    .background(Color(nsColor: .textBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+            Button("Verificar novamente") { motor = BinaryResolver.resolve() }
+                .buttonStyle(.borderedProminent)
         }
     }
 }

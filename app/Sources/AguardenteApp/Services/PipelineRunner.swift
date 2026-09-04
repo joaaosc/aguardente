@@ -36,16 +36,47 @@ public final class PipelineRunner {
     public private(set) var activeStageID: Stage.ID?
     public private(set) var previousStageID: Stage.ID?
     public private(set) var phase: Phase = .idle
-    public var modelName: String = "Qwen/Qwen3-4B"
-    public var outDir: String = "runs/run_qwen3_4b"
-    public var targetParams: Double = 1.44e9
     public private(set) var elapsed: Duration = .zero
+
+    public var modelName: String {
+        didSet { Preferences.modelName = modelName }
+    }
+
+    /// Destino absoluto. Um caminho relativo era resolvido contra o diretório
+    /// de trabalho, que num `.app` aberto pelo Finder é `/` — o pipeline
+    /// tentava gravar na raiz do disco e falhava por permissão.
+    public var outDir: String {
+        didSet { Preferences.outDir = outDir }
+    }
+
+    /// Alvo de parâmetros, ou `nil` para deixar o pipeline dimensionar pela RAM.
+    ///
+    /// Enviar um número fixo era o defeito mais grave da interface: 1,44 B foi
+    /// calibrado para um modelo e uma máquina, e ia junto para qualquer outro
+    /// modelo escolhido. Numa máquina cujo teto de treino é menor, todo `run`
+    /// abortava antes de baixar coisa alguma. Sem `--target-params` o pipeline
+    /// escolhe o alvo que cabe, para o modelo que o usuário pediu de fato.
+    public var targetParams: Double? {
+        didSet { Preferences.targetParams = targetParams }
+    }
+
+    /// Verdadeiro quando a execução está em curso mas nada chega há tempo demais.
+    ///
+    /// Sem este sinal, um pipeline travado deixava a interface indicando
+    /// "Executando" indefinidamente, sem diferença visível de um que progride.
+    public private(set) var isStalled: Bool = false
+
+    /// Intervalo sem eventos a partir do qual a execução é dada como sem
+    /// resposta. Etapas longas — download, treino — passam minutos sem emitir
+    /// nada, então o limiar é generoso de propósito.
+    private static let limiteSemResposta: Duration = .seconds(300)
 
     private var process: Process?
     private var streamTask: Task<Void, Never>?
     private var timerTask: Task<Void, Never>?
     private var startTime: ContinuousClock.Instant?
     private var accumulatedDuration: Duration = .zero
+    private var lastEventAt: ContinuousClock.Instant?
 
     public var isRunning: Bool {
         phase == .running
@@ -55,7 +86,15 @@ public final class PipelineRunner {
         stages.filter { $0.state == .ok || $0.state == .skipped }.count
     }
 
+    /// Há saída em disco que valha revelar no Finder.
+    public var hasOutput: Bool {
+        FileManager.default.fileExists(atPath: (outDir as NSString).expandingTildeInPath)
+    }
+
     public init() {
+        modelName = Preferences.modelName
+        outDir = Preferences.outDir
+        targetParams = Preferences.targetParams
         loadDefaultStages()
     }
 
@@ -94,6 +133,8 @@ public final class PipelineRunner {
 
         phase = .running
         startTime = ContinuousClock.now
+        lastEventAt = ContinuousClock.now
+        isStalled = false
         startTimer()
 
         let resolution = BinaryResolver.resolve()
@@ -139,15 +180,16 @@ public final class PipelineRunner {
         loadDefaultStages()
     }
 
+    /// Abre o destino no Finder, e só ele.
+    ///
+    /// O recuo anterior era o diretório de trabalho do processo — `/` num app
+    /// aberto pelo Finder. Revelar a raiz do disco como resposta a um clique
+    /// não ajuda ninguém; sem saída, a ação simplesmente não faz nada, e a
+    /// interface a mantém desabilitada.
     public func revealOutput() {
         let path = (outDir as NSString).expandingTildeInPath
-        let url = URL(fileURLWithPath: path)
-        if FileManager.default.fileExists(atPath: url.path) {
-            NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: url.path)
-        } else {
-            let currentDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: currentDir.path)
-        }
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: path)
     }
 
     private func startTimer() {
@@ -156,8 +198,11 @@ public final class PipelineRunner {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard let self, self.phase == .running, let start = self.startTime else { break }
-                let currentSegment = ContinuousClock.now - start
-                self.elapsed = self.accumulatedDuration + currentSegment
+                let agora = ContinuousClock.now
+                self.elapsed = self.accumulatedDuration + (agora - start)
+                if let ultimo = self.lastEventAt {
+                    self.isStalled = (agora - ultimo) > PipelineRunner.limiteSemResposta
+                }
             }
         }
     }
@@ -183,21 +228,24 @@ public final class PipelineRunner {
         env["PYTHONUNBUFFERED"] = "1"
         proc.environment = env
 
+        // O destino é criado aqui para que exista antes de qualquer download, e
+        // o diretório de trabalho do processo passa a ser o pai dele. Sem isso o
+        // filho herdava `/` num app aberto pelo Finder.
+        let destino = URL(fileURLWithPath: (outDir as NSString).expandingTildeInPath)
+        try? FileManager.default.createDirectory(at: destino, withIntermediateDirectories: true)
+
         switch resolution {
         case .executable(let url):
             proc.executableURL = url
-            proc.arguments = ["run", modelName, "-o", outDir, "--json"]
-            if targetParams > 0 {
-                proc.arguments?.append(contentsOf: ["--target-params", String(format: "%.0f", targetParams)])
-            }
+            proc.currentDirectoryURL = destino.deletingLastPathComponent()
+            proc.arguments = argumentos(destino: destino.path)
 
         case .uvWrapper(let uvURL, let projectDir):
             proc.executableURL = uvURL
+            // `uv run` resolve o projeto a partir do diretório de trabalho, então
+            // aqui ele precisa ser o do repositório, não o do destino.
             proc.currentDirectoryURL = projectDir
-            proc.arguments = ["run", "aguardente", "run", modelName, "-o", outDir, "--json"]
-            if targetParams > 0 {
-                proc.arguments?.append(contentsOf: ["--target-params", String(format: "%.0f", targetParams)])
-            }
+            proc.arguments = ["run", "aguardente"] + argumentos(destino: destino.path)
 
         case .notFound(let hint):
             let errorMsg = "Binário aguardente não encontrado. Execute: \(hint)"
@@ -206,15 +254,21 @@ public final class PipelineRunner {
             return
         }
 
+        // Lançar antes de publicar a referência. Com `run()` dentro da tarefa
+        // destacada, um `cancel()` no intervalo chamava `terminate()` num
+        // processo ainda não lançado — exceção do Objective-C, que derruba o app.
+        do {
+            try proc.run()
+        } catch {
+            handleProcessError(error)
+            return
+        }
         self.process = proc
 
         streamTask = Task.detached { [weak self] in
+            let lines = pipe.fileHandleForReading.bytes.lines
+            let decoder = JSONDecoder()
             do {
-                try proc.run()
-                let fileHandle = pipe.fileHandleForReading
-                let lines = fileHandle.bytes.lines
-                let decoder = JSONDecoder()
-
                 for try await line in lines {
                     guard let data = line.data(using: .utf8) else { continue }
                     if let event = try? decoder.decode(PipelineEvent.self, from: data) {
@@ -223,14 +277,30 @@ public final class PipelineRunner {
                         await self?.apply(.log(id: "pipeline", message: line, level: "info"))
                     }
                 }
-
-                proc.waitUntilExit()
-                let exitCode = proc.terminationStatus
-                await self?.handleProcessTermination(exitCode: exitCode)
             } catch {
-                await self?.handleProcessError(error)
+                await self?.apply(.log(id: "pipeline",
+                                       message: "leitura da saída interrompida: \(error.localizedDescription)",
+                                       level: "warn"))
             }
+
+            proc.waitUntilExit()
+            let exitCode = proc.terminationStatus
+            await self?.handleProcessTermination(exitCode: exitCode)
         }
+    }
+
+    /// Argumentos do `aguardente run`.
+    ///
+    /// `--target-params` só entra quando o usuário pediu um alvo. Omitido, o
+    /// pipeline dimensiona pela RAM da máquina e pelo modelo escolhido, que é
+    /// o comportamento correto para qualquer modelo — inclusive os que não são
+    /// o padrão.
+    func argumentos(destino: String) -> [String] {
+        var args = ["run", modelName, "-o", destino, "--json"]
+        if let alvo = targetParams, alvo > 0 {
+            args.append(contentsOf: ["--target-params", String(format: "%.0f", alvo)])
+        }
+        return args
     }
 
     private func handleProcessTermination(exitCode: Int32) {
@@ -248,6 +318,9 @@ public final class PipelineRunner {
     }
 
     public func apply(_ event: PipelineEvent) {
+        lastEventAt = ContinuousClock.now
+        isStalled = false
+
         switch event {
         case .plan(let planStages):
             if !planStages.isEmpty {
