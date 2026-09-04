@@ -102,3 +102,30 @@ def test_401_na_listagem_e_nao_encontrado(monkeypatch):
 
     assert "não encontrado" in e.value.message
     assert "gated" not in e.value.message and "licença" not in (e.value.hint or "")
+
+
+def test_arquivo_vazio_sem_tamanho_remoto_conta_como_incompleto(tmp_path):
+    """Sem tamanho no índice, a verificação era pulada e um vazio passava."""
+    plano = FetchPlan(model_id="org/m", revision="main", dest=tmp_path,
+                      files=(RemoteFile(path="config.json", size=0),))
+    (tmp_path / "config.json").write_bytes(b"")
+
+    assert [f.path for f in plano.missing()] == ["config.json"]
+
+
+def test_arquivo_com_conteudo_sem_tamanho_remoto_conta_como_completo(tmp_path):
+    """Sem referência de tamanho, só o vazio é afirmável como incompleto."""
+    plano = FetchPlan(model_id="org/m", revision="main", dest=tmp_path,
+                      files=(RemoteFile(path="config.json", size=0),))
+    (tmp_path / "config.json").write_text("{}")
+
+    assert plano.missing() == ()
+
+
+def test_tamanho_divergente_conta_como_incompleto(tmp_path):
+    plano = FetchPlan(model_id="org/m", revision="main", dest=tmp_path,
+                      files=(RemoteFile(path="model.safetensors", size=100),))
+    (tmp_path / "model.safetensors").write_bytes(b"x" * 40)
+
+    assert [f.path for f in plano.missing()] == ["model.safetensors"]
+    assert plano.pending_bytes == 100

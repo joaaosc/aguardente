@@ -74,18 +74,25 @@ def test_nome_aceita_espaco_e_maiuscula():
 
 def test_disco_dos_logits_bate_com_a_estimativa_do_teacher():
     nivel = effort.get("high")
-    esperado, _ = estimate_logit_bytes(nivel.logit_batches * 2, nivel.seq_len,
+    esperado, _ = estimate_logit_bytes(nivel.logit_samples, nivel.seq_len,
                                        top_k=nivel.top_k)
-    assert nivel.logit_bytes(2) == esperado
+    assert nivel.logit_bytes() == esperado
 
 
 def test_disco_cresce_com_o_nivel():
-    tamanhos = [n.logit_bytes(2) for n in effort.LEVELS]
+    tamanhos = [n.logit_bytes() for n in effort.LEVELS]
     assert tamanhos == sorted(tamanhos)
 
 
+def test_amostras_derivam_do_lote_de_referencia():
+    """O nível fixa quantas amostras existem; o lote só decide como agrupá-las."""
+    nivel = effort.get("medium")
+    assert nivel.logit_samples == nivel.logit_batches * effort.LOTE_DE_REFERENCIA
+    assert nivel.calib_samples == nivel.calib_batches * effort.LOTE_DE_REFERENCIA
+
+
 def test_comparacao_cobre_todos_os_niveis():
-    linhas = list(effort.comparison(2))
+    linhas = list(effort.comparison())
     assert [l["name"] for l in linhas] == list(effort.NAMES)
     assert all(l["logit_bytes"] > 0 for l in linhas)
 

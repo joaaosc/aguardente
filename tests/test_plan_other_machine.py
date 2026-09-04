@@ -9,8 +9,11 @@ import pytest
 
 from aguardente.arch import Arch
 from aguardente.budget import GB, Machine
+from aguardente import effort
 from aguardente.cli import _secao_outra_maquina
 from aguardente.probe import ModelProbe
+
+NIVEL = effort.get(effort.DEFAULT)
 
 # Qwen3-4B real: piso de poda medido em 0,96 B, teto de treino de uma
 # máquina de 24 GB medido em 1,21 B — os dois números vêm de sessões
@@ -64,7 +67,7 @@ def test_machine_other_assume_apple_silicon():
 
 def test_maquina_24gb_bate_com_a_referencia_medida(espiao):
     """1,21 B é o número documentado para uma máquina de 24 GB — regressão."""
-    _secao_outra_maquina(QWEN3_4B, probe_de(QWEN3_4B, 4_022_468_096), 24, 480, None)
+    _secao_outra_maquina(QWEN3_4B, probe_de(QWEN3_4B, 4_022_468_096), 24, 480, None, NIVEL)
     teto = valor_de(espiao, "teto de treino")
     assert "1,2" in teto or "1.2" in teto
 
@@ -73,14 +76,14 @@ def test_maquina_24gb_bate_com_a_referencia_medida(espiao):
 
 
 def test_maquina_grande_permite_destilacao(espiao):
-    _secao_outra_maquina(QWEN3_4B, probe_de(QWEN3_4B, 4_022_468_096), 24, 480, None)
+    _secao_outra_maquina(QWEN3_4B, probe_de(QWEN3_4B, 4_022_468_096), 24, 480, None, NIVEL)
     assert valor_de(espiao, "destilação (recuperação)") == "viável"
     assert not any(r == "piso de poda" for r, _, _ in espiao)
 
 
 def test_maquina_pequena_recusa_destilacao_e_diz_o_motivo(espiao):
     """0,96 B é o piso de poda documentado do Qwen3-4B — regressão cruzada."""
-    _secao_outra_maquina(QWEN3_4B, probe_de(QWEN3_4B, 4_022_468_096), 8, 20, None)
+    _secao_outra_maquina(QWEN3_4B, probe_de(QWEN3_4B, 4_022_468_096), 8, 20, None, NIVEL)
 
     assert valor_de(espiao, "destilação (recuperação)") == "inviável"
     piso = valor_de(espiao, "piso de poda")
@@ -92,7 +95,7 @@ def test_maquina_pequena_recusa_destilacao_e_diz_o_motivo(espiao):
 def test_target_params_explicito_e_respeitado(espiao):
     """Um alvo pedido pelo usuário vale mais que o teto da máquina."""
     _secao_outra_maquina(QWEN3_4B, probe_de(QWEN3_4B, 4_022_468_096), 24, 480,
-                         500_000_000)
+                         500_000_000, NIVEL)
     # 500 M é menor que o piso de poda (0,96 B): mesmo numa máquina grande,
     # esse alvo específico não é alcançável.
     assert valor_de(espiao, "destilação (recuperação)") == "inviável"
@@ -103,7 +106,7 @@ def test_target_params_explicito_e_respeitado(espiao):
 
 def test_disco_insuficiente_e_recusado_com_o_que_falta(espiao):
     # Qwen3-4B em fp16 já são ~7,5 GB só de download; 3 GB não bastam.
-    _secao_outra_maquina(QWEN3_4B, probe_de(QWEN3_4B, 4_022_468_096), 24, 3, None)
+    _secao_outra_maquina(QWEN3_4B, probe_de(QWEN3_4B, 4_022_468_096), 24, 3, None, NIVEL)
 
     assert valor_de(espiao, "conversão (poda + export)") == "inviável"
     motivo = nota_de(espiao, "conversão (poda + export)")
@@ -111,16 +114,33 @@ def test_disco_insuficiente_e_recusado_com_o_que_falta(espiao):
 
 
 def test_disco_generoso_e_aceito(espiao):
-    _secao_outra_maquina(QWEN3_4B, probe_de(QWEN3_4B, 4_022_468_096), 24, 480, None)
+    _secao_outra_maquina(QWEN3_4B, probe_de(QWEN3_4B, 4_022_468_096), 24, 480, None, NIVEL)
     assert valor_de(espiao, "conversão (poda + export)") == "viável"
 
 
-def test_estimativa_de_disco_soma_download_e_bundle(espiao):
-    _secao_outra_maquina(QWEN3_4B, probe_de(QWEN3_4B, 4_022_468_096), 24, 480, None)
+def test_estimativa_de_disco_soma_download_bundle_e_logits(espiao):
+    _secao_outra_maquina(QWEN3_4B, probe_de(QWEN3_4B, 4_022_468_096), 24, 480, None, NIVEL)
     nota = nota_de(espiao, "disco no pico (estimado)")
     assert "download" in nota and "bundle" in nota
+    # Os logits costumam ser o maior artefato do pipeline: omiti-los anunciava
+    # "viável" para máquinas onde a execução real aborta por falta de disco.
+    assert "logits" in nota and NIVEL.name in nota
     # Modelo de texto puro: a etapa de extração não deveria aparecer.
     assert "extração" not in nota
+
+
+def test_esforco_maior_aumenta_o_pico_de_disco(espiao):
+    """O disco dos logits cresce com o nível, e a conta precisa refletir isso."""
+    from aguardente import effort
+
+    _secao_outra_maquina(QWEN3_4B, probe_de(QWEN3_4B, 4_022_468_096), 24, 480, None,
+                         effort.get("low"))
+    baixo = nota_de(espiao, "disco no pico (estimado)")
+    espiao.clear()
+    _secao_outra_maquina(QWEN3_4B, probe_de(QWEN3_4B, 4_022_468_096), 24, 480, None,
+                         effort.get("max"))
+    alto = nota_de(espiao, "disco no pico (estimado)")
+    assert baixo != alto
 
 
 def test_modelo_multimodal_soma_a_extracao(espiao, monkeypatch):
@@ -130,7 +150,7 @@ def test_modelo_multimodal_soma_a_extracao(espiao, monkeypatch):
     p = probe_de(QWEN3_4B, 4_022_468_096)
     monkeypatch.setattr(type(p), "is_multimodal", property(lambda self: True))
     monkeypatch.setattr(type(p), "text_params", property(lambda self: 3_000_000_000))
-    _secao_outra_maquina(QWEN3_4B, p, 24, 480, None)
+    _secao_outra_maquina(QWEN3_4B, p, 24, 480, None, NIVEL)
 
     nota = nota_de(espiao, "disco no pico (estimado)")
     assert "extração" in nota

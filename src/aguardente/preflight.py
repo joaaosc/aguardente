@@ -264,16 +264,22 @@ def check_arch() -> CheckResult:
     return CheckResult("arquitetura", Status.OK, m)
 
 
-def check_pipeline_deps() -> CheckResult:
-    """Verifica se os pacotes opcionais de execução do pipeline estão instalados."""
-    missing = [m for m in ("torch", "transformers", "coreai_torch", "coreai_opt")
-               if importlib.util.find_spec(m) is None]
+def check_pipeline_deps(*, deep: bool = False) -> CheckResult:
+    """Verifica se os pacotes opcionais de execução do pipeline estão instalados.
+
+    Com `deep`, importa cada pacote para detectar uma instalação presente mas
+    quebrada — é o que o `doctor` quer saber. Sem ele, só `torch` é importado,
+    porque importar `transformers` custa segundos e centenas de MB que ficam
+    residentes por toda a execução, na mesma RAM que o orçamento raciona.
+    """
+    modules = ("torch", "transformers", "coreai_torch", "coreai_opt")
+    missing = [m for m in modules if importlib.util.find_spec(m) is None]
     if missing:
         return CheckResult("stack do pipeline", Status.WARN, f"faltam: {', '.join(missing)}",
                            "Instale as dependências completas com: aguardente install")
 
     loaded = {}
-    for module in ("torch", "transformers", "coreai_torch", "coreai_opt"):
+    for module in (modules if deep else ("torch",)):
         try:
             loaded[module] = importlib.import_module(module)
         except Exception as exc:  # noqa: BLE001 — diagnóstico de dependência quebrada
@@ -316,13 +322,13 @@ def check_resources(required_disk_bytes: int = 0, *, path: str | Path = "/") -> 
 
 
 def run_all(*, required_disk_bytes: int = 0, include_pipeline: bool = True,
-            path: str | Path = "/") -> list[CheckResult]:
+            deep_pipeline: bool = False, path: str | Path = "/") -> list[CheckResult]:
     checks: list[Callable[[], CheckResult]] = [
         check_macos, check_xcode, check_coreai_build, check_aria2,
         check_python, check_arch,
     ]
     if include_pipeline:
-        checks.append(check_pipeline_deps)
+        checks.append(lambda: check_pipeline_deps(deep=deep_pipeline))
     results = [c() for c in checks]
     results.extend(check_resources(required_disk_bytes, path=path))
     return results

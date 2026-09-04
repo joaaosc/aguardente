@@ -1,0 +1,194 @@
+import Testing
+import Foundation
+@testable import AguardenteApp
+
+@Suite("PipelineRunner Tests")
+@MainActor
+struct PipelineRunnerTests {
+
+    @Test("Aplica eventos sequencialmente no PipelineRunner")
+    func testApplyEvents() {
+        let runner = PipelineRunner()
+        #expect(runner.stages.count == 5)
+        #expect(runner.phase == .idle)
+
+        // 1. Início de etapa
+        runner.apply(.stageStart(id: "fetch", n: 1, of: 5, rationale: "Baixando"))
+        #expect(runner.activeStageID == "fetch")
+        #expect(runner.stage("fetch")?.state == .running)
+        #expect(runner.stage("fetch")?.rationale == "Baixando")
+
+        // 2. Progresso
+        runner.apply(.progress(id: "fetch", current: 50, total: 100))
+        #expect(runner.stage("fetch")?.progress == 0.5)
+
+        // 3. Log
+        runner.apply(.log(id: "fetch", message: "Conectado", level: "info"))
+        #expect(runner.stage("fetch")?.log.count == 1)
+        #expect(runner.stage("fetch")?.log.first?.text == "Conectado")
+
+        // 4. Métrica
+        runner.apply(.metric(id: "fetch", key: "bytes", value: 8.5e9, unit: "B"))
+        #expect(runner.stage("fetch")?.metrics.count == 1)
+
+        // 5. Conclusão da etapa
+        runner.apply(.stageEnd(id: "fetch", ok: true, ms: 1500))
+        #expect(runner.stage("fetch")?.state == .ok)
+        #expect(runner.stage("fetch")?.duration == .milliseconds(1500))
+        #expect(runner.completedCount == 1)
+    }
+
+    @Test("Alternar a partir de pausado retoma a execução em vez de reiniciá-la")
+    func testTogglePausedResumes() {
+        let runner = PipelineRunner()
+        runner.loadDemoStages()
+        #expect(runner.isRunning)
+
+        runner.toggle()
+        #expect(runner.phase == .paused)
+
+        runner.toggle()
+        #expect(runner.phase == .running)
+
+        // As etapas já concluídas sobrevivem: retomar não é recomeçar do zero.
+        #expect(runner.stages.count == 5)
+        #expect(runner.stage("prune")?.state == .ok)
+        #expect(runner.activeStageID == "recover")
+    }
+
+    @Test("Parar registra interrupção deliberada, não falha")
+    func testCancelIsNotAFailure() {
+        let runner = PipelineRunner()
+        runner.loadDemoStages()
+
+        runner.cancel()
+        #expect(runner.phase == .cancelled)
+        #expect(runner.phase.description == "Interrompido")
+        #expect(runner.phase.isActive == false)
+    }
+
+    @Test("isActive distingue processo vivo de execução encerrada")
+    func testPhaseIsActive() {
+        #expect(PipelineRunner.Phase.running.isActive)
+        #expect(PipelineRunner.Phase.paused.isActive)
+        #expect(!PipelineRunner.Phase.idle.isActive)
+        #expect(!PipelineRunner.Phase.cancelled.isActive)
+        #expect(!PipelineRunner.Phase.finished(ok: true).isActive)
+        #expect(!PipelineRunner.Phase.failed("erro").isActive)
+    }
+
+    @Test("Carregamento de dados de demonstração")
+    func testDemoData() {
+        let runner = PipelineRunner()
+        runner.loadDemoStages()
+
+        #expect(runner.stages.count == 5)
+        #expect(runner.activeStageID == "recover")
+        #expect(runner.isRunning == true)
+        #expect(runner.stage("prune")?.state == .ok)
+        #expect(runner.stage("recover")?.state == .running)
+        #expect(runner.stage("export")?.state == .pending)
+    }
+}
+
+@Suite("Configuração da execução")
+@MainActor
+struct ConfiguracaoTests {
+
+    @Test("Sem alvo informado, --target-params não é enviado")
+    func semAlvoNaoEnviaFlag() {
+        let runner = PipelineRunner()
+        runner.modelName = "org/qualquer-modelo"
+        runner.targetParams = nil
+
+        let args = runner.argumentos(destino: "/tmp/saida")
+
+        #expect(!args.contains("--target-params"))
+        #expect(args.contains("org/qualquer-modelo"))
+        #expect(args.contains("--json"))
+    }
+
+    @Test("Com alvo informado, o valor vai como inteiro")
+    func comAlvoEnviaValor() {
+        let runner = PipelineRunner()
+        runner.targetParams = 1.44e9
+
+        let args = runner.argumentos(destino: "/tmp/saida")
+
+        let indice = args.firstIndex(of: "--target-params")
+        #expect(indice != nil)
+        #expect(args[indice! + 1] == "1440000000")
+    }
+
+    @Test("Alvo zero equivale a automático")
+    func alvoZeroEAutomatico() {
+        let runner = PipelineRunner()
+        runner.targetParams = 0
+
+        #expect(!runner.argumentos(destino: "/tmp/saida").contains("--target-params"))
+    }
+
+    @Test("O destino informado chega ao comando")
+    func destinoChegaAoComando() {
+        let runner = PipelineRunner()
+        let args = runner.argumentos(destino: "/Users/alguem/Documents/Aguardente")
+
+        let indice = args.firstIndex(of: "-o")
+        #expect(indice != nil)
+        #expect(args[indice! + 1] == "/Users/alguem/Documents/Aguardente")
+    }
+
+    @Test("O destino padrão é absoluto")
+    func destinoPadraoEAbsoluto() {
+        #expect(Preferences.destinoPadrao.hasPrefix("/"))
+    }
+}
+
+@Suite("Caminho de controle")
+@MainActor
+struct ControleTests {
+
+    @Test("Encerramento não sobrescreve uma parada deliberada")
+    func encerramentoNaoSobrescreveCancelamento() {
+        let runner = PipelineRunner()
+        runner.cancel()
+        #expect(runner.phase == .cancelled)
+
+        runner.concluirParaTeste(exitCode: 15)
+
+        #expect(runner.phase == .cancelled)
+    }
+
+    @Test("Encerramento não sobrescreve o motivo vindo do pipeline")
+    func encerramentoNaoSobrescreveErroDoPipeline() {
+        let runner = PipelineRunner()
+        runner.apply(.error(id: "prune", message: "o alvo excede o teto", hint: "reduza"))
+        #expect(runner.phase == .failed("o alvo excede o teto"))
+
+        runner.concluirParaTeste(exitCode: 1)
+
+        #expect(runner.phase == .failed("o alvo excede o teto"))
+    }
+
+    @Test("Sem diretório de projeto, o wrapper uv não é oferecido")
+    func semProjetoNaoOfereceWrapper() {
+        // O diretório de trabalho de um .app aberto pelo Finder é `/`; devolver
+        // um uvWrapper apontando para lá seria prometer um caminho que falha.
+        if case .uvWrapper = BinaryResolver.resolve(projectDirectory: nil) {
+            Issue.record("uvWrapper devolvido sem diretório de projeto")
+        }
+    }
+
+    @Test("O log descarta em blocos ao passar do teto")
+    func logDescartaEmBlocos() {
+        let etapa = Stage(id: "x", title: "X")
+        for i in 0..<120 {
+            etapa.appendCappedLog(LogLine(text: "linha \(i)"), limit: 100)
+        }
+        // Aparado para 90 no primeiro estouro, e só voltaria a aparar na 101ª
+        // linha seguinte — não uma remoção por linha.
+        #expect(etapa.log.count <= 100)
+        #expect(etapa.log.count >= 90)
+        #expect(etapa.log.last?.text == "linha 119")
+    }
+}

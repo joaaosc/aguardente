@@ -6,7 +6,6 @@ import json
 import math
 import time
 from dataclasses import asdict, dataclass, field
-from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -140,7 +139,12 @@ def recover(
         estado = _load_checkpoint(ckpt, student, optimizer, device=dev)
         result.steps = result.resumed_from = estado["step"]
         lotes_feitos = estado["lotes_feitos"]
-        best, stale = estado["best"], estado["stale"]
+        # `best` volta porque é o piso de perplexidade já alcançado. `stale`
+        # não: um treino que parou por platô salvou o contador estourado, e
+        # restaurá-lo encerraria a retomada na primeira avaliação — inclusive
+        # quando foi justamente a taxa de aprendizado que mudou para escapar
+        # do platô. Cada execução merece a paciência inteira.
+        best = estado["best"]
         epoca_inicial = lotes_feitos // max(1, logits.shards)
 
     started = time.perf_counter()
@@ -151,21 +155,32 @@ def recover(
             _save_checkpoint_resumavel(student, optimizer, ckpt, result.steps,
                                        lotes_feitos, best, stale)
 
+    # Lotes acumulados desde o último passo do otimizador. É contado à parte de
+    # `lotes_feitos` — que é a posição global e nunca recua — porque um passo
+    # residual (fim de época, tempo esgotado, platô, Ctrl-C) fecha a janela de
+    # acumulação sem alinhar a posição global a um múltiplo de `grad_accum`.
+    # Derivar a janela de `lotes_feitos % grad_accum` faria a época seguinte
+    # disparar o primeiro passo com menos lotes do que o configurado.
+    pendentes = 0
+
+    def _aplica_passo() -> None:
+        nonlocal pendentes
+        torch.nn.utils.clip_grad_norm_(student.parameters(), cfg.max_grad_norm)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        result.steps += 1
+        pendentes = 0
+
     def _flush_gradientes() -> None:
-        if lotes_feitos % cfg.grad_accum != 0:
-            torch.nn.utils.clip_grad_norm_(student.parameters(), cfg.max_grad_norm)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            result.steps += 1
+        if pendentes:
+            _aplica_passo()
 
     try:
         for epoch in range(epoca_inicial, cfg.epochs):
             # Só a época em que o treino parou pula lotes; as seguintes
             # começam do zero normalmente.
             pular = lotes_feitos - epoch * logits.shards if epoch == epoca_inicial else 0
-            fluxo = logits.batches(device=dev)
-            if pular > 0:
-                fluxo = islice(fluxo, pular, None)
+            fluxo = logits.batches(device=dev, start=pular)
 
             for i, batch in enumerate(fluxo, start=pular):
                 lr = _lr_at(result.steps, total_steps, cfg)
@@ -191,12 +206,10 @@ def recover(
 
                 (loss / cfg.grad_accum).backward()
                 lotes_feitos += 1
+                pendentes += 1
 
-                if lotes_feitos % cfg.grad_accum == 0:
-                    torch.nn.utils.clip_grad_norm_(student.parameters(), cfg.max_grad_norm)
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    result.steps += 1
+                if pendentes >= cfg.grad_accum:
+                    _aplica_passo()
                     if cfg.checkpoint_every and result.steps % cfg.checkpoint_every == 0:
                         _checkpoint_automatico()
 
@@ -247,8 +260,14 @@ def _finish(result: RecoveryResult, started: float, student: Any,
     student.eval()
     if hasattr(student, "config"):
         student.config.use_cache = True
-    # Restaura o melhor modelo registrado durante as avaliações, se houver
-    if ckpt and (ckpt / "best.pt").is_file():
+    # Restaura o melhor modelo registrado durante as avaliações, se houver.
+    # Um `best.pt` só pertence a este treino quando ele mesmo o gravou (há
+    # avaliações registradas) ou quando esta execução é a continuação de outra
+    # (retomada de checkpoint). Um treino que começou do zero e nunca avaliou
+    # nada encontraria ali os pesos de uma execução anterior, e carregá-los
+    # descartaria em silêncio tudo o que acabou de treinar.
+    proprio = bool(result.evals) or result.resumed_from > 0
+    if ckpt and proprio and (ckpt / "best.pt").is_file():
         import torch
         dev = next(student.parameters()).device
         blob = torch.load(ckpt / "best.pt", map_location=dev, weights_only=True)
@@ -315,7 +334,18 @@ def _load_checkpoint(ckpt: Path, student: Any, optimizer: Any, *, device: str) -
     import torch
 
     blob = torch.load(ckpt / "last.pt", map_location=device, weights_only=True)
-    student.load_state_dict(blob["state_dict"], assign=False)
+    try:
+        student.load_state_dict(blob["state_dict"], assign=False)
+    except RuntimeError as e:
+        raise AguardenteError(
+            f"o checkpoint em {ckpt / 'last.pt'} não corresponde ao student atual",
+            hint="O checkpoint foi gravado por um student de outro formato — outro "
+                 "alvo de parâmetros, outro modelo de origem. Apague o diretório de "
+                 "checkpoints ou use --restart para começar a recuperação do zero.",
+        ) from e
     optimizer.load_state_dict(blob["optimizer_state"])
+    # `stale` continua sendo gravado, porque documenta por que a execução
+    # anterior parou, mas não é devolvido: restaurá-lo encerrava a retomada na
+    # primeira avaliação. Ver o comentário em `recover`.
     return {"step": blob["step"], "lotes_feitos": blob["lotes_feitos"],
-           "best": blob["best"], "stale": blob["stale"]}
+            "best": blob["best"]}

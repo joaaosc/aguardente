@@ -34,3 +34,7 @@ packages = ["src/aguardente"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Alguns testes importam fixtures de módulos irmãos (`from tests.test_... import`),
+# o que exige a raiz no sys.path. Sem isto a coleta falha inteira quando o pytest
+# roda fora de um ambiente com o pacote instalado em modo editável.
+pythonpath = ["."]

@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>pt_BR</string>
+	<key>CFBundleExecutable</key>
+	<string>aguardente-app</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.joaaosc.aguardente</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Aguardente</string>
+	<key>CFBundleDisplayName</key>
+	<string>Aguardente</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<!-- Os dois valores abaixo são reescritos por scripts/build-app.sh a partir
+	     do pacote Python e da contagem de commits. Editá-los aqui não tem
+	     efeito: a versão tem uma fonte só, `src/aguardente/__init__.py`. -->
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>0</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<!-- A destilação roda a partir do macOS 14. Só a conversão Core AI exige um
+	     sistema mais novo, e essa barreira é verificada em execução, não aqui:
+	     recusar a instalação inteira por causa da última etapa impediria o uso
+	     nas máquinas em que as demais etapas funcionam. -->
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 João Pedro Costa. Licença de uso restrito.</string>
+
+	<!-- O pipeline grava modelos, logits e bundles no destino escolhido pelo
+	     usuário. Sem App Sandbox, o TCC ainda pede consentimento quando esse
+	     destino cai numa pasta protegida; estas descrições são o texto exibido. -->
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>O Aguardente grava os modelos convertidos no destino que você escolher.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>O Aguardente grava os modelos convertidos no destino que você escolher.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>O Aguardente grava os modelos convertidos no destino que você escolher.</string>
+</dict>
+</plist>

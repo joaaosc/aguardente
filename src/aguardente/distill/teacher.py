@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
@@ -33,11 +34,17 @@ class TeacherLogits:
         return cls(path=p, top_k=meta["top_k"], shards=meta["shards"],
                    samples=meta["samples"], seq_len=meta["seq_len"])
 
-    def batches(self, *, device: str | None = None) -> Iterator[dict[str, "torch.Tensor"]]:
-        """Itera sobre os shards armazenados em ordem."""
+    def batches(self, *, device: str | None = None,
+                start: int = 0) -> Iterator[dict[str, "torch.Tensor"]]:
+        """Itera sobre os shards armazenados em ordem, a partir de `start`.
+
+        Retomar pulando com `islice` custaria uma leitura de disco e uma
+        transferência para o dispositivo por shard descartado; começar o
+        `range` adiante não lê nada do que já foi treinado.
+        """
         import torch
 
-        for i in range(self.shards):
+        for i in range(max(0, start), self.shards):
             blob = torch.load(self.path / f"{i:06d}.pt", map_location="cpu",
                               weights_only=True)
             if device:
@@ -72,31 +79,48 @@ def precompute_logits(
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
+    # Shards de uma execução anterior só podem ser reaproveitados se tiverem sido
+    # gerados com o mesmo top-k. O manifesto é a única fonte confiável disso: sem
+    # essa checagem, mudar `--top-k` reaproveitaria silenciosamente logits com K
+    # antigo enquanto o manifesto passaria a anunciar o K novo.
+    reaproveita = True
+    manifesto_antigo = out / _MANIFEST
+    if manifesto_antigo.is_file():
+        try:
+            gravado = json.loads(manifesto_antigo.read_text()).get("top_k")
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            gravado = None
+        if gravado is not None and int(gravado) != int(top_k):
+            reaproveita = False
+
     was_training = teacher.training
     teacher.eval()
     shards = samples = seq_len = 0
 
     try:
         with torch.no_grad():
-            for i, batch in enumerate(batches):
-                if max_batches is not None and i >= max_batches:
-                    break
+            for i, batch in enumerate(islice(batches, max_batches)):
                 shard_path = out / f"{i:06d}.pt"
                 input_ids = batch["input_ids"]
-                if shard_path.is_file() and shard_path.stat().st_size > 0:
+                if reaproveita and shard_path.is_file() and shard_path.stat().st_size > 0:
                     shards += 1
                     samples += int(input_ids.size(0))
                     seq_len = int(input_ids.size(1))
+                    if on_progress:
+                        on_progress(shards)
                     continue
 
                 logits = teacher(**batch).logits
-                if not torch.isfinite(logits).all():
+                k = min(top_k, logits.size(-1))
+                values, indices = logits.topk(k, dim=-1)
+                # `topk` ordena NaN acima de qualquer número finito e preserva ±Inf,
+                # então checar os k valores selecionados detecta a mesma corrupção
+                # que varrer [B, T, V] inteiro, a uma fração do custo.
+                if not torch.isfinite(values).all():
                     raise AguardenteError(
                         "o modelo teacher produziu valores não finitos (NaN ou Inf) durante a geração de logits",
                         hint="Verifique se os pesos do modelo original ou o dispositivo estão corrompendo os tensores.",
                     )
-                k = min(top_k, logits.size(-1))
-                values, indices = logits.topk(k, dim=-1)
 
                 payload = {
                     "input_ids": input_ids.detach().cpu(),
@@ -123,6 +147,9 @@ def precompute_logits(
 
     meta = {"top_k": top_k, "shards": shards, "samples": samples, "seq_len": seq_len}
     tmp_manifest = out / f"{_MANIFEST}.tmp"
-    tmp_manifest.write_text(json.dumps(meta, indent=2))
-    tmp_manifest.replace(out / _MANIFEST)
+    try:
+        tmp_manifest.write_text(json.dumps(meta, indent=2))
+        tmp_manifest.replace(out / _MANIFEST)
+    finally:
+        tmp_manifest.unlink(missing_ok=True)
     return TeacherLogits(path=out, **meta)

@@ -196,7 +196,9 @@ Levantamento do estado atual do projeto. Itens ~~tachados com ✅~~ já foram co
 - O macOS não falha imediatamente sob pressão de memória, ele pagina. Uma execução acima do orçamento tende a ficar ordens de grandeza mais lenta em vez de abortar, e o sintoma é difícil de atribuir ao alvo escolhido.
 - Um download interrompido de `xcodebuild -downloadComponent MetalToolchain` pode deixar `xcrun --find coreai-build` bem-sucedido com o componente incompleto. O diagnóstico aprovaria o ambiente e a falha só apareceria na compilação.
 - A verificação de versão do Xcode aceita qualquer `27.x`, incluindo betas em que o Metal Toolchain ainda não está disponível. Na prática a verificação de `coreai-build` cobre o caso, mas o diagnóstico de versão sozinho não distingue.
-- Não foram auditados: `fetch.py` além de `require_aria2` (retomada, verificação de integridade, modelos de acesso restrito), `probe.py` e a poda estruturada em `prune`.
+- A integridade dos arquivos baixados é conferida por tamanho, não por checksum. O índice do Hugging Face publica o SHA-256 dos arquivos LFS; confrontá-lo detectaria uma corrupção que coincida com o tamanho esperado.
+- `probe.py` decide se um modelo é aceito e como seus parâmetros são contados, e tem a cobertura de testes mais fina do projeto (dois casos). Um config inesperado tende a falhar tarde, já dentro da execução.
+- Não foi executada uma conversão completa pela interface gráfica. O caminho CLI → NDJSON → interface está coberto por testes dos dois lados, mas nenhuma execução real de ponta a ponta foi observada.
 
 ### Corrigidos
 

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Sem App Sandbox de propósito.
+	     O app executa o CLI `aguardente` como processo filho, que por sua vez
+	     baixa dezenas de GB com aria2c e grava em diretórios escolhidos pelo
+	     usuário. Nada disso cabe no App Sandbox sem reescrever a arquitetura de
+	     execução, e é o que descarta a Mac App Store como canal — a distribuição
+	     é por Developer ID com notarização.
+
+	     O Hardened Runtime (exigido pela notarização) é ligado por `codesign -o
+	     runtime` no script de build, não aqui. Este arquivo fica deliberadamente
+	     mínimo: cada exceção ao Hardened Runtime é uma exceção a explicar na
+	     revisão de notarização, e o app não precisa de nenhuma. Executar um
+	     processo filho não exige entitlement — o filho é avaliado por si. -->
+</dict>
+</plist>

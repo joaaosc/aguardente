@@ -40,6 +40,14 @@ def kd_loss(
         raise ValueError(f"alpha deve estar no intervalo [0.0, 1.0], recebido {alpha}")
 
     if labels is not None:
+        # O alinhamento causal consome uma posição; com T < 2 não sobra nenhuma
+        # transição t -> t + 1 e as reduções abaixo operariam sobre tensores
+        # vazios, devolvendo NaN em vez de uma perda.
+        if student_logits.size(1) < 2:
+            raise ValueError(
+                "o alinhamento causal exige pelo menos 2 posições de sequência, "
+                f"recebido {student_logits.size(1)}"
+            )
         # Alinhamento causal para predição de próximo token:
         # a posição t prediz o token t + 1.
         s_logits = student_logits[:, :-1].contiguous()
@@ -70,7 +78,8 @@ def kd_loss(
     kl_per_token = F.kl_div(s_logp, t_prob, reduction="none").sum(dim=-1).clamp(min=0.0)
 
     if s_mask is not None:
-        loss_kd = (kl_per_token * s_mask.float()).sum() / s_mask.float().sum().clamp(min=1.0)
+        pesos = s_mask.to(kl_per_token.dtype)
+        loss_kd = (kl_per_token * pesos).sum() / pesos.sum().clamp(min=1.0)
     else:
         loss_kd = kl_per_token.mean()
 
@@ -81,9 +90,9 @@ def kd_loss(
         return loss_kd
 
     if s_mask is not None:
-        s_labels = s_labels.masked_fill(~s_mask.bool(), ignore_index)
+        s_labels = s_labels.masked_fill(~s_mask, ignore_index)
 
-    if (s_labels != ignore_index).sum() == 0:
+    if not bool((s_labels != ignore_index).any()):
         loss_ce = torch.tensor(0.0, device=student_logits.device, dtype=torch.float32)
     else:
         loss_ce = F.cross_entropy(
