@@ -136,6 +136,10 @@ fi
 if [ "$assinar" -eq 1 ]; then
 	IDENTIDADE="$(resolver_identidade)"
 	passo "Assinando com '$IDENTIDADE'"
+	# Uma assinatura que falha no meio deixaria em `dist/` um bundle montado e
+	# não assinado, indistinguível de um pronto para distribuir. Melhor não
+	# deixar artefato nenhum do que deixar um que engana.
+	trap 'rm -rf "$BUNDLE"; echo "assinatura falhou — bundle descartado" >&2' ERR
 	# `-o runtime` liga o Hardened Runtime, que a notarização exige.
 	codesign --force --deep --timestamp -o runtime \
 		--entitlements app/Resources/Aguardente.entitlements \
@@ -146,6 +150,7 @@ if [ "$assinar" -eq 1 ]; then
 	# Antes da notarização o Gatekeeper ainda recusa: é o esperado, e é
 	# exatamente isso que o passo seguinte resolve.
 	spctl --assess --type execute --verbose=4 "$BUNDLE" || true
+	trap - ERR
 else
 	passo "Pulando a assinatura (--no-sign)"
 fi
