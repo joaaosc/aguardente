@@ -50,7 +50,7 @@ public struct RootView: View {
                 }
             }
 
-            ToolbarSpacer(.flexible)
+            espacador(.flexivel)
 
             ToolbarItemGroup {
                 Button {
@@ -72,7 +72,7 @@ public struct RootView: View {
                 .help("Encerra o pipeline em execução")
             }
 
-            ToolbarSpacer(.fixed)
+            espacador(.fixo)
 
             ToolbarItem {
                 Button {
@@ -83,7 +83,7 @@ public struct RootView: View {
                 .help(isLogVisible ? "Oculta o log da etapa" : "Mostra o log da etapa")
             }
 
-            ToolbarSpacer(.fixed)
+            espacador(.fixo)
 
             ToolbarItem {
                 Menu {
@@ -112,6 +112,24 @@ public struct RootView: View {
         } message: {
             Text("O progresso exibido e os registros desta execução são descartados. "
                  + "Os arquivos já gravados em \(runner.outDir) permanecem no disco.")
+        }
+    }
+
+    private enum Espaco { case flexivel, fixo }
+
+    /// Separador de barra de ferramentas, quando o sistema o oferece.
+    ///
+    /// `ToolbarSpacer` só existe a partir do macOS 26. Ele agrupa os botões em
+    /// blocos visuais, e é a única razão pela qual a interface exigiria um
+    /// sistema recente — o resto funciona desde o macOS 14. Ausente o
+    /// separador, a barra continua completa, apenas sem os intervalos.
+    @ToolbarContentBuilder
+    private func espacador(_ tipo: Espaco) -> some ToolbarContent {
+        if #available(macOS 26.0, *) {
+            switch tipo {
+            case .flexivel: ToolbarSpacer(.flexible)
+            case .fixo: ToolbarSpacer(.fixed)
+            }
         }
     }
 

@@ -25,8 +25,12 @@
 	<string>0</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
+	<!-- A destilação roda a partir do macOS 14. Só a conversão Core AI exige um
+	     sistema mais novo, e essa barreira é verificada em execução, não aqui:
+	     recusar a instalação inteira por causa da última etapa impediria o uso
+	     nas máquinas em que as demais etapas funcionam. -->
 	<key>LSMinimumSystemVersion</key>
-	<string>26.0</string>
+	<string>14.0</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.developer-tools</string>
 	<key>NSHighResolutionCapable</key>

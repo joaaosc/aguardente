@@ -47,6 +47,24 @@ public struct StageDetail: View {
                         .foregroundStyle(.orange)
                 }
 
+                // A conversão Core AI é a única etapa que exige um sistema mais
+                // novo que o mínimo do aplicativo. Dizer isso aqui, antes de
+                // executar, evita horas de destilação seguidas de uma falha na
+                // última etapa.
+                if stage.id == CoreAIDisponibilidade.etapaDependente,
+                   !CoreAIDisponibilidade.suportada {
+                    Label {
+                        Text(CoreAIDisponibilidade.motivo)
+                    } icon: {
+                        Image(systemName: "exclamationmark.circle.fill")
+                    }
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+                }
+
                 if !stage.metrics.isEmpty {
                     StageMetrics(metrics: stage.metrics)
                 }
