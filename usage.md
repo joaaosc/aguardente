@@ -290,9 +290,13 @@ loss = α · KL(softmax(student_topk / T) ‖ softmax(teacher_topk / T)) · T² 
 
 O laço de treino usa AdamW, taxa de aprendizado com warmup linear seguido de decaimento por cosseno, acumulação de gradiente, `clip_grad_norm_`, avaliação periódica de perplexidade com parada antecipada por platô, e checkpoint automático — pesos, estado do otimizador e a posição exata no fluxo de lotes, retomável sem repetir trabalho.
 
+Em MPS os pesos ficam em `bfloat16`, não em `float16`: o treino atualiza os pesos no próprio dtype do modelo e o AdamW divide pela raiz do segundo momento, que em `float16` subborda para zero e manda todos os pesos para infinito no primeiro passo. A perda é conferida a cada lote e os pesos são conferidos ao final do treino: um student com infinito ou NaN aborta a etapa em vez de seguir para a exportação.
+
 ### export
 
-`export` chama o exportador oficial da Apple, `coreai.llm.export`, como subprocesso — localizado direto no PATH ou, quando só o módulo `coreai_models` está instalado, via `uv run coreai.llm.export`. Os argumentos controlam plataforma (`macOS`), compressão (`4bit` por padrão: int4 por bloco de 32 valores, ~4,50 bits por peso), precisão de computação (`float16`) e comprimento máximo de contexto; `--export-dry-run` valida esses argumentos sem gravar o bundle.
+`export` chama o exportador oficial da Apple, `coreai.llm.export`, como subprocesso — procurado primeiro no diretório do interpretador em execução (instalado como ferramenta `uv`, o exportador divide o ambiente com o `aguardente` sem aparecer no PATH do usuário), depois no PATH e, por último, via `uv run coreai.llm.export`. Os argumentos controlam plataforma (`macOS`), compressão (`4bit` por padrão: int4 por bloco de 32 valores, ~4,50 bits por peso), precisão de computação (`float16`) e comprimento máximo de contexto; `--export-dry-run` valida esses argumentos sem gravar o bundle.
+
+O exportador aceita apenas um nome curto do registro da Apple ou um identificador do Hugging Face — o caminho de um diretório vai direto para `snapshot_download`, que o rejeita. Um modelo podado e destilado aqui não existe no Hub, então a etapa monta um cache do Hub num diretório temporário, com os arquivos do modelo ligados por symlink na posição de um snapshot, e roda o exportador em modo offline apontado para esse cache. Nada é copiado e nada sai da máquina.
 
 O resultado é um diretório com `metadata.json` e o pacote `.aimodel`. A partir dele, `xcrun coreai-build inspect` examina o modelo exportado e `xcrun coreai-build compile` gera a versão compilada AOT (`.aimodelc`) para execução no dispositivo — passos fora do `aguardente`, já no toolchain da Apple.
 
@@ -379,6 +383,8 @@ Se o treinamento exceder a capacidade de memória da máquina, considere as segu
 | `alvo é menor que o piso de poda` | Alvo abaixo do limite estrutural | Escolha um modelo base menor ou eleve `--target-params`. |
 | `num_attention_heads não é múltiplo de num_key_value_heads` | Arquitetura não padrão | Incompatível com o corte em grupos GQA. |
 | `MPS backend out of memory` | Memória de GPU esgotada | Use `--grad-accum 8` e `--seq-len 256`. |
+| `a perda de destilação divergiu` | Taxa de aprendizado alta demais para o modelo | Reduza `--lr`, aumente `--grad-accum`, ou use um nível de esforço mais conservador. |
+| `a recuperação produziu pesos não finitos` | Divergência no passo final do treino | Reduza `--lr`; em `--device cpu` o treino roda em float32, com mais margem numérica. |
 | `excede o teto de treino desta máquina` | Alvo maior do que a RAM comporta no treino | Reduza `--target-params`, use `--skip-recover`, ou `--allow-oversized` para assumir o risco. |
 | `memória insuficiente para concluir a etapa` | Falta de memória durante a execução | Reduza o alvo, o lote ou o comprimento de sequência, e aumente `--grad-accum`. |
 | `pesos pré-quantizados não suportados` | Repositório distribui pesos GPTQ, AWQ ou FP8 | Use o repositório com os pesos originais em float16. |
