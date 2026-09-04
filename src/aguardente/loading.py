@@ -20,10 +20,19 @@ def pick_device(prefer: str | None = None) -> str:
 
 
 def pick_dtype(device: str) -> Any:
-    """Seleciona o tipo de precisão para o dispositivo (float16 para MPS, float32 para CPU)."""
+    """Seleciona o tipo de precisão para o dispositivo (bfloat16 em MPS, float32 na CPU).
+
+    Em MPS a escolha é `bfloat16`, não `float16`: o treino de recuperação
+    atualiza os pesos no próprio dtype do modelo, sem cópia mestra em float32,
+    e o AdamW divide pela raiz do segundo momento. Um gradiente da ordem de
+    1e-4 tem quadrado 1e-8, abaixo do menor subnormal de float16 — o
+    denominador vira zero e a primeira atualização manda todos os pesos para
+    infinito. `bfloat16` ocupa os mesmos 2 bytes por peso, com o expoente de
+    float32, e não sofre esse estouro.
+    """
     import torch
 
-    return torch.float16 if device == "mps" else torch.float32
+    return torch.bfloat16 if device == "mps" else torch.float32
 
 
 def load_causal_lm(ref: str, *, device: str | None = None, dtype: Any = None) -> tuple[Any, Any]:

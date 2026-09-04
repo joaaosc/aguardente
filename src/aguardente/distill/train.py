@@ -272,6 +272,7 @@ def _finish(result: RecoveryResult, started: float, student: Any,
         dev = next(student.parameters()).device
         blob = torch.load(ckpt / "best.pt", map_location=dev, weights_only=True)
         student.load_state_dict(blob["state_dict"], assign=False)
+    _exigir_pesos_finitos(student)
     if ckpt:
         (ckpt / "recovery.json").write_text(result.to_json())
         # Um treino que chegou até aqui por completar as épocas não precisa
@@ -280,6 +281,28 @@ def _finish(result: RecoveryResult, started: float, student: Any,
         if result.stopped_by == "epochs":
             (ckpt / "last.pt").unlink(missing_ok=True)
     return result
+
+
+def _exigir_pesos_finitos(student: Any) -> None:
+    """Confere que o treino não deixou infinito ou NaN nos pesos.
+
+    A perda é conferida a cada lote, mas a divergência pode aparecer no passo
+    do otimizador que fecha o treino — depois da última perda medida e sem
+    nenhuma passada adiante para denunciá-la. Sem esta verificação o student
+    corrompido segue para a exportação e vira um bundle que carrega, ocupa uma
+    fração do tamanho esperado e não produz nada.
+    """
+    import torch
+
+    for nome, tensor in student.state_dict().items():
+        if tensor.is_floating_point() and not bool(torch.isfinite(tensor).all()):
+            raise AguardenteError(
+                f"a recuperação produziu pesos não finitos em {nome}",
+                hint="O treino divergiu no último passo. Reduza --lr, aumente "
+                     "--grad-accum, ou use um nível de esforço mais conservador; "
+                     "em --device cpu o treino roda em float32, com mais margem "
+                     "numérica.",
+            )
 
 
 def _save_checkpoint(student: Any, ckpt: Path, step: int, metric: float) -> None:

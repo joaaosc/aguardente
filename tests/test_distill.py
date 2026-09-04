@@ -630,3 +630,32 @@ def test_kd_loss_rejects_degenerate_sequence_length():
     v, idx = s.topk(8, dim=-1)
     with pytest.raises(ValueError, match="pelo menos 2 posições"):
         kd_loss(s, v, idx, labels=torch.randint(0, 32, (2, 1)))
+
+
+# ------------------------------------------------- sanidade numérica do treino
+
+
+def test_pesos_nao_finitos_interrompem_a_recuperacao():
+    """Regressão: a divergência no último passo escapava da conferência da
+    perda e o student saía com infinito em todos os tensores."""
+    from aguardente.distill.train import _exigir_pesos_finitos
+
+    modelo = LlamaForCausalLM(LlamaConfig(
+        hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, vocab_size=64))
+    _exigir_pesos_finitos(modelo)  # limpo: não levanta
+
+    with torch.no_grad():
+        modelo.model.layers[0].mlp.up_proj.weight.fill_(float("inf"))
+    with pytest.raises(AguardenteError) as e:
+        _exigir_pesos_finitos(modelo)
+    assert "não finitos" in e.value.message and "--lr" in e.value.hint
+
+
+def test_dtype_de_mps_tem_expoente_largo():
+    """float16 zera o segundo momento do AdamW e a primeira atualização manda
+    todos os pesos para infinito; bfloat16 ocupa o mesmo espaço sem estourar."""
+    from aguardente.loading import pick_dtype
+
+    assert pick_dtype("mps") is torch.bfloat16
+    assert pick_dtype("cpu") is torch.float32
