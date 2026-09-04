@@ -163,7 +163,7 @@ def prune_model(
                 layer.layer_idx = new_idx
         _replace_layers(model, kept)
 
-    _sync_config(model, dst)
+    _sync_config(model, dst, keep_layers, src.num_hidden_layers)
 
     return PruneReport(
         params_before=before,
@@ -199,26 +199,49 @@ def _default_layer_selection(total: int, keep: int) -> list[int]:
     return sorted({0, *middle, total - 1})[:keep]
 
 
-def _sync_config(model: Any, dst: Arch) -> None:
+def _resize_per_layer_lists(cfg: Any, keep_layers: Sequence[int], src_layers: int) -> list[str]:
+    """Refatia as listas do config que descrevem uma camada por posição.
+
+    Configs recentes do transformers carregam `layer_types` — e famílias com
+    atenção alternada carregam listas equivalentes — com um item por camada, e
+    validam o comprimento contra `num_hidden_layers` ao reinstanciar. Sem
+    refatiar, o config gravado descreve 28 camadas para um modelo com 17 e o
+    checkpoint podado não volta a carregar.
+    """
+    if src_layers <= 0:
+        return []
+    ajustados = []
+    for nome, valor in list(vars(cfg).items()):
+        if nome.startswith("_") or not isinstance(valor, (list, tuple)):
+            continue
+        if len(valor) != src_layers:
+            continue
+        refatiado = [valor[i] for i in keep_layers]
+        setattr(cfg, nome, type(valor)(refatiado) if isinstance(valor, tuple) else refatiado)
+        ajustados.append(nome)
+    return ajustados
+
+
+def _sync_config(model: Any, dst: Arch, keep_layers: Sequence[int] = (),
+                 src_layers: int = 0) -> list[str]:
     """Atualiza o objeto de configuração do modelo com as novas dimensões."""
     cfg = getattr(model, "config", None)
     if cfg is None:
-        return
-    for name, value in (
+        return []
+    dimensoes = (
         ("intermediate_size", dst.intermediate_size),
         ("num_hidden_layers", dst.num_hidden_layers),
         ("num_attention_heads", dst.num_attention_heads),
         ("num_key_value_heads", dst.num_key_value_heads),
-    ):
-        if hasattr(cfg, name):
-            setattr(cfg, name, value)
-    inner = getattr(cfg, "text_config", None)
-    if inner is not None:
-        for name, value in (
-            ("intermediate_size", dst.intermediate_size),
-            ("num_hidden_layers", dst.num_hidden_layers),
-            ("num_attention_heads", dst.num_attention_heads),
-            ("num_key_value_heads", dst.num_key_value_heads),
-        ):
-            if hasattr(inner, name):
-                setattr(inner, name, value)
+    )
+    ajustados = []
+    for alvo in (cfg, getattr(cfg, "text_config", None)):
+        if alvo is None:
+            continue
+        # As listas por camada são refatiadas antes das dimensões: alguns
+        # configs validam o comprimento no próprio `__setattr__`.
+        ajustados += _resize_per_layer_lists(alvo, keep_layers, src_layers)
+        for name, value in dimensoes:
+            if hasattr(alvo, name):
+                setattr(alvo, name, value)
+    return ajustados

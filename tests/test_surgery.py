@@ -157,3 +157,53 @@ def test_default_layer_selection_keeps_boundaries():
             assert sel == sorted(set(sel))
             if keep >= 2:
                 assert sel[0] == 0 and sel[-1] == total - 1
+
+
+# ------------------------------------------------- listas por camada no config
+
+
+def test_listas_por_camada_acompanham_o_corte_de_camadas():
+    """Regressão: `layer_types` ficava com o comprimento original e o
+    checkpoint podado não voltava a carregar."""
+    from aguardente.prune.surgery import _sync_config
+
+    class _Cfg:
+        pass
+
+    cfg = _Cfg()
+    cfg.num_hidden_layers = 6
+    cfg.intermediate_size = 256
+    cfg.num_attention_heads = 8
+    cfg.num_key_value_heads = 4
+    cfg.layer_types = ["full_attention"] * 6
+    cfg.layer_types[1] = "sliding_attention"
+    cfg.rope_scaling = None
+
+    class _Model:
+        config = cfg
+
+    alvo = Arch(hidden_size=64, intermediate_size=128, num_hidden_layers=3,
+                num_attention_heads=8, num_key_value_heads=4, head_dim=8,
+                vocab_size=512)
+    ajustados = _sync_config(_Model(), alvo, [0, 1, 5], 6)
+
+    assert cfg.num_hidden_layers == 3
+    assert cfg.layer_types == ["full_attention", "sliding_attention", "full_attention"]
+    assert "layer_types" in ajustados
+
+
+def test_poda_de_camadas_mantem_o_config_recarregavel():
+    """O config gravado precisa descrever o modelo podado, não o original."""
+    from aguardente.plan import PrunePlan
+
+    m = tiny_model(num_hidden_layers=6)
+    alvo = arch_of(m).with_(num_hidden_layers=3)
+    prune_model(m, PrunePlan(source=arch_of(m), target=alvo, requested_params=0),
+                keep_ffn=torch.arange(alvo.intermediate_size),
+                keep_layers=[0, 2, 5])
+
+    dados = m.config.to_dict()
+    assert dados["num_hidden_layers"] == 3
+    for chave, valor in dados.items():
+        if isinstance(valor, list) and valor and all(isinstance(v, str) for v in valor):
+            assert len(valor) != 6, f"{chave} manteve o comprimento original"
