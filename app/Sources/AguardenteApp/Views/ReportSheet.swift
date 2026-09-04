@@ -55,114 +55,48 @@ public struct ReportSheet: View {
         }
 
         md += "## Como testar o modelo gerado\n\n"
-        md += "```bash\nswift run -c release llm-runner --model \(runner.outDir)/bundle --prompt \"Olá\"\n```\n"
+        // Mesma fonte do bloco exibido na tela: dois literais divergem na
+        // primeira vez que o comando muda.
+        md += "```bash\n\(comandoDeTesteTexto)\n```\n"
         return md
     }
 
     public var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    // Cabeçalho
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(runner.modelName)
-                            .font(.title2.weight(.bold))
-                        Text("Pipeline de poda estruturada, destilação e conversão Core AI")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.bottom, 8)
-
-                    Divider()
-
-                    // Resumo das Etapas
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("Etapas")
-                            .font(.headline)
-
-                        ForEach(runner.stages) { stage in
-                            HStack {
-                                Image(systemName: stage.state.symbol)
-                                    .foregroundStyle(stage.state.tint)
-                                Text(stage.title)
-                                    .fontWeight(.medium)
-                                Spacer()
-                                Text(stage.duration.map { formatDuration($0) } ?? "—")
-                                    .font(.callout.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                            }
-                            .padding(.vertical, 4)
-                        }
-                    }
-
-                    Divider()
-
-                    // Métricas, agrupadas por etapa. A identidade de `Metric` é
-                    // a chave, única dentro de uma etapa mas não entre elas:
-                    // achatar tudo numa lista só daria ids repetidos ao ForEach,
-                    // que descartaria linhas em silêncio.
-                    if runner.stages.contains(where: { !$0.metrics.isEmpty }) {
-                        VStack(alignment: .leading, spacing: 14) {
-                            Text("Métricas Coletadas")
-                                .font(.headline)
-
-                            ForEach(runner.stages.filter { !$0.metrics.isEmpty }) { etapa in
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(etapa.title)
-                                        .font(.subheadline.weight(.medium))
-                                        .foregroundStyle(.secondary)
-
-                                    ForEach(etapa.metrics) { m in
-                                        HStack {
-                                            Text(m.label)
-                                            Spacer()
-                                            Text(m.formatted)
-                                                .font(.callout.monospacedDigit().weight(.semibold))
-                                                .foregroundStyle(m.meetsTarget ? Color.primary : Color.orange)
-                                        }
-                                        .padding(.vertical, 2)
-                                    }
-                                }
-                            }
-                        }
-
-                        Divider()
-                    }
-
-                    // Comando de Teste
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Comando para testar no Terminal")
-                            .font(.headline)
-
-                        Text("swift run -c release llm-runner --model \(runner.outDir)/bundle --prompt \"Olá\"")
-                            .font(.system(.caption, design: .monospaced))
-                            .padding(10)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Color(nsColor: .textBackgroundColor))
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
-                            .textSelection(.enabled)
-                    }
+                VStack(alignment: .leading, spacing: 0) {
+                    cabecalho
+                    corpo
                 }
-                .padding(24)
             }
+            .bordaDeRolagem()
             .navigationTitle("Relatório da Execução")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Fechar") { dismiss() }
                 }
 
-                ToolbarItemGroup(placement: .primaryAction) {
+                // Dois botões num mesmo `ToolbarItemGroup(placement:
+                // .primaryAction)` numa folha de macOS renderizam só o
+                // primeiro — o "Exportar…" simplesmente não aparecia na barra
+                // inferior. Em itens separados, com o exportar em
+                // `.confirmationAction`, os dois ficam visíveis e o principal
+                // ganha a posição que o sistema reserva a ele.
+                ToolbarItem(placement: .automatic) {
                     Button {
                         copyMarkdown()
                     } label: {
-                        Label(isCopied ? "Copiado!" : "Copiar Markdown", systemImage: isCopied ? "checkmark" : "doc.on.doc")
+                        Label(isCopied ? "Copiado!" : "Copiar Markdown",
+                              systemImage: isCopied ? "checkmark" : "doc.on.doc")
                     }
+                }
 
+                ToolbarItem(placement: .confirmationAction) {
                     Button {
                         reportDocument = ReportDocument(text: reportMarkdown)
                         showFileExporter = true
                     } label: {
-                        Label("Exportar...", systemImage: "square.and.arrow.up")
+                        Label("Exportar…", systemImage: "square.and.arrow.up")
                     }
                 }
             }
@@ -173,7 +107,145 @@ public struct ReportSheet: View {
                 defaultFilename: "aguardente-relatorio.md"
             ) { _ in }
         }
-        .frame(minWidth: 520, minHeight: 480)
+        .frame(minWidth: 560, minHeight: 520)
+    }
+
+    /// Mesmo cabeçalho da janela principal, pelas mesmas razões.
+    ///
+    /// O relatório é a folha que o usuário exporta e mostra a outra pessoa; se
+    /// ele tivesse tipografia e espaçamento próprios, seria uma segunda
+    /// linguagem visual dentro do mesmo aplicativo.
+    private var cabecalho: some View {
+        VStack(alignment: .leading, spacing: Espaco.bloco) {
+            VStack(alignment: .leading, spacing: Espaco.interno) {
+                Text("Relatório")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+
+                Text(runner.modelName)
+                    .font(.title.weight(.semibold))
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.7)
+                    .textSelection(.enabled)
+
+                Text("Poda estruturada, destilação e conversão Core AI")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: Espaco.secao) {
+                fato("Estado", runner.phase.description)
+                fato("Tempo total", formatDuration(runner.elapsed))
+                fato("Alvo", alvoDescrito)
+            }
+        }
+        .padding(.horizontal, Espaco.secao)
+        .padding(.top, Espaco.bloco)
+        .padding(.bottom, Espaco.secao)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(alignment: .bottom) {
+            Marca.cabecalho
+                .overlay(alignment: .bottom) {
+                    Rectangle().fill(.separator).frame(height: 1)
+                }
+        }
+    }
+
+    private func fato(_ rotulo: String, _ valor: String) -> some View {
+        VStack(alignment: .leading, spacing: Espaco.minimo) {
+            Text(rotulo)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(valor)
+                .font(.callout.weight(.medium).monospacedDigit())
+                .lineLimit(1)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var corpo: some View {
+        VStack(alignment: .leading, spacing: Espaco.secao) {
+            etapas
+
+            // Métricas agrupadas por etapa. A identidade de `Metric` é a chave,
+            // única dentro de uma etapa mas não entre elas: achatar tudo numa
+            // lista só daria ids repetidos ao `ForEach`, que descartaria linhas
+            // em silêncio.
+            ForEach(runner.stages.filter { !$0.metrics.isEmpty }) { etapa in
+                VStack(alignment: .leading, spacing: Espaco.interno) {
+                    Text(etapa.title)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.secondary)
+
+                    StageMetrics(metrics: etapa.metrics, titulo: nil)
+                }
+            }
+
+            comandoDeTeste
+        }
+        .padding(.horizontal, Espaco.secao)
+        .padding(.bottom, Espaco.secao)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var etapas: some View {
+        VStack(alignment: .leading, spacing: Espaco.interno) {
+            Text("Etapas")
+                .font(.headline)
+
+            VStack(spacing: 0) {
+                ForEach(Array(runner.stages.enumerated()), id: \.element.id) { indice, stage in
+                    if indice > 0 { Divider() }
+
+                    HStack(spacing: Espaco.bloco - 4) {
+                        Text("\(indice + 1)")
+                            .font(.callout.monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                            .frame(width: 16, alignment: .trailing)
+
+                        Text(stage.title)
+                            .font(.callout)
+
+                        Spacer(minLength: Espaco.interno)
+
+                        EstadoPill(state: stage.state)
+
+                        Text(stage.duration.map { formatDuration($0) } ?? "—")
+                            .font(.callout.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .frame(width: 92, alignment: .trailing)
+                    }
+                    .padding(.horizontal, Espaco.bloco - 4)
+                    .padding(.vertical, Espaco.interno + 2)
+                    .accessibilityElement(children: .combine)
+                }
+            }
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: Raio.medio))
+        }
+    }
+
+    private var comandoDeTeste: some View {
+        VStack(alignment: .leading, spacing: Espaco.interno) {
+            Text("Como testar o modelo gerado")
+                .font(.headline)
+
+            Text(comandoDeTesteTexto)
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+                .padding(Espaco.bloco - 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(nsColor: .textBackgroundColor),
+                            in: RoundedRectangle(cornerRadius: Raio.pequeno))
+                .overlay {
+                    RoundedRectangle(cornerRadius: Raio.pequeno)
+                        .strokeBorder(.separator)
+                }
+        }
+    }
+
+    private var comandoDeTesteTexto: String {
+        "swift run -c release llm-runner --model \(runner.outDir)/bundle --prompt \"Olá\""
     }
 
     private func copyMarkdown() {
