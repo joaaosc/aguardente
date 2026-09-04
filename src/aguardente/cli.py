@@ -982,8 +982,11 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _falha(msg: str, hint: str | None = None, *, exc: BaseException | None = None) -> int:
+def _falha(msg: str, hint: str | None = None, *, exc: BaseException | None = None,
+           args: argparse.Namespace | None = None) -> int:
     """Imprime a falha no formato do pacote, com traceback só sob AGUARDENTE_DEBUG."""
+    if args is not None:
+        _erro_como_evento(args, msg, hint)
     print(f"\nerro: {msg}", file=sys.stderr)
     if hint:
         print(f"  → {hint}", file=sys.stderr)
@@ -993,11 +996,26 @@ def _falha(msg: str, hint: str | None = None, *, exc: BaseException | None = Non
     return 1
 
 
+def _erro_como_evento(args: argparse.Namespace, msg: str, hint: str | None = None) -> None:
+    """Em modo `--json`, uma falha precisa chegar como evento, não como texto.
+
+    Quem consome o NDJSON — a interface macOS — só entende eventos. Uma
+    mensagem em stderr vira ali uma linha de log solta, e o motivo real da
+    falha desaparece atrás de "processo encerrou com código 1", justamente
+    quando é a informação que o usuário mais precisa.
+    """
+    if not getattr(args, "json", False):
+        return
+    from .events import stdout_log
+    stdout_log().error("pipeline", msg, hint=hint)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return int(args.func(args))
     except AguardenteError as e:
+        _erro_como_evento(args, e.message, e.hint)
         print(f"\nerro: {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
@@ -1009,26 +1027,26 @@ def main(argv: list[str] | None = None) -> int:
         return _falha(
             "memória insuficiente para concluir a etapa",
             "Reduza --target-params, --batch-size ou --seq-len, aumente --grad-accum, "
-            "e feche outros aplicativos antes de repetir.", exc=e)
+            "e feche outros aplicativos antes de repetir.", exc=e, args=args)
     except ModuleNotFoundError as e:
         return _falha(
             f"dependência ausente: {e.name}",
             "Instale a stack completa com `aguardente install` e "
-            "confirme com `aguardente doctor`.", exc=e)
+            "confirme com `aguardente doctor`.", exc=e, args=args)
     except OSError as e:
         if e.errno == errno.ENOSPC:
             return _falha("disco cheio durante a escrita",
                           "Libere espaço ou aponte -o para outro volume. O estado da "
-                          "execução foi preservado para retomada.", exc=e)
+                          "execução foi preservado para retomada.", exc=e, args=args)
         if e.errno in (errno.EACCES, errno.EPERM):
             return _falha(f"permissão negada: {e.filename or e}",
-                          "Verifique as permissões do diretório de execução.", exc=e)
+                          "Verifique as permissões do diretório de execução.", exc=e, args=args)
         return _falha(f"falha de entrada/saída: {e}",
-                      "Verifique o caminho de destino e a conexão de rede.", exc=e)
+                      "Verifique o caminho de destino e a conexão de rede.", exc=e, args=args)
     except Exception as e:  # noqa: BLE001 — último recurso, com traceback opcional
         return _falha(f"falha inesperada: {type(e).__name__}: {e}",
                       f"Defina {DEBUG_ENV}=1 e repita o comando para ver o traceback completo.",
-                      exc=e)
+                      exc=e, args=args)
 
 
 if __name__ == "__main__":

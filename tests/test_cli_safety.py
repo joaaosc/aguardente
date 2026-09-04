@@ -1,6 +1,7 @@
 """Testes da rede de segurança do CLI e do descarte de execuções anteriores."""
 
 import errno
+import json
 
 import pytest
 
@@ -114,3 +115,43 @@ def test_flags_novas_existem_no_run(flag):
 def test_flags_novas_tem_padrao_falso():
     args = cli.build_parser().parse_args(["run", "org/m", "-o", "run"])
     assert args.restart is False and args.allow_oversized is False
+
+
+def test_erro_vira_evento_em_modo_json(monkeypatch, capsys):
+    """Sem isto, a GUI só recebe 'processo encerrou com código 1'."""
+    def explode(_args):
+        raise AguardenteError("o alvo excede o teto de treino",
+                              hint="Use --target-params menor.")
+
+    parser = cli.build_parser()
+    args = parser.parse_args(["run", "org/m", "-o", "run", "--json"])
+    monkeypatch.setattr(args, "func", explode, raising=False)
+    monkeypatch.setattr(cli, "build_parser", lambda: _ParserFixo(args))
+
+    assert cli.main([]) == 1
+    saida = capsys.readouterr()
+    evento = json.loads([l for l in saida.out.splitlines() if l.strip()][-1])
+    assert evento["ev"] == "error"
+    assert "teto de treino" in evento["msg"]
+    assert "--target-params" in evento["hint"]
+
+
+def test_erro_sem_json_nao_emite_evento(monkeypatch, capsys):
+    def explode(_args):
+        raise AguardenteError("falhou")
+
+    parser = cli.build_parser()
+    args = parser.parse_args(["run", "org/m", "-o", "run"])
+    monkeypatch.setattr(args, "func", explode, raising=False)
+    monkeypatch.setattr(cli, "build_parser", lambda: _ParserFixo(args))
+
+    assert cli.main([]) == 1
+    assert capsys.readouterr().out == ""
+
+
+class _ParserFixo:
+    def __init__(self, args):
+        self._args = args
+
+    def parse_args(self, _argv=None):
+        return self._args
