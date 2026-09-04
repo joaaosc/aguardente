@@ -691,17 +691,18 @@ def _conferir_exportador(ctx: Context, model_dir: Path) -> None:
     depois de horas de poda e treino. Falha aqui é aviso, não interrupção: o
     diagnóstico pode ser de ambiente, e o resto do pipeline ainda tem valor.
     """
-    from .export import available, build_command, run_export
+    from .export import available, build_command, run_export, staged_repo
 
     if ctx.opts.skip_export or not available():
         return
-    cmd = build_command(model_dir, ctx.opts.out_dir / "dry-run",
-                        platform=ctx.opts.platform, compression=ctx.opts.compression,
-                        compute_precision=ctx.opts.compute_precision,
-                        max_context_length=ctx.opts.max_context_length, dry_run=True)
     linhas: list[str] = []
     try:
-        codigo = run_export(cmd, on_line=linhas.append)
+        with staged_repo(model_dir) as (ref, ambiente):
+            cmd = build_command(ref, ctx.opts.out_dir / "dry-run",
+                                platform=ctx.opts.platform, compression=ctx.opts.compression,
+                                compute_precision=ctx.opts.compute_precision,
+                                max_context_length=ctx.opts.max_context_length, dry_run=True)
+            codigo = run_export(cmd, on_line=linhas.append, env=ambiente)
     except Exception as e:  # noqa: BLE001 — a conferência não pode derrubar a etapa
         ctx.say(f"             aviso: não foi possível validar a exportação: {e}")
         return
@@ -1038,7 +1039,7 @@ def stage_recover(ctx: Context, pruned_dir: Path, logits_dir: Path | None) -> Pa
 
 def stage_export(ctx: Context, model_dir: Path) -> Path | None:
     """Etapa 5: Exportação para o formato .aimodel."""
-    from .export import build_command, find_bundle, run_export
+    from .export import build_command, find_bundle, run_export, staged_repo
 
     opts, state = ctx.opts, ctx.state
     out = opts.bundle_dir
@@ -1052,20 +1053,24 @@ def stage_export(ctx: Context, model_dir: Path) -> Path | None:
         ctx.say(f"export       já concluído: {out}")
         return out
 
-    cmd = build_command(
-        model_dir, out, platform=opts.platform, compression=opts.compression,
-        compute_precision=opts.compute_precision,
-        max_context_length=opts.max_context_length,
-        dry_run=opts.export_dry_run,
-    )
-    ctx.say(f"export       {' '.join(cmd)}")
+    # O exportador só entende um identificador do Hub; o modelo local é
+    # apresentado como um repositório em cache, resolvido offline.
+    with staged_repo(model_dir) as (ref, ambiente):
+        cmd = build_command(
+            ref, out, platform=opts.platform, compression=opts.compression,
+            compute_precision=opts.compute_precision,
+            max_context_length=opts.max_context_length,
+            dry_run=opts.export_dry_run,
+        )
+        ctx.say(f"export       {' '.join(cmd)}")
 
-    state.begin("export")
-    ctx.events.stage_start("export", 6, len(STAGES),
-                           rationale="Converte e quantiza o modelo para execução acelerada via Apple Core AI no Neural Engine / GPU.")
-    t0 = time.perf_counter()
-    code = run_export(cmd, on_line=lambda line: ctx.say(f"             {line}"))
-    dt = time.perf_counter() - t0
+        state.begin("export")
+        ctx.events.stage_start("export", 6, len(STAGES),
+                               rationale="Converte e quantiza o modelo para execução acelerada via Apple Core AI no Neural Engine / GPU.")
+        t0 = time.perf_counter()
+        code = run_export(cmd, on_line=lambda line: ctx.say(f"             {line}"),
+                          env=ambiente)
+        dt = time.perf_counter() - t0
 
     if code != 0:
         state.fail("export", f"exportador saiu com código {code}")

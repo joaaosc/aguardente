@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import re
 import shutil
 import subprocess
+import sys
+import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -30,7 +36,18 @@ class ExportResult:
 
 
 def _resolve(name: str) -> list[str] | None:
-    """Localiza o executável coreai.llm.export no PATH ou via módulo uv."""
+    """Localiza o executável coreai.llm.export.
+
+    A busca começa pelo diretório do interpretador em execução: instalado como
+    ferramenta uv, o aguardente compartilha o ambiente com o exportador, mas só
+    o próprio aguardente é exposto no PATH do usuário. Sem esse passo o
+    executável ao lado é invisível e o fallback `uv run` acaba resolvendo no
+    projeto do diretório atual, que é outro ambiente.
+    """
+    vizinho = Path(sys.executable).parent / name
+    if vizinho.is_file() and os.access(vizinho, os.X_OK):
+        return [str(vizinho)]
+
     direct = shutil.which(name)
     if direct:
         return [direct]
@@ -86,7 +103,8 @@ def build_command(
     if include_debug_info:
         cmd.append("--include-debug-info")
     if experimental:
-        # Necessário para diretórios locais de modelos
+        # Um modelo produzido aqui não tem preset no registro da Apple, e sem
+        # esta flag o exportador recusa qualquer identificador desconhecido.
         cmd.append("--experimental")
     if overwrite:
         cmd.append("--overwrite")
@@ -95,11 +113,60 @@ def build_command(
     return cmd
 
 
+STAGED_NAMESPACE = "aguardente"
+_STAGED_REVISION = "0" * 40
+
+
+def _staged_name(model_dir: Path) -> str:
+    """Nome de repositório derivado do diretório, aceito por `validate_repo_id`."""
+    limpo = re.sub(r"[^A-Za-z0-9._-]+", "-", model_dir.name).strip("-.") or "modelo"
+    return limpo[:96]
+
+
+@contextlib.contextmanager
+def staged_repo(model_dir: str | Path) -> Iterator[tuple[str, dict[str, str]]]:
+    """Apresenta um diretório local ao exportador como repositório do Hub.
+
+    O `coreai.llm.export` só aceita um nome curto do registro da Apple ou um
+    identificador do Hugging Face: o caminho recebido vai direto para
+    `snapshot_download`, que o rejeita por não ter a forma `namespace/nome`. Um
+    modelo podado e destilado aqui não existe no Hub, e publicá-lo só para
+    convertê-lo seria absurdo.
+
+    A saída é montar um cache do Hub num diretório temporário, com os arquivos
+    do modelo ligados por symlink na posição que um snapshot ocuparia, e rodar
+    o exportador em modo offline apontado para esse cache. Nada é copiado, nada
+    sai da máquina, e o exportador resolve o identificador sem tocar na rede.
+
+    Para uma referência que não é diretório — um identificador do Hub de
+    verdade — nada é montado e a referência passa intacta.
+    """
+    origem = Path(model_dir)
+    if not origem.is_dir():
+        yield str(model_dir), {}
+        return
+
+    repo = f"{STAGED_NAMESPACE}/{_staged_name(origem)}"
+    with tempfile.TemporaryDirectory(prefix="aguardente-hub-") as tmp:
+        cache = Path(tmp)
+        raiz = cache / f"models--{STAGED_NAMESPACE}--{_staged_name(origem)}"
+        snapshot = raiz / "snapshots" / _STAGED_REVISION
+        snapshot.mkdir(parents=True)
+        (raiz / "refs").mkdir()
+        (raiz / "refs" / "main").write_text(_STAGED_REVISION)
+        for arquivo in origem.iterdir():
+            if arquivo.is_file():
+                (snapshot / arquivo.name).symlink_to(arquivo.resolve())
+        yield repo, {"HF_HUB_CACHE": str(cache), "HF_HUB_OFFLINE": "1"}
+
+
 def run_export(cmd: list[str], *, on_line: Callable[[str], None] | None = None,
-               timeout: float | None = None) -> int:
+               timeout: float | None = None,
+               env: Mapping[str, str] | None = None) -> int:
     """Executa o comando de exportação repassando as linhas de saída."""
+    ambiente = {**os.environ, **env} if env else None
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1)
+                            text=True, bufsize=1, env=ambiente)
     try:
         assert proc.stdout is not None
         for line in proc.stdout:

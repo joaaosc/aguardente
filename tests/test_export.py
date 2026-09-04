@@ -3,6 +3,7 @@
 import pytest
 
 from aguardente.errors import AguardenteError
+from aguardente.export import _resolve as _resolve_original
 from aguardente.export import build_command, find_bundle
 
 
@@ -86,3 +87,79 @@ def test_missing_exporter_error_warns_about_pypi_squat(monkeypatch):
     with pytest.raises(AguardenteError) as e:
         mod.build_command("/tmp/m", "/tmp/o")
     assert "PyPI" in (e.value.hint or "")
+
+
+# ------------------------------------------- diretório local como repositório
+
+
+def test_diretorio_local_vira_repositorio_em_cache(tmp_path):
+    """O exportador só aceita identificador do Hub: o caminho local é montado
+    como snapshot em um cache offline, sem copiar nem publicar nada."""
+    from pathlib import Path
+
+    from aguardente.export import staged_repo
+
+    modelo = tmp_path / "student"
+    modelo.mkdir()
+    (modelo / "config.json").write_text("{}")
+    (modelo / "model.safetensors").write_bytes(b"pesos")
+
+    with staged_repo(modelo) as (ref, env):
+        assert ref == "aguardente/student"
+        assert env["HF_HUB_OFFLINE"] == "1"
+        cache = Path(env["HF_HUB_CACHE"])
+        raiz = cache / "models--aguardente--student"
+        revisao = (raiz / "refs" / "main").read_text()
+        snapshot = raiz / "snapshots" / revisao
+        assert (snapshot / "config.json").read_text() == "{}"
+        assert (snapshot / "model.safetensors").read_bytes() == b"pesos"
+
+    # O cache é temporário e não sobrevive ao bloco.
+    assert not cache.exists()
+
+
+def test_identificador_do_hub_passa_intacto(tmp_path):
+    from aguardente.export import staged_repo
+
+    with staged_repo("Qwen/Qwen3-4B") as (ref, env):
+        assert ref == "Qwen/Qwen3-4B"
+        assert env == {}
+
+
+def test_nome_do_repositorio_e_saneado(tmp_path):
+    from aguardente.export import staged_repo
+
+    modelo = tmp_path / "meu modelo:v2"
+    modelo.mkdir()
+    with staged_repo(modelo) as (ref, _):
+        namespace, _, nome = ref.partition("/")
+        assert namespace == "aguardente"
+        assert all(c.isalnum() or c in "._-" for c in nome)
+
+
+def test_exportador_e_procurado_ao_lado_do_interpretador(tmp_path, monkeypatch):
+    """Instalado como ferramenta uv, o exportador fica no bin do ambiente e
+    nunca aparece no PATH do usuário."""
+    import sys
+
+    import aguardente.export as mod
+
+    binario = tmp_path / "bin" / "coreai.llm.export"
+    binario.parent.mkdir()
+    binario.write_text("#!/bin/sh\n")
+    binario.chmod(0o755)
+
+    monkeypatch.setattr(sys, "executable", str(binario.parent / "python"))
+    monkeypatch.setattr(mod.shutil, "which", lambda _n: None)
+    assert _resolve_original("coreai.llm.export") == [str(binario)]
+
+
+def test_sem_executavel_ao_lado_a_busca_segue_para_o_path(tmp_path, monkeypatch):
+    import sys
+
+    import aguardente.export as mod
+
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "bin" / "python"))
+    monkeypatch.setattr(mod.shutil, "which",
+                        lambda n: "/usr/local/bin/x" if n == "coreai.llm.export" else None)
+    assert _resolve_original("coreai.llm.export") == ["/usr/local/bin/x"]
