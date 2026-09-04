@@ -7,15 +7,19 @@ struct AguardenteApp: App {
     var body: some Scene {
         WindowGroup {
             RootView(runner: runner)
-                .frame(minWidth: 720, minHeight: 480)
+                // O detalhe passou a ter cabeçalho, trilha do pipeline e uma
+                // grade de métricas. Abaixo desta largura a grade colapsa para
+                // uma coluna e o cabeçalho perde a folga que o torna legível.
+                .frame(minWidth: 840, minHeight: 560)
         }
         .windowStyle(.automatic)
         .windowToolbarStyle(.unified)
-        .defaultSize(width: 980, height: 640)
+        .defaultSize(width: 1080, height: 720)
         .windowResizability(.contentMinSize)
         .commands {
             SidebarCommands()
             CommandGroup(replacing: .newItem) {}
+            ComandosDeVisualizacao()
 
             CommandMenu("Execução") {
                 Button(runner.isRunning ? "Pausar" : "Iniciar") {

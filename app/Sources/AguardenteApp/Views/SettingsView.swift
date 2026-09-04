@@ -23,20 +23,24 @@ public struct SettingsView: View {
 
     public var body: some View {
         Form {
+            // A explicação de cada grupo vira rodapé da própria seção em vez de
+            // um `Text` solto entre os controles: num `Form` agrupado o rodapé
+            // já recebe o tamanho, a cor e o recuo certos, e o texto deixa de
+            // ser lido como mais um campo do formulário.
             Section {
                 TextField("Modelo", text: $runner.modelName, prompt: Text("organização/nome"))
-                    .textFieldStyle(.roundedBorder)
-                Text("Identificador do Hugging Face, URL do Hugging Face ou do GitHub, "
-                     + "ou o caminho de um diretório local.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             } header: {
                 Text("Modelo de origem")
+            } footer: {
+                // Sem o `frame`, o rodapé de uma `Section` num `Form` agrupado
+                // de macOS sai justificado à direita e lê como legenda solta.
+                rodape("Identificador do Hugging Face, URL do Hugging Face ou do GitHub, "
+                       + "ou o caminho de um diretório local.")
             }
 
             Section {
                 LabeledContent("Destino") {
-                    HStack(spacing: 8) {
+                    HStack(spacing: Espaco.interno) {
                         Text(runner.outDir)
                             .lineLimit(1)
                             .truncationMode(.head)
@@ -46,12 +50,11 @@ public struct SettingsView: View {
                         Button("Escolher…") { escolhendoDestino = true }
                     }
                 }
-                Text("Os pesos baixados, os logits e o pacote final são gravados aqui. "
-                     + "Reserve dezenas de gigabytes.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             } header: {
                 Text("Destino")
+            } footer: {
+                rodape("Os pesos baixados, os logits e o pacote final são gravados aqui. "
+                       + "Reserve dezenas de gigabytes.")
             }
 
             Section {
@@ -62,7 +65,7 @@ public struct SettingsView: View {
 
                 if !alvoAutomatico {
                     LabeledContent("Alvo") {
-                        HStack {
+                        HStack(spacing: Espaco.interno) {
                             Slider(value: $alvoEmBilhoes, in: 0.1...14, step: 0.01)
                                 .onChange(of: alvoEmBilhoes) { _, novo in
                                     runner.targetParams = novo * 1e9
@@ -73,18 +76,16 @@ public struct SettingsView: View {
                         }
                     }
                 }
-
-                Text(alvoAutomatico
-                     ? "O pipeline escolhe o maior modelo que ainda treina na memória disponível."
-                     : "Um alvo acima do teto de treino da máquina interrompe a execução antes do download.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             } header: {
                 Text("Tamanho do resultado")
+            } footer: {
+                rodape(alvoAutomatico
+                       ? "O pipeline escolhe o maior modelo que ainda treina na memória disponível."
+                       : "Um alvo acima do teto de treino da máquina interrompe a execução antes do download.")
             }
         }
         .formStyle(.grouped)
-        .frame(width: 460)
+        .frame(width: 480)
         .fixedSize(horizontal: false, vertical: true)
         .fileImporter(isPresented: $escolhendoDestino,
                       allowedContentTypes: [.folder]) { resultado in
@@ -92,5 +93,11 @@ public struct SettingsView: View {
                 runner.outDir = url.path
             }
         }
+    }
+
+    private func rodape(_ texto: String) -> some View {
+        Text(texto)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
