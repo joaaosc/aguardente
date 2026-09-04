@@ -641,9 +641,16 @@ def stage_extract(ctx: Context, teacher_dir: Path) -> Path:
         return out
 
     descartado = p.layout.dropped_params
-    ctx.say(f"extração     decoder em {p.layout.prefix!r} → raiz canônica")
-    ctx.say(f"             descartando {descartado/1e9:.2f} B parâmetros "
-            f"({descartado/max(1, p.stored_params):.1%}) de visão e projetor")
+    origem = p.layout.prefix or "raiz"
+    ctx.say(f"extração     decoder em {origem} → raiz canônica")
+    if p.layout.is_multimodal:
+        ctx.say(f"             descartando {descartado/1e9:.2f} B parâmetros "
+                f"({descartado/max(1, p.stored_params):.1%}) de visão e projetor")
+    else:
+        # Checkpoint de texto puro com as chaves fora da convenção: nada é
+        # descartado, só renomeado para o prefixo que o exportador espera.
+        ctx.say("             sem componentes a descartar: só a renomeação "
+                "das chaves para o prefixo canônico")
     _ensure_disk(ctx, p.text_params * 2, "a extração do decoder de texto")
 
     state.begin("extract")

@@ -611,8 +611,12 @@ def cmd_extract(args: argparse.Namespace) -> int:
     ui.blank()
     ui.field("decoder", p.layout.prefix or "raiz", note=f"{p.layout.num_layers} camadas")
     ui.field("mantido", _fmt_params(p.text_params))
-    ui.field("descartado", _fmt_params(p.dropped_params),
-             note=f"{p.dropped_params / p.stored_params:.1%} do checkpoint")
+    if p.layout.is_multimodal:
+        ui.field("descartado", _fmt_params(p.dropped_params),
+                 note=f"{p.dropped_params / p.stored_params:.1%} do checkpoint")
+    else:
+        ui.field("descartado", "nada",
+                 note="checkpoint de texto puro: só as chaves são renomeadas")
 
     saida = destino / "teacher-text"
     cfg = json.loads((origem / "config.json").read_text())
