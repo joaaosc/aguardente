@@ -183,10 +183,13 @@ class RunState:
                     s.status = StageStatus.PENDING
             return state
 
+        # O arquivo não é gravado aqui: ele materializa na primeira etapa que
+        # começa. Uma execução que morre antes disso — identificador errado,
+        # modelo grande demais para a RAM, ambiente incompleto — não deixa a
+        # pasta reservada em nome de um modelo que nunca chegou a ser baixado,
+        # o que obrigaria `--restart` para tentar de novo com o nome correto.
         d.mkdir(parents=True, exist_ok=True)
-        state = cls(run_dir=d, model=model, target_params=target_params)
-        state.save()
-        return state
+        return cls(run_dir=d, model=model, target_params=target_params)
 
     @staticmethod
     def _read(p: Path) -> dict[str, Any]:

@@ -30,7 +30,7 @@ def test_modelo_divergente_aborta(tmp_path):
 
 
 def test_alvo_divergente_aborta(tmp_path):
-    criar(tmp_path)
+    criar(tmp_path).begin("fetch")
     with pytest.raises(StateMismatch) as e:
         RunState.load_or_create(tmp_path / "run", model=MODELO, target_params=900_000_000)
     assert "alvo" in e.value.message
@@ -38,7 +38,7 @@ def test_alvo_divergente_aborta(tmp_path):
 
 def test_retomada_sem_argumentos_herda_o_gravado(tmp_path):
     """`aguardente status` carrega o estado sem informar modelo nem alvo."""
-    criar(tmp_path)
+    criar(tmp_path).begin("fetch")
     st = RunState.load_or_create(tmp_path / "run")
     assert st.model == MODELO and st.target_params == 1_000_000_000
 

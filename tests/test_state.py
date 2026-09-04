@@ -5,10 +5,24 @@ import json
 from aguardente.state import RunState, StageStatus
 
 
-def test_creates_state_file(tmp_path):
+def test_state_file_materializes_on_first_stage(tmp_path):
     st = RunState.load_or_create(tmp_path / "run", model="org/m", target_params=1000)
+    # Antes da primeira etapa o diretório não fica reservado em nome do modelo:
+    # uma execução que falha no plano pode ser repetida com outro identificador
+    # sem exigir --restart.
+    assert not st.path.exists()
+
+    st.begin("fetch")
     assert st.path.is_file()
     assert json.loads(st.path.read_text())["model"] == "org/m"
+
+
+def test_failed_plan_does_not_claim_the_directory(tmp_path):
+    RunState.load_or_create(tmp_path / "run", model="errado/modelo")
+    # Sem estado gravado, o mesmo diretório aceita outro modelo em seguida.
+    st = RunState.load_or_create(tmp_path / "run", model="certo/modelo")
+    st.begin("fetch")
+    assert json.loads(st.path.read_text())["model"] == "certo/modelo"
 
 
 def test_round_trips(tmp_path):
