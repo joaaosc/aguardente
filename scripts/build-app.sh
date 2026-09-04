@@ -129,7 +129,9 @@ echo "versão $VERSAO (build $(git rev-list --count HEAD))"
 if [ -f THIRD-PARTY-NOTICES.md ]; then
 	cp THIRD-PARTY-NOTICES.md "$BUNDLE/Contents/Resources/"
 fi
-[ -f LICENSE ] && cp LICENSE "$BUNDLE/Contents/Resources/"
+if [ -f LICENSE ]; then
+	cp LICENSE "$BUNDLE/Contents/Resources/"
+fi
 
 # --------------------------------------------------------------- assinatura
 

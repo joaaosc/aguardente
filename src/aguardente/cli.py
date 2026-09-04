@@ -291,7 +291,13 @@ def cmd_plan(args: argparse.Namespace) -> int:
     ui.field("RAM total", f"{m.ram_bytes / GB:.0f} GB",
              note=f"orçamento de {m.usable_ram_bytes / GB:.0f} GB")
     ui.field("disco livre", f"{m.free_disk_bytes / GB:.0f} GB")
-    ui.field("treinável até", _fmt_params(budget.max_params_for_training()))
+    # O mesmo dtype que o `run` vai usar. Calcular o teto com o padrão de 2
+    # bytes fazia o `plan` anunciar um alvo 1,33x maior do que o `run` aceita
+    # em máquina sem MPS — e o `run` abortava sobre o número que o `plan`
+    # tinha acabado de sugerir.
+    dtype_bytes = training_dtype_bytes(getattr(args, "device", None))
+    teto = budget.max_params_for_training(dtype_bytes=dtype_bytes)
+    ui.field("treinável até", _fmt_params(teto))
     ui.field("comprimido cabe até", _fmt_params(budget.max_params_for_inference()))
 
     if args.other_ram_gb is not None or args.other_disk_gb is not None:
@@ -302,7 +308,6 @@ def cmd_plan(args: argparse.Namespace) -> int:
         _secao_outra_maquina(a, p, args.other_ram_gb, args.other_disk_gb,
                              args.target_params, effort.get(getattr(args, "effort", None)))
 
-    teto = budget.max_params_for_training()
     target = args.target_params or teto
     if args.target_params and args.target_params > teto:
         ui.blank()
@@ -353,7 +358,6 @@ def cmd_plan(args: argparse.Namespace) -> int:
         # A mesma conta que `run` fará, com as mesmas entradas: sem MPS o treino
         # cai para float32 e o lote cabível é outro. Estimar aqui com números
         # diferentes anunciaria um lote que a execução não usaria.
-        dtype_bytes = training_dtype_bytes(getattr(args, "device", None))
         lote = suggested_batch_size(p, budget, seq_len=nivel.seq_len,
                                     dtype_bytes=dtype_bytes, training=True)
         ui.field("lote sugerido pela RAM", str(lote))
@@ -403,6 +407,9 @@ def _secao_outra_maquina(a, p, ram_gb: float, disk_gb: float,
     """
     m = Machine.other(ram_gb=ram_gb, disk_gb=disk_gb)
     budget = Budget.for_machine(m)
+    # Aqui o padrão de 2 bytes é o correto, e não uma omissão: a outra máquina
+    # é descrita só por RAM e disco, e todo Mac que roda este programa é Apple
+    # Silicon — logo, treina em float16 sobre MPS.
     teto = budget.max_params_for_training()
     alvo = target_params or teto
 

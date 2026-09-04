@@ -430,3 +430,40 @@ def test_limpeza_de_checkpoints_precede_a_medicao_de_disco():
     fonte = inspect.getsource(pl.stage_recover)
     assert (fonte.index("_preparar_checkpoints")
             < fonte.index("os checkpoints da recuperação"))
+
+
+def test_teto_do_plan_usa_o_mesmo_dtype_do_run():
+    """O plan anunciava um teto 1,33x maior do que o run aceita sem MPS."""
+    from aguardente.budget import GB, Budget, Machine
+
+    budget = Budget.for_machine(Machine(24 * GB, 500 * GB, 8, True))
+    assert budget.max_params_for_training(dtype_bytes=4) < \
+        budget.max_params_for_training(dtype_bytes=2)
+
+
+def test_dtype_de_treino_nao_importa_torch():
+    """`plan` existe para não tocar em nada; importar torch custa RAM residente."""
+    import sys as _sys
+
+    antes = "torch" in _sys.modules
+    assert pl.training_dtype_bytes() in (2, 4)
+    assert ("torch" in _sys.modules) == antes
+
+
+def test_dtype_de_treino_respeita_o_dispositivo_informado():
+    assert pl.training_dtype_bytes("mps") == 2
+    assert pl.training_dtype_bytes("cpu") == 4
+
+
+def test_student_de_outra_configuracao_e_descartado(tmp_path):
+    """Um download interrompido não pode misturar dois students no destino."""
+    ctx = contexto(tmp_path, student="org/a")
+    destino = ctx.opts.pruned_dir
+    destino.mkdir(parents=True)
+    (destino / "model.safetensors").write_bytes(b"pesos do student anterior")
+    (destino / pl.FINGERPRINT_FILE).write_text("impressao-de-outro-student")
+
+    pl._preparar_artefatos(ctx, destino, "prune", aviso="descartado")
+
+    assert not (destino / "model.safetensors").exists()
+    assert (destino / pl.FINGERPRINT_FILE).read_text() == fingerprint(ctx.opts, "prune")

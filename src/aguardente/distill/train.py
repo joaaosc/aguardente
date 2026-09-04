@@ -344,5 +344,8 @@ def _load_checkpoint(ckpt: Path, student: Any, optimizer: Any, *, device: str) -
                  "checkpoints ou use --restart para começar a recuperação do zero.",
         ) from e
     optimizer.load_state_dict(blob["optimizer_state"])
+    # `stale` continua sendo gravado, porque documenta por que a execução
+    # anterior parou, mas não é devolvido: restaurá-lo encerrava a retomada na
+    # primeira avaliação. Ver o comentário em `recover`.
     return {"step": blob["step"], "lotes_feitos": blob["lotes_feitos"],
-            "best": blob["best"], "stale": blob.get("stale", 0)}
+            "best": blob["best"]}

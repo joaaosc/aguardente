@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import platform
 import shutil
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -388,17 +390,30 @@ def _guard_training_ceiling(ctx: Context, params: int, teto: float, budget: Budg
 
 
 def training_dtype_bytes(device: str | None = None) -> int:
-    """Bytes por peso no treino: 2 em MPS (float16), 4 nos demais (float32)."""
-    try:
-        from .loading import pick_device
-        resolvido = pick_device(device)
-    except Exception:  # noqa: BLE001 — sem torch o plano ainda precisa de um número
-        resolvido = device or "mps"
-    return 2 if resolvido == "mps" else 4
+    """Bytes por peso no treino: 2 em MPS (float16), 4 nos demais (float32).
+
+    Sem dispositivo informado, a resposta sai da plataforma: MPS é o backend do
+    Metal, presente em todo Mac Apple Silicon — que é o único alvo suportado.
+    Perguntar ao torch custaria segundos de import e centenas de MB residentes
+    num comando como o `plan`, que existe justamente para não tocar em nada.
+    """
+    if device is None:
+        return 2 if (sys.platform == "darwin" and platform.machine() == "arm64") else 4
+    return 2 if device == "mps" else 4
 
 
 def _training_dtype_bytes(opts: RunOptions) -> int:
-    return training_dtype_bytes(opts.device)
+    """O mesmo cálculo, com o dispositivo real quando o torch já está carregado.
+
+    No `run` o torch é importado de qualquer forma, então vale confirmar em vez
+    de estimar: um Mac Apple Silicon com MPS desabilitado treina em float32, e
+    é a diferença entre o plano caber e a recuperação estourar a memória.
+    """
+    try:
+        from .loading import pick_device
+        return training_dtype_bytes(pick_device(opts.device))
+    except Exception:  # noqa: BLE001 — sem torch resta a estimativa por plataforma
+        return training_dtype_bytes(opts.device)
 
 
 def suggested_batch_size(p: ModelProbe, budget: Budget, *, seq_len: int,
@@ -709,6 +724,14 @@ def _stage_fetch_student(ctx: Context) -> Path:
         ctx.say(f"student      já presente: {out}")
         return out
 
+    # Um download interrompido deixa arquivos parciais sem registro no estado,
+    # e `plan_fetch` conta como já baixado tudo o que encontra no destino.
+    # Trocar de `--student` depois disso misturava os dois modelos no mesmo
+    # diretório. A marca é a mesma usada pelos logits e pelos checkpoints;
+    # configuração igual preserva o diretório e a retomada continua valendo.
+    _preparar_artefatos(ctx, out, "prune",
+                        aviso="download de outro student descartado")
+
     # Um student externo pode ter vários GB, e nada garante que caibam. As
     # demais etapas que escrevem em volume medem antes de começar; esta não
     # media, e encher o volume no meio do download degrada o sistema inteiro.
@@ -732,6 +755,9 @@ def _stage_fetch_student(ctx: Context) -> Path:
             ctx.say(f"student      copiando de {local} ({necessario/GB:.2f} GB)")
             shutil.rmtree(out, ignore_errors=True)
             shutil.copytree(local, out)
+            # `copytree` exige que o destino não exista, então a marca escrita
+            # acima foi junto; reescrevê-la mantém a etapa retomável.
+            (out / FINGERPRINT_FILE).write_text(fingerprint(opts, "prune"))
         else:
             ctx.say(f"student      baixando {ref} ({necessario/GB:.2f} GB pendentes)")
             fetch(plano_remoto, connections=opts.connections, concurrent=opts.concurrent,

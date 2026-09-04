@@ -319,8 +319,14 @@ def test_retomada_preserva_estado_do_otimizador(tmp_path):
 
     estado = _load_checkpoint(ckpt, novo_student, novo_optimizer, device="cpu")
 
-    assert estado == {"step": 1, "lotes_feitos": 1, "best": 0.5, "stale": 1}
+    # `stale` é gravado para documentar por que a execução parou, mas não volta:
+    # restaurá-lo encerraria a retomada na primeira avaliação.
+    assert estado == {"step": 1, "lotes_feitos": 1, "best": 0.5}
     assert novo_optimizer.state
+
+    import torch as _torch
+    gravado = _torch.load(ckpt / "last.pt", map_location="cpu", weights_only=True)
+    assert gravado["stale"] == 1
 
 
 def test_checkpoint_written_when_metric_improves(tmp_path):
