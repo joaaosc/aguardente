@@ -135,6 +135,13 @@ class RunOptions:
     max_context_length: int | None = None
     export_dry_run: bool = False
 
+    # extração
+    # Consome os shards de origem em vez de copiá-los: um shard inteiramente
+    # mantido é reescrito no lugar e movido, o que derruba o pico de disco ao
+    # custo de destruir o checkpoint baixado — refazer a etapa exige novo
+    # download.
+    discard_source_weights: bool = False
+
     # controle
     effort: str = "medium"
     device: str | None = None

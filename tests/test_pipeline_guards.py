@@ -467,3 +467,37 @@ def test_student_de_outra_configuracao_e_descartado(tmp_path):
 
     assert not (destino / "model.safetensors").exists()
     assert (destino / pl.FINGERPRINT_FILE).read_text() == fingerprint(ctx.opts, "prune")
+
+
+def test_flag_de_descarte_de_pesos_chega_ao_pipeline():
+    """A etapa de extração lê `opts.discard_source_weights`; sem o campo, quebrava."""
+    from aguardente import cli
+
+    args = cli.build_parser().parse_args(
+        ["run", "org/m", "-o", "run", "--discard-source-weights"])
+    assert cli._options_from(args).discard_source_weights is True
+    assert cli._options_from(
+        cli.build_parser().parse_args(["run", "org/m", "-o", "run"])
+    ).discard_source_weights is False
+
+
+def test_todo_atributo_lido_de_opts_existe_em_run_options():
+    """Guarda estrutural: `opts.x` no pipeline só compila contra um campo real."""
+    import ast
+    import dataclasses
+    from pathlib import Path
+
+    campos = {f.name for f in dataclasses.fields(RunOptions)}
+    campos |= {n for n in dir(RunOptions) if not n.startswith("_")}
+
+    fonte = Path(pl.__file__).read_text()
+    lidos = {
+        n.attr
+        for n in ast.walk(ast.parse(fonte))
+        if isinstance(n, ast.Attribute)
+        and (
+            (isinstance(n.value, ast.Name) and n.value.id == "opts")
+            or (isinstance(n.value, ast.Attribute) and n.value.attr == "opts")
+        )
+    }
+    assert not (lidos - campos)

@@ -671,6 +671,7 @@ def _options_from(args: argparse.Namespace) -> RunOptions:
         calib_file=args.calib_file,
         effort=nivel.name,
         no_checkpointing=args.no_checkpointing,
+        discard_source_weights=getattr(args, "discard_source_weights", False),
         **valores,
         platform=args.platform,
         compression=args.compression,
