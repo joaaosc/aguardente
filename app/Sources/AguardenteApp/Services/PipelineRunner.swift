@@ -167,8 +167,15 @@ public final class PipelineRunner {
     public func cancel() {
         streamTask?.cancel()
         streamTask = nil
+        let estavaPausado = phase == .paused
         stopTimer()
         if let proc = process, proc.isRunning {
+            // SIGTERM não chega a um processo parado por SIGSTOP. Sem retomar
+            // antes, cancelar durante a pausa deixava o pipeline suspenso para
+            // sempre, segurando a RAM e o modelo já carregado.
+            if estavaPausado {
+                proc.resume()
+            }
             proc.terminate()
         }
         process = nil
@@ -303,13 +310,29 @@ public final class PipelineRunner {
         return args
     }
 
+    /// Conclui a execução a partir do código de saída do processo.
+    ///
+    /// Só quando não há nada melhor. O código de saída é a informação mais
+    /// pobre disponível: uma parada deliberada já registrou `.cancelled`, e um
+    /// evento `error` já trouxe a mensagem específica com a dica. Sem esta
+    /// guarda, o encerramento do processo sobrescrevia as duas — cancelar
+    /// mostrava "Falhou: processo encerrou com código 15", e o diagnóstico que
+    /// o pipeline mandou desaparecia atrás do código de saída.
+    /// Ponto de entrada do teste para o encerramento do processo.
+    ///
+    /// Os testes não criam processo real, e é justamente no encerramento que
+    /// estava o defeito: sem uma porta de entrada, a guarda ficaria sem
+    /// cobertura.
+    func concluirParaTeste(exitCode: Int32) {
+        handleProcessTermination(exitCode: exitCode)
+    }
+
     private func handleProcessTermination(exitCode: Int32) {
         stopTimer()
-        if exitCode == 0 {
-            phase = .finished(ok: true)
-        } else {
-            phase = .failed("Processo encerrou com código \(exitCode)")
-        }
+        guard phase.isActive else { return }
+        phase = exitCode == 0
+            ? .finished(ok: true)
+            : .failed("Processo encerrou com código \(exitCode)")
     }
 
     private func handleProcessError(_ error: Error) {

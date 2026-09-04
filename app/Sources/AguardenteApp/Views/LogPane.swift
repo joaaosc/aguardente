@@ -92,13 +92,19 @@ public struct LogPane: View {
                 }
                 .background(Color(nsColor: .textBackgroundColor))
                 .textSelection(.enabled)
-                .onChange(of: lines.count) { _, _ in
-                    guard let last = filteredLines.last else { return }
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo(last.id, anchor: .bottom)
-                    }
-                }
+                .onChange(of: lines.count) { _, _ in irParaOFim(proxy) }
+                // Filtrar reconstrói a lista inteira; sem isto a rolagem ficava
+                // parada onde o log não filtrado estava, quase sempre fora da
+                // faixa visível do resultado.
+                .onChange(of: filterText) { _, _ in irParaOFim(proxy) }
             }
+        }
+    }
+
+    private func irParaOFim(_ proxy: ScrollViewProxy) {
+        guard let ultima = filteredLines.last else { return }
+        withAnimation(.easeOut(duration: 0.15)) {
+            proxy.scrollTo(ultima.id, anchor: .bottom)
         }
     }
 
@@ -110,8 +116,12 @@ public struct LogPane: View {
         }
     }
 
+    /// Copia o que está à vista.
+    ///
+    /// O botão fica ao lado do campo de filtro, e copiar o log inteiro quando a
+    /// tela mostra três linhas contraria o que a posição promete.
     private func copyLog() {
-        let text = lines.map { "[\($0.formattedTime)] \($0.text)" }.joined(separator: "\n")
+        let text = filteredLines.map { "[\($0.formattedTime)] \($0.text)" }.joined(separator: "\n")
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
         didCopy = true

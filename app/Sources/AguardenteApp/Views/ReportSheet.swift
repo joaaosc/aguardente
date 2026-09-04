@@ -39,13 +39,17 @@ public struct ReportSheet: View {
         }
         md += "\n"
 
-        let allMetrics = runner.stages.flatMap { $0.metrics }
-        if !allMetrics.isEmpty {
+        // A etapa entra na tabela porque a mesma chave pode ser emitida por
+        // etapas diferentes — `seconds` vem de todas elas. Sem a coluna, duas
+        // linhas idênticas apareceriam sem meio de distingui-las.
+        if runner.stages.contains(where: { !$0.metrics.isEmpty }) {
             md += "## Métricas de Qualidade\n\n"
-            md += "| Métrica | Valor | Meta Atendida |\n"
-            md += "|---|---|---|\n"
-            for m in allMetrics {
-                md += "| \(m.label) | \(m.formatted) | \(m.meetsTarget ? "✓" : "⚠") |\n"
+            md += "| Etapa | Métrica | Valor | Meta Atendida |\n"
+            md += "|---|---|---|---|\n"
+            for etapa in runner.stages {
+                for m in etapa.metrics {
+                    md += "| \(etapa.title) | \(m.label) | \(m.formatted) | \(m.meetsTarget ? "✓" : "⚠") |\n"
+                }
             }
             md += "\n"
         }
@@ -93,22 +97,32 @@ public struct ReportSheet: View {
 
                     Divider()
 
-                    // Métricas
-                    let allMetrics = runner.stages.flatMap { $0.metrics }
-                    if !allMetrics.isEmpty {
-                        VStack(alignment: .leading, spacing: 10) {
+                    // Métricas, agrupadas por etapa. A identidade de `Metric` é
+                    // a chave, única dentro de uma etapa mas não entre elas:
+                    // achatar tudo numa lista só daria ids repetidos ao ForEach,
+                    // que descartaria linhas em silêncio.
+                    if runner.stages.contains(where: { !$0.metrics.isEmpty }) {
+                        VStack(alignment: .leading, spacing: 14) {
                             Text("Métricas Coletadas")
                                 .font(.headline)
 
-                            ForEach(allMetrics, id: \.id) { (m: Metric) in
-                                HStack {
-                                    Text(m.label)
-                                    Spacer()
-                                    Text(m.formatted)
-                                        .font(.callout.monospacedDigit().weight(.semibold))
-                                        .foregroundStyle(m.meetsTarget ? Color.primary : Color.orange)
+                            ForEach(runner.stages.filter { !$0.metrics.isEmpty }) { etapa in
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(etapa.title)
+                                        .font(.subheadline.weight(.medium))
+                                        .foregroundStyle(.secondary)
+
+                                    ForEach(etapa.metrics) { m in
+                                        HStack {
+                                            Text(m.label)
+                                            Spacer()
+                                            Text(m.formatted)
+                                                .font(.callout.monospacedDigit().weight(.semibold))
+                                                .foregroundStyle(m.meetsTarget ? Color.primary : Color.orange)
+                                        }
+                                        .padding(.vertical, 2)
+                                    }
                                 }
-                                .padding(.vertical, 3)
                             }
                         }
 

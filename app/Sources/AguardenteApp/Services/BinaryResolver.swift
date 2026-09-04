@@ -54,10 +54,15 @@ public struct BinaryResolver: Sendable {
             URL(fileURLWithPath: "/opt/homebrew/bin/uv"),
             URL(fileURLWithPath: "/usr/local/bin/uv")
         ]
-        for uvLoc in uvLocations {
-            if fileManager.isExecutableFile(atPath: uvLoc.path) {
-                let project = projectDirectory ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                return .uvWrapper(uvURL: uvLoc, projectDir: project)
+        // `uv run` resolve o projeto a partir do diretório de trabalho, então o
+        // wrapper só serve com um diretório de projeto real. O recuo anterior
+        // era o diretório do processo, que num `.app` aberto pelo Finder é `/`:
+        // devolvia um caminho de execução que falharia sempre. Dizer que não
+        // encontrou é a resposta verdadeira, e leva o usuário à tela que
+        // explica o que instalar.
+        if let projectDir = projectDirectory {
+            for uvLoc in uvLocations where fileManager.isExecutableFile(atPath: uvLoc.path) {
+                return .uvWrapper(uvURL: uvLoc, projectDir: projectDir)
             }
         }
 

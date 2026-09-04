@@ -143,3 +143,52 @@ struct ConfiguracaoTests {
         #expect(Preferences.destinoPadrao.hasPrefix("/"))
     }
 }
+
+@Suite("Caminho de controle")
+@MainActor
+struct ControleTests {
+
+    @Test("Encerramento não sobrescreve uma parada deliberada")
+    func encerramentoNaoSobrescreveCancelamento() {
+        let runner = PipelineRunner()
+        runner.cancel()
+        #expect(runner.phase == .cancelled)
+
+        runner.concluirParaTeste(exitCode: 15)
+
+        #expect(runner.phase == .cancelled)
+    }
+
+    @Test("Encerramento não sobrescreve o motivo vindo do pipeline")
+    func encerramentoNaoSobrescreveErroDoPipeline() {
+        let runner = PipelineRunner()
+        runner.apply(.error(id: "prune", message: "o alvo excede o teto", hint: "reduza"))
+        #expect(runner.phase == .failed("o alvo excede o teto"))
+
+        runner.concluirParaTeste(exitCode: 1)
+
+        #expect(runner.phase == .failed("o alvo excede o teto"))
+    }
+
+    @Test("Sem diretório de projeto, o wrapper uv não é oferecido")
+    func semProjetoNaoOfereceWrapper() {
+        // O diretório de trabalho de um .app aberto pelo Finder é `/`; devolver
+        // um uvWrapper apontando para lá seria prometer um caminho que falha.
+        if case .uvWrapper = BinaryResolver.resolve(projectDirectory: nil) {
+            Issue.record("uvWrapper devolvido sem diretório de projeto")
+        }
+    }
+
+    @Test("O log descarta em blocos ao passar do teto")
+    func logDescartaEmBlocos() {
+        let etapa = Stage(id: "x", title: "X")
+        for i in 0..<120 {
+            etapa.appendCappedLog(LogLine(text: "linha \(i)"), limit: 100)
+        }
+        // Aparado para 90 no primeiro estouro, e só voltaria a aparar na 101ª
+        // linha seguinte — não uma remoção por linha.
+        #expect(etapa.log.count <= 100)
+        #expect(etapa.log.count >= 90)
+        #expect(etapa.log.last?.text == "linha 119")
+    }
+}
