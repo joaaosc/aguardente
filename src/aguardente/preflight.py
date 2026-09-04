@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .budget import GB, Machine
+from .quiet import Captured, silenced
 
 # Códigos sintéticos para falhas que não produzem código de saída do processo.
 NOT_FOUND = -1
@@ -280,15 +281,20 @@ def check_pipeline_deps(*, deep: bool = False) -> CheckResult:
 
     loaded = {}
     for module in (modules if deep else ("torch",)):
+        # Os avisos que os pacotes imprimem ao carregar são diagnóstico deles,
+        # não do ambiente: ficam retidos e só reaparecem se o import falhar.
+        ruido = Captured()
         try:
-            loaded[module] = importlib.import_module(module)
+            with silenced() as ruido:
+                loaded[module] = importlib.import_module(module)
         except Exception as exc:  # noqa: BLE001 — diagnóstico de dependência quebrada
             detail = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
             return CheckResult(
                 "stack do pipeline", Status.WARN,
                 f"{module} não carrega: {detail}",
                 "Reinstale as dependências completas com: aguardente install",
-                debug=f"{type(exc).__name__}: {exc}",
+                debug=f"{type(exc).__name__}: {exc}"
+                      + (f"\n{ruido}" if ruido else ""),
             )
 
     torch = loaded["torch"]

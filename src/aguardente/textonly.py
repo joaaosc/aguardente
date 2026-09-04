@@ -694,9 +694,14 @@ CLASS_DEFAULTS = {
 
 def supported_model_types() -> tuple[frozenset[str], bool]:
     """Arquiteturas aceitas pelo exportador, e se vieram do pacote instalado."""
+    from .quiet import silenced
+
     try:
-        from coreai_models.models.registry import list_models
-        return frozenset(list_models()), True
+        # O registro do exportador importa torch em cadeia, e a importação
+        # despeja avisos das bibliotecas no meio do painel do CLI.
+        with silenced():
+            from coreai_models.models.registry import list_models
+            return frozenset(list_models()), True
     except Exception:  # noqa: BLE001 — ausência do pacote é o caso comum
         return APPLE_FALLBACK, False
 
