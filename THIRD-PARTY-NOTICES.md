@@ -37,12 +37,31 @@ Invocadas como processos, nunca vinculadas nem redistribuídas.
 O aguardente **não redistribui pesos de modelo**. Ele baixa o que o usuário
 pedir e produz um modelo derivado a partir dele.
 
-Isso tem uma consequência que a licença deste projeto não resolve: **o modelo
-que sai do pipeline herda os termos do modelo que entrou**. Poda e destilação
-produzem uma obra derivada, e cada família tem regras próprias — Qwen e Mistral
-publicam sob Apache 2.0, enquanto Llama e outras usam licenças de comunidade
-com restrições de uso e obrigações de nomenclatura para derivados.
+### A licença dos pesos não restringe a licença deste programa
 
-Quem for redistribuir um modelo gerado aqui precisa checar a licença do modelo
-de origem. A licença de uso restrito deste programa cobre o programa, não os
-pesos que ele produz.
+Nenhuma licença de modelo alcança o código do aguardente. Elas governam os
+pesos e as obras derivadas deles — não o software que os processa. Não existe
+aqui o efeito de contaminação que uma licença copyleft teria sobre código: o
+aguardente pode continuar sob licença de uso restrito independentemente de
+quais modelos ele venha a converter.
+
+O que a licença do modelo governa é **a saída do pipeline**. Poda e destilação
+produzem obra derivada dos pesos de origem, e é a licença de origem que a
+acompanha — não a deste programa. Em termos práticos, para quem for
+redistribuir um modelo convertido:
+
+| Modelo de origem | Licença dos pesos | Efeito sobre o derivado |
+|---|---|---|
+| Qwen 3 (todas as escalas) | Apache 2.0 | Permissiva: pode ser redistribuído sob os termos que você escolher, inclusive restritivos, preservando a atribuição. |
+| Mistral 7B Instruct v0.3 | Apache 2.0 | Idem. |
+| SmolLM2 | Apache 2.0 | Idem. |
+| DeepSeek-R1-Distill-Qwen | MIT | Permissiva, com atribuição. |
+| Llama 3.x | Llama Community License | Restrições de uso, obrigação de nomear o derivado começando com "Llama" e de propagar a licença. |
+| Gemma | Gemma Terms of Use | Restrições de uso que se propagam a derivados. |
+
+O modelo padrão do aplicativo — Qwen 3 — é Apache 2.0, o caso mais folgado:
+nada nele limita a licença que você aplica ao resultado.
+
+A regra geral fica: **a licença de uso restrito deste programa cobre o
+programa, não os pesos que ele produz.** Ao distribuir um modelo convertido,
+verifique a licença do modelo de origem.
