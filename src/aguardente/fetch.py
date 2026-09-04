@@ -104,11 +104,26 @@ class FetchPlan:
         return sum(f.size for f in self.files)
 
     def missing(self) -> tuple[RemoteFile, ...]:
-        """Identifica arquivos ausentes ou incompletos no destino."""
+        """Identifica arquivos ausentes ou incompletos no destino.
+
+        O índice do Hugging Face nem sempre traz o tamanho — arquivos fora do
+        LFS podem vir sem o campo. Quando isso acontecia, a comparação de
+        tamanho era pulada por inteiro e qualquer arquivo existente passava por
+        completo, inclusive um de zero byte deixado por um download abortado.
+        Sem tamanho de referência, só dá para afirmar que um arquivo vazio está
+        incompleto — e é o que se afirma.
+        """
         out = []
         for f in self.files:
             local = safe_join(self.dest, f.path)
-            if not local.is_file() or (f.size and local.stat().st_size != f.size):
+            if not local.is_file():
+                out.append(f)
+                continue
+            tamanho_local = local.stat().st_size
+            if f.size:
+                if tamanho_local != f.size:
+                    out.append(f)
+            elif tamanho_local == 0:
                 out.append(f)
         return tuple(out)
 
