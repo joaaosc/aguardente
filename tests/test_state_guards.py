@@ -132,8 +132,44 @@ def test_lock_de_processo_morto_e_recuperado(tmp_path):
         assert json.loads(lock.read_text())["pid"] == os.getpid()
 
 
-def test_lock_antigo_e_considerado_obsoleto(tmp_path):
+def test_lock_remoto_nao_expira_silenciosamente(tmp_path):
     (tmp_path / "run.lock").write_text(json.dumps(
         {"pid": os.getpid(), "at": 0, "host": "outra-maquina"}))
-    with run_lock(tmp_path, stale_after=10) as lock:
-        assert lock.exists()
+    with pytest.raises(StateMismatch):
+        with run_lock(tmp_path, stale_after=10):
+            pass
+
+
+def test_lock_local_antigo_continua_protegendo_processo_vivo(tmp_path):
+    import socket
+    (tmp_path / "run.lock").write_text(json.dumps(
+        {"pid": os.getpid(), "at": 0, "host": socket.gethostname()}))
+    with pytest.raises(StateMismatch):
+        with run_lock(tmp_path, stale_after=10):
+            pass
+
+
+def test_new_incomplete_lock_is_not_stolen_during_its_creation(tmp_path):
+    (tmp_path / "run.lock").write_text("")
+    with pytest.raises(StateMismatch):
+        with run_lock(tmp_path):
+            pass
+
+
+def test_old_incomplete_lock_can_be_recovered(tmp_path):
+    lock = tmp_path / "run.lock"
+    lock.write_text("")
+    os.utime(lock, (0, 0))
+    with run_lock(tmp_path):
+        assert json.loads(lock.read_text())["pid"] == os.getpid()
+
+
+def test_restart_never_deletes_an_active_runs_artifacts(tmp_path):
+    from aguardente.pipeline import RunOptions, run_pipeline
+    marker = tmp_path / "student/config.json"
+    marker.parent.mkdir()
+    marker.write_text("preserve")
+    with run_lock(tmp_path):
+        with pytest.raises(StateMismatch):
+            run_pipeline(RunOptions(model="org/model", out_dir=tmp_path, restart=True))
+        assert marker.read_text() == "preserve"

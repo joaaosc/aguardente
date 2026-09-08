@@ -58,7 +58,8 @@ def test_kd_loss_is_zero_when_student_matches_teacher():
     torch.manual_seed(0)
     logits = torch.randn(2, 5, 64)
     vals, idx = logits.topk(8, dim=-1)
-    loss = kd_loss(logits, vals, idx, labels=None, alpha=1.0, temperature=2.0)
+    loss = kd_loss(logits, vals, idx, labels=None, alpha=1.0, temperature=2.0,
+                   teacher_logsumexp=torch.logsumexp(logits / 2, -1))
     assert float(loss) == pytest.approx(0.0, abs=1e-5)
 
 
@@ -140,7 +141,8 @@ def _mean_kd(model, logits) -> float:
     with torch.no_grad():
         for b in logits.batches():
             out = model(input_ids=b["input_ids"])
-            total += float(kd_loss(out.logits, b["values"], b["indices"], alpha=1.0))
+            total += float(kd_loss(out.logits, b["values"], b["indices"], alpha=1.0,
+                                   teacher_logsumexp=b["logsumexp"]))
     return total / logits.shards
 
 
@@ -319,9 +321,9 @@ def test_retomada_preserva_estado_do_otimizador(tmp_path):
 
     estado = _load_checkpoint(ckpt, novo_student, novo_optimizer, device="cpu")
 
-    # `stale` é gravado para documentar por que a execução parou, mas não volta:
-    # restaurá-lo encerraria a retomada na primeira avaliação.
-    assert estado == {"step": 1, "lotes_feitos": 1, "best": 0.5}
+    # A retomada mantém a mesma paciência; trocar hiperparâmetros invalida o
+    # checkpoint pelo fingerprint, em vez de alterar o treino silenciosamente.
+    assert estado == {"step": 1, "lotes_feitos": 1, "best": 0.5, "stale": 1}
     assert novo_optimizer.state
 
     import torch as _torch

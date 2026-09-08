@@ -363,6 +363,13 @@ def arch_from_shapes(headers: Mapping[str, Mapping[str, Any]], layout: TextLayou
     head_dim, cabecas, grupos = _cabecas(cfg or {}, q_out=q_out, kv_out=kv_out,
                                          hidden=hidden)
 
+    # A serialized lm_head can be a duplicate of tied embeddings (Qwen3).
+    # Shapes describe storage, while the config defines parameter sharing.
+    tied = (cfg or {}).get("tie_word_embeddings", layout.tie_word_embeddings)
+    if not tied and layout.lm_head is None:
+        raise UnsupportedArchitecture(
+            "config declara embeddings independentes, mas lm_head está ausente")
+
     # A quantidade de normas por camada não está em config algum: o Gemma 3
     # normaliza também a saída de cada bloco e tem quatro, contra as duas do
     # Llama. Contá-las pelo sufixo `layernorm.weight` acerta as duas famílias
@@ -382,7 +389,7 @@ def arch_from_shapes(headers: Mapping[str, Mapping[str, Any]], layout: TextLayou
         num_key_value_heads=grupos,
         head_dim=head_dim,
         vocab_size=vocab,
-        tie_word_embeddings=layout.tie_word_embeddings,
+        tie_word_embeddings=bool(tied),
         norms_per_layer=normas,
         qk_norm=f"{ROOT}layers.0.self_attn.q_norm.weight" in formas,
         attention_bias=f"{ROOT}layers.0.self_attn.q_proj.bias" in formas,

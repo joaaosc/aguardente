@@ -4,24 +4,27 @@ from __future__ import annotations
 
 import json
 import math
+import random
+import tempfile
 import time
+import signal
+import threading
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import Any, Callable
 
 from .loss import kd_loss
 from .teacher import TeacherLogits
 from ..errors import AguardenteError
-
-if TYPE_CHECKING:  # pragma: no cover
-    import torch
-
 
 @dataclass(frozen=True, slots=True)
 class RecoveryConfig:
     """Hiperparâmetros e configurações do treino de recuperação."""
 
     epochs: int = 2
+    seed: int = 42
+    shuffle: bool = True
     learning_rate: float = 3e-5
     weight_decay: float = 0.01
     alpha: float = 0.9
@@ -34,10 +37,7 @@ class RecoveryConfig:
     plateau_threshold: float = 0.005
     plateau_patience: int = 2
     max_seconds: float | None = None
-    # Passos de otimizador entre checkpoints automáticos. Independe de
-    # `evaluate`: sem `--measure` o checkpoint por ganho de perplexidade nunca
-    # dispara, e um treino de horas sem essa rede de segurança perderia tudo
-    # numa queda de energia ou num Ctrl-C sem querer.
+    # Passos de otimizador entre checkpoints completos para retomada.
     checkpoint_every: int = 50
 
 
@@ -56,6 +56,8 @@ class RecoveryResult:
     # Passos já feitos ao retomar de um checkpoint; 0 quando o treino começou
     # do zero. Só para relatório — não entra no cálculo do que falta rodar.
     resumed_from: int = 0
+    tokens_seen: int = 0
+    best_step: int | None = None
 
     @property
     def best_eval(self) -> float | None:
@@ -110,148 +112,177 @@ def recover(
     import torch
 
     cfg = cfg or RecoveryConfig()
+    if cfg.epochs < 1 or cfg.grad_accum < 1 or logits.shards < 1:
+        raise ValueError("epochs, grad_accum and logits.shards must be positive")
+    if cfg.learning_rate <= 0 or not math.isfinite(cfg.learning_rate):
+        raise ValueError("learning_rate must be finite and positive")
+    if cfg.plateau_patience < 1:
+        raise ValueError("plateau_patience must be positive")
     dev = device or str(next(student.parameters()).device)
     result = RecoveryResult()
-
+    torch.manual_seed(cfg.seed)
+    random.seed(cfg.seed)
+    if hasattr(student, "config"):
+        student.config.use_cache = False
     if cfg.gradient_checkpointing and hasattr(student, "gradient_checkpointing_enable"):
         student.gradient_checkpointing_enable()
         if hasattr(student, "enable_input_require_grads"):
             student.enable_input_require_grads()
-        if hasattr(student, "config"):
-            student.config.use_cache = False
-
+    if hasattr(student, "float"):
+        student.float()
+    if logits.temperature != cfg.temperature:
+        raise AguardenteError("temperatura dos logits difere da temperatura do treino; regenere os logits")
     optimizer = _build_optimizer(student, cfg)
-    total_steps = max(1, cfg.epochs * logits.shards // cfg.grad_accum)
-    eval_every = cfg.eval_every or max(1, logits.shards // 2)
-
-    ckpt = Path(checkpoint_dir) if checkpoint_dir else None
+    steps_per_epoch = math.ceil(logits.shards / cfg.grad_accum)
+    total_steps = cfg.epochs * steps_per_epoch
+    eval_every = cfg.eval_every or max(1, steps_per_epoch // 4)
+    # Best weights live on disk even for API callers without persistent checkpoints.
+    temporary = tempfile.TemporaryDirectory(prefix="aguardente-best-") if evaluate and not checkpoint_dir else None
+    ckpt = Path(checkpoint_dir or temporary.name) if checkpoint_dir or temporary else None
     if ckpt:
         ckpt.mkdir(parents=True, exist_ok=True)
-
-    best = float("inf")
-    stale = 0
-    # Posição global no fluxo de lotes, somada sobre todas as épocas — é o
-    # que permite retomar no meio de uma época, não só no início de uma nova.
-    lotes_feitos = 0
-    epoca_inicial = 0
-
+    best = plateau_best = float("inf")
+    stale = lotes_feitos = 0
     if ckpt and (ckpt / "last.pt").is_file():
         estado = _load_checkpoint(ckpt, student, optimizer, device=dev)
         result.steps = result.resumed_from = estado["step"]
         lotes_feitos = estado["lotes_feitos"]
-        # `best` volta porque é o piso de perplexidade já alcançado. `stale`
-        # não: um treino que parou por platô salvou o contador estourado, e
-        # restaurá-lo encerraria a retomada na primeira avaliação — inclusive
-        # quando foi justamente a taxa de aprendizado que mudou para escapar
-        # do platô. Cada execução merece a paciência inteira.
         best = estado["best"]
-        epoca_inicial = lotes_feitos // max(1, logits.shards)
-
+        plateau_best = estado.get("plateau_best", best)
+        stale = estado.get("stale", 0)
+        result.tokens_seen = estado.get("tokens_seen", 0)
+        result.evals = estado.get("evals", [])
+        result.best_step = estado.get("best_step")
     started = time.perf_counter()
     student.train()
+    pending = pending_tokens = 0
+    window_rng = None
 
-    def _checkpoint_automatico() -> None:
+    def checkpoint():
         if ckpt:
             _save_checkpoint_resumavel(student, optimizer, ckpt, result.steps,
-                                       lotes_feitos, best, stale)
+                lotes_feitos, best, stale, plateau_best=plateau_best,
+                tokens_seen=result.tokens_seen, evals=result.evals, best_step=result.best_step)
 
-    # Lotes acumulados desde o último passo do otimizador. É contado à parte de
-    # `lotes_feitos` — que é a posição global e nunca recua — porque um passo
-    # residual (fim de época, tempo esgotado, platô, Ctrl-C) fecha a janela de
-    # acumulação sem alinhar a posição global a um múltiplo de `grad_accum`.
-    # Derivar a janela de `lotes_feitos % grad_accum` faria a época seguinte
-    # disparar o primeiro passo com menos lotes do que o configurado.
-    pendentes = 0
+    def assess():
+        nonlocal best, plateau_best, stale
+        if not evaluate:
+            return False
+        student.eval()
+        try:
+            metric = float(evaluate())
+        finally:
+            student.train()
+        if not math.isfinite(metric) or metric <= 0:
+            raise AguardenteError(f"métrica de validação inválida: {metric}")
+        result.evals.append((result.steps, metric))
+        # Saving the actual minimum is independent from the patience threshold.
+        if metric < best:
+            best = metric
+            result.best_step = result.steps
+            if ckpt:
+                _save_checkpoint(student, ckpt, result.steps, metric)
+        gain = (plateau_best - metric) / plateau_best if math.isfinite(plateau_best) else 1.0
+        if gain > cfg.plateau_threshold:
+            plateau_best, stale = metric, 0
+        else:
+            stale += 1
+        return stale >= cfg.plateau_patience
 
-    def _aplica_passo() -> None:
-        nonlocal pendentes
-        torch.nn.utils.clip_grad_norm_(student.parameters(), cfg.max_grad_norm)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        result.steps += 1
-        pendentes = 0
-
-    def _flush_gradientes() -> None:
-        if pendentes:
-            _aplica_passo()
+    def apply_step():
+        nonlocal pending, pending_tokens, window_rng
+        # Each microbatch contributes its SUM, then the complete window is
+        # normalized by valid causal transitions, including a residual window.
+        # Ctrl-C must not checkpoint half of an AdamW update. Finish this small
+        # transaction before dispatching the signal to the interrupt handler.
+        with _defer_sigint():
+            for p in student.parameters():
+                if p.grad is not None:
+                    p.grad.div_(pending_tokens)
+            torch.nn.utils.clip_grad_norm_(student.parameters(), cfg.max_grad_norm,
+                                          error_if_nonfinite=True)
+            lr = _lr_at(result.steps + 1, total_steps, cfg)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            result.steps += 1
+            result.tokens_seen += pending_tokens
+            pending = pending_tokens = 0
+            window_rng = None
 
     try:
+        if evaluate and not result.evals:
+            assess()  # The untrained student is a valid best checkpoint too.
+        epoca_inicial = lotes_feitos // logits.shards
         for epoch in range(epoca_inicial, cfg.epochs):
-            # Só a época em que o treino parou pula lotes; as seguintes
-            # começam do zero normalmente.
-            pular = lotes_feitos - epoch * logits.shards if epoch == epoca_inicial else 0
-            fluxo = logits.batches(device=dev, start=pular)
-
-            for i, batch in enumerate(fluxo, start=pular):
-                lr = _lr_at(result.steps, total_steps, cfg)
-                for group in optimizer.param_groups:
-                    group["lr"] = lr
-
+            order = list(range(logits.shards))
+            if cfg.shuffle:
+                random.Random(cfg.seed + epoch).shuffle(order)
+            skip = lotes_feitos - epoch * logits.shards if epoch == epoca_inicial else 0
+            for i, batch in enumerate(logits.batches(device=dev, start=skip, order=order), start=skip):
+                if not pending:
+                    window_rng = _capture_rng()
                 mask = batch.get("attention_mask")
-                kwargs = {"attention_mask": mask} if mask is not None else {}
-                out = student(input_ids=batch["input_ids"], **kwargs)
-                loss = kd_loss(
-                    out.logits, batch["values"], batch["indices"],
-                    labels=batch["input_ids"],
-                    mask=mask,
-                    alpha=cfg.alpha, temperature=cfg.temperature,
-                )
-
+                ids = batch["input_ids"]
+                tokens = int((mask[:, :-1].bool() & mask[:, 1:].bool()).sum()) if mask is not None else ids.shape[0] * (ids.shape[1] - 1)
+                if tokens < 1:
+                    raise AguardenteError("shard sem transições causais válidas")
+                if "logsumexp" not in batch:
+                    raise AguardenteError("logits antigos sem massa de probabilidade; regenere a etapa logits")
+                out = student(input_ids=ids, **({"attention_mask": mask} if mask is not None else {}))
+                loss = kd_loss(out.logits, batch["values"], batch["indices"], labels=ids,
+                               mask=mask, alpha=cfg.alpha, temperature=cfg.temperature,
+                               teacher_logsumexp=batch["logsumexp"],
+                               teacher_tail_values=batch.get("tail_values"),
+                               teacher_tail_indices=batch.get("tail_indices"))
                 value = float(loss.detach())
                 if not math.isfinite(value):
-                    raise AguardenteError(
-                        f"a perda de destilação divergiu (loss={value}) no passo {result.steps}",
-                        hint="A taxa de aprendizado pode estar alta demais. Tente reduzir com --lr ou usar um nível de esforço mais conservador.",
-                    )
-
-                (loss / cfg.grad_accum).backward()
+                    raise AguardenteError(f"a perda de destilação divergiu (loss={value}) no passo {result.steps}")
+                (loss * tokens).backward()
                 lotes_feitos += 1
-                pendentes += 1
-
-                if pendentes >= cfg.grad_accum:
-                    _aplica_passo()
-                    if cfg.checkpoint_every and result.steps % cfg.checkpoint_every == 0:
-                        _checkpoint_automatico()
-
+                pending += 1
+                pending_tokens += tokens
+                stepped = pending == cfg.grad_accum or i + 1 == logits.shards
+                if stepped:
+                    apply_step()
                 result.losses.append(value)
-                if len(result.losses) > _MAX_LOSS_HISTORY:
-                    del result.losses[:len(result.losses) - _MAX_LOSS_HISTORY]
+                del result.losses[:-_MAX_LOSS_HISTORY]
+                if stepped:
+                    end_epoch = i + 1 == logits.shards
+                    if end_epoch:
+                        result.epochs_completed = epoch + 1
+                    if evaluate and (result.steps % eval_every == 0 or end_epoch):
+                        plateau = assess()
+                        # Early validation can plateau before the model has
+                        # seen half of a large corpus. Finish at least one
+                        # complete pass; still save/restore every real minimum.
+                        if plateau and 1 <= result.epochs_completed < cfg.epochs:
+                            result.stopped_by = "plateau"
+                            checkpoint()
+                            return _finish(result, started, student, ckpt)
+                    if cfg.checkpoint_every and result.steps % cfg.checkpoint_every == 0:
+                        checkpoint()
+                    if cfg.max_seconds and time.perf_counter() - started > cfg.max_seconds:
+                        result.stopped_by = "time"
+                        checkpoint()
+                        return _finish(result, started, student, ckpt)
                 if on_step:
                     on_step(result.steps, value)
-
-                if cfg.max_seconds and time.perf_counter() - started > cfg.max_seconds:
-                    result.stopped_by = "time"
-                    _flush_gradientes()
-                    _checkpoint_automatico()
-                    return _finish(result, started, student, ckpt)
-
-                if evaluate and (i + 1) % eval_every == 0:
-                    student.eval()
-                    metric = float(evaluate())
-                    student.train()
-                    result.evals.append((result.steps, metric))
-
-                    gain = (best - metric) / best if math.isfinite(best) else 1.0
-                    if gain > cfg.plateau_threshold:
-                        best, stale = metric, 0
-                        if ckpt:
-                            _save_checkpoint(student, ckpt, result.steps, metric)
-                    else:
-                        stale += 1
-                        if stale >= cfg.plateau_patience:
-                            result.stopped_by = "plateau"
-                            _flush_gradientes()
-                            _checkpoint_automatico()
-                            return _finish(result, started, student, ckpt)
-
-            _flush_gradientes()
-            result.epochs_completed = epoch + 1
+        return _finish(result, started, student, ckpt)
     except KeyboardInterrupt:
+        # An interrupted backward can leave partial gradients. Replay the whole
+        # uncommitted accumulation window, rather than applying corrupt updates.
+        optimizer.zero_grad(set_to_none=True)
+        lotes_feitos -= pending
+        if window_rng is not None:
+            _restore_rng(window_rng)
         result.stopped_by = "interrupted"
-        _flush_gradientes()
-        _checkpoint_automatico()
-
-    return _finish(result, started, student, ckpt)
+        checkpoint()
+        return _finish(result, started, student, ckpt)
+    finally:
+        if temporary:
+            temporary.cleanup()
 
 
 def _finish(result: RecoveryResult, started: float, student: Any,
@@ -300,8 +331,7 @@ def _exigir_pesos_finitos(student: Any) -> None:
                 f"a recuperação produziu pesos não finitos em {nome}",
                 hint="O treino divergiu no último passo. Reduza --lr, aumente "
                      "--grad-accum, ou use um nível de esforço mais conservador; "
-                     "em --device cpu o treino roda em float32, com mais margem "
-                     "numérica.",
+                     "o treino usa FP32 em todos os dispositivos.",
             )
 
 
@@ -314,7 +344,7 @@ def _save_checkpoint(student: Any, ckpt: Path, step: int, metric: float) -> None
     try:
         torch.save(
             {"step": step, "metric": metric,
-             "state_dict": {k: v.detach().cpu() for k, v in student.state_dict().items()}},
+             "state_dict": _cpu_state_dict(student)},
             temporario,
         )
         temporario.replace(destino)
@@ -323,7 +353,7 @@ def _save_checkpoint(student: Any, ckpt: Path, step: int, metric: float) -> None
 
 
 def _save_checkpoint_resumavel(student: Any, optimizer: Any, ckpt: Path, step: int,
-                               lotes_feitos: int, best: float, stale: int) -> None:
+                               lotes_feitos: int, best: float, stale: int, **extra: Any) -> None:
     """Grava pesos, estado do otimizador e posição — o bastante para retomar do zero.
 
     Diferente de `_save_checkpoint` (só os pesos, para inspecionar o melhor
@@ -338,8 +368,8 @@ def _save_checkpoint_resumavel(student: Any, optimizer: Any, ckpt: Path, step: i
     try:
         torch.save(
             {"step": step, "lotes_feitos": lotes_feitos, "best": best, "stale": stale,
-             "state_dict": {k: v.detach().cpu() for k, v in student.state_dict().items()},
-             "optimizer_state": optimizer.state_dict()},
+             "state_dict": _cpu_state_dict(student),
+             "optimizer_state": optimizer.state_dict(), "rng": _capture_rng(), **extra},
             temporario,
         )
         temporario.replace(destino)
@@ -367,8 +397,58 @@ def _load_checkpoint(ckpt: Path, student: Any, optimizer: Any, *, device: str) -
                  "checkpoints ou use --restart para começar a recuperação do zero.",
         ) from e
     optimizer.load_state_dict(blob["optimizer_state"])
-    # `stale` continua sendo gravado, porque documenta por que a execução
-    # anterior parou, mas não é devolvido: restaurá-lo encerrava a retomada na
-    # primeira avaliação. Ver o comentário em `recover`.
-    return {"step": blob["step"], "lotes_feitos": blob["lotes_feitos"],
-            "best": blob["best"]}
+    if "rng" in blob:
+        _restore_rng(blob["rng"])
+    return {k: v for k, v in blob.items() if k not in {"state_dict", "optimizer_state", "rng"}}
+
+
+def _cpu_state_dict(student: Any) -> dict[str, Any]:
+    # Tied embeddings/lm_head share GPU storage. Moving each key separately to
+    # CPU duplicates that large matrix in both host RAM and checkpoint files.
+    copies, state = {}, {}
+    for key, value in student.state_dict().items():
+        identity = (str(value.device), value.data_ptr(), value.dtype, tuple(value.shape), tuple(value.stride()))
+        if identity not in copies:
+            copies[identity] = value.detach().cpu()
+        state[key] = copies[identity]
+    return state
+
+
+def _capture_rng() -> dict[str, Any]:
+    import torch
+    state = {"python": random.getstate(), "torch": torch.get_rng_state()}
+    if torch.backends.mps.is_available():
+        state["mps"] = torch.mps.get_rng_state()
+    if torch.cuda.is_initialized():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng(state: dict[str, Any]) -> None:
+    import torch
+    random.setstate(state["python"])
+    torch.set_rng_state(state["torch"].cpu())
+    if "mps" in state:
+        torch.mps.set_rng_state(state["mps"].cpu())
+    if "cuda" in state:
+        torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])
+
+
+@contextmanager
+def _defer_sigint():
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.getsignal(signal.SIGINT)
+    received = []
+
+    def defer(signum, frame):
+        received.append((signum, frame))
+
+    signal.signal(signal.SIGINT, defer)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    if received and callable(previous):
+        previous(*received[0])

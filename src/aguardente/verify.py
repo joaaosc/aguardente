@@ -41,6 +41,8 @@ def perplexity(
     n = ids.size(1)
     if n < 2:
         raise ValueError("texto curto demais para medir perplexidade")
+    if max_len < 2 or stride < 1 or stride >= max_len:
+        raise ValueError("perplexity requires 1 <= stride < max_length to score every causal target")
 
     nll_sum = torch.zeros((), dtype=torch.float64)
     counted = 0
@@ -65,7 +67,7 @@ def perplexity(
                 if valid <= 0:
                     continue
                 out = model(input_ids=window, labels=targets)
-                nll_sum += out.loss.detach().double().cpu() * valid
+                nll_sum += out.loss.detach().cpu().double() * valid
                 counted += valid
                 windows += 1
 
@@ -80,13 +82,15 @@ def perplexity(
 
 
 def perplexity_on_wikitext(
-    model: Any, tokenizer: Any, *, max_chars: int = 200_000, **kw: Any
+    model: Any, tokenizer: Any, *, max_chars: int = 20_000, split: str = "test", **kw: Any
 ) -> Perplexity:
     """Calcula a perplexidade sobre o conjunto de teste do WikiText."""
     from .calibration import load_texts
 
-    texts = load_texts(split="test", limit=512, min_chars=1)
+    texts = load_texts(split=split, limit=512, min_chars=1)
     joined = "\n\n".join(texts)[:max_chars]
+    kw.setdefault("max_length", 512)
+    kw.setdefault("stride", 256)
     return perplexity(model, tokenizer, joined, **kw)
 
 

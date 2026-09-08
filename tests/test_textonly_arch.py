@@ -86,6 +86,24 @@ def test_dimensoes_do_qwen_com_gqa_e_bias():
     assert a.attention_bias is True
 
 
+def test_lm_head_materializado_nao_desfaz_compartilhamento_do_config():
+    h = checkpoint("model.", hidden=32, inter=64, camadas=2, vocab=128,
+                   q_out=32, kv_out=16, lm_head=True)
+    headers = {"m.safetensors": h}
+    layout = discover_layout(headers)
+    a = arch_from_shapes(headers, layout,
+                         cfg={"head_dim": 8, "tie_word_embeddings": True})
+    assert a.tie_word_embeddings is True
+    assert count_params(a).lm_head == 0
+    assert layout.kept_params - count_params(a).total == 128 * 32
+    assert reconcile(a, layout) == 0
+
+
+def test_cabeca_independente_ausente_nao_e_inventada():
+    with pytest.raises(UnsupportedArchitecture, match="lm_head está ausente"):
+        montar(qwen(2), cfg={"head_dim": 128, "tie_word_embeddings": False})
+
+
 def test_qk_norm_vem_das_formas_nao_do_model_type():
     a = montar(checkpoint("model.", hidden=1024, inter=3072, camadas=4, vocab=1000,
                           q_out=1024, kv_out=512, qk_norm=True),

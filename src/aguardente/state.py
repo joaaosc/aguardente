@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import shutil
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -23,6 +24,23 @@ FINGERPRINT = "fingerprint"
 LOCK_FILE = "run.lock"
 # Um lock mais antigo que isto pertence a um processo que morreu sem limpá-lo.
 STALE_LOCK_SECONDS = 12 * 3600
+ARTIFACT_DIRS = ("teacher", "teacher-text", "pruned", "logits", "student", "bundle", "ckpt", "data", "dry-run")
+
+
+def discard_run_artifacts(out_dir: Path) -> list[str]:
+    """Called with run_lock held; keep the lock and user-owned files intact."""
+    removed = []
+    for name in (STATE_FILE, "quality.json", "reconstruction.json", "runtime-validation.json"):
+        path = out_dir / name
+        if path.is_file():
+            path.unlink()
+            removed.append(name)
+    for name in ARTIFACT_DIRS:
+        path = out_dir / name
+        if path.is_dir():
+            shutil.rmtree(path)
+            removed.append(f"{name}/")
+    return removed
 
 
 def _process_alive(pid: int) -> bool:
@@ -43,13 +61,16 @@ def _lock_owner(lock: Path) -> dict[str, Any] | None:
         dados = json.loads(lock.read_text())
     except (OSError, json.JSONDecodeError):
         return None
-    return dados if isinstance(dados, dict) else None
+    return dados if isinstance(dados, dict) and {"pid", "host", "at"} <= dados.keys() else None
+
+
+def run_is_active(run_dir: str | Path) -> bool:
+    owner = _lock_owner(Path(run_dir) / LOCK_FILE)
+    return bool(owner and (owner["host"] != socket.gethostname() or _process_alive(int(owner["pid"]))))
 
 
 def _lock_is_stale(dono: dict[str, Any], stale_after: float) -> bool:
-    """Um lock é obsoleto quando seu dono morreu ou envelheceu além do limite."""
-    if time.time() - float(dono.get("at") or 0) > stale_after:
-        return True
+    """Treinos longos não perdem o lock enquanto o processo estiver vivo."""
     # A verificação por pid só vale na mesma máquina: em volume compartilhado o
     # número poderia coincidir com um processo local sem qualquer relação.
     if dono.get("host") != socket.gethostname():
@@ -75,7 +96,8 @@ def run_lock(run_dir: str | Path, *,
             break
         except FileExistsError:
             dono = _lock_owner(lock)
-            if tentativa == 1 and (dono is None or _lock_is_stale(dono, stale_after)):
+            incomplete_stale = dono is None and time.time() - lock.stat().st_mtime > min(60, stale_after)
+            if tentativa == 1 and (incomplete_stale or (dono is not None and _lock_is_stale(dono, stale_after))):
                 lock.unlink(missing_ok=True)
                 continue
             raise StateMismatch(
@@ -156,7 +178,7 @@ class RunState:
     @classmethod
     def load_or_create(cls, run_dir: str | Path, *, model: str = "",
                        target_params: int | None = None,
-                       restart: bool = False) -> RunState:
+                       restart: bool = False, reset_interrupted: bool = True) -> RunState:
         d = Path(run_dir).expanduser()
         p = d / STATE_FILE
         if p.is_file() and not restart:
@@ -179,7 +201,7 @@ class RunState:
             )
             # Reseta etapas interrompidas que ficaram salvas como "running"
             for s in state.stages.values():
-                if s.status is StageStatus.RUNNING:
+                if reset_interrupted and s.status is StageStatus.RUNNING:
                     s.status = StageStatus.PENDING
             return state
 

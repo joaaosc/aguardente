@@ -85,7 +85,6 @@ def test_interrupcao_mantem_codigo_130(monkeypatch, capsys):
 
 def test_restart_remove_estado_e_artefatos(tmp_path):
     (tmp_path / "state.json").write_text("{}")
-    (tmp_path / "run.lock").write_text("{}")
     for nome in ("teacher", "logits", "ckpt"):
         (tmp_path / nome).mkdir()
         (tmp_path / nome / "peso.bin").write_bytes(b"x")
@@ -93,7 +92,7 @@ def test_restart_remove_estado_e_artefatos(tmp_path):
 
     removidos = cli._discard_run_dir(tmp_path)
 
-    assert set(removidos) == {"state.json", "run.lock", "teacher/", "logits/", "ckpt/"}
+    assert set(removidos) == {"state.json", "teacher/", "logits/", "ckpt/"}
     assert not (tmp_path / "teacher").exists()
     # O que não pertence ao pipeline permanece: --restart não limpa o diretório inteiro.
     assert (tmp_path / "notas.txt").exists()
@@ -101,6 +100,16 @@ def test_restart_remove_estado_e_artefatos(tmp_path):
 
 def test_restart_em_diretorio_limpo_nao_remove_nada(tmp_path):
     assert cli._discard_run_dir(tmp_path) == []
+
+
+def test_development_launcher_preserves_cli_failure_exit_code(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+    script = Path(__file__).resolve().parents[1] / "scripts/dev_cli.py"
+    result = subprocess.run([sys.executable, str(script), "status", "-o", str(tmp_path)],
+                            capture_output=True, text=True)
+    assert result.returncode == 1
 
 
 # ------------------------------------------------------------------- parser

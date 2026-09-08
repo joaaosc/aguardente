@@ -116,6 +116,13 @@ class Budget:
 
     @classmethod
     def for_machine(cls, m: Machine) -> Budget:
+        if m.ram_bytes <= 0:
+            from .errors import InsufficientResources
+            raise InsufficientResources(
+                "não foi possível medir a RAM desta máquina",
+                hint="Verifique o acesso a sysctl hw.memsize. Uma medição indisponível "
+                     "não permite calcular um orçamento de treino confiável.",
+            )
         return cls(machine=m, ram_bytes=m.usable_ram_bytes)
 
     def max_params_for_training(self, *, optimizer: str = "adamw",

@@ -16,7 +16,7 @@ from typing import Any, Callable
 from .arch import count_params
 from .budget import GB, Budget, Machine, suggest_batch_size
 from .effort import LOTE_DE_REFERENCIA
-from .errors import AguardenteError, InsufficientResources, PlanImpossible
+from .errors import AguardenteError, InsufficientResources
 from .events import EventLog, null_log
 from .plan import PrunePlan, plan_for_target
 from .probe import ModelProbe, probe
@@ -52,13 +52,35 @@ FINGERPRINT_FIELDS: dict[str, tuple[str, ...]] = {
     # trocar de student produz outro modelo treinado, e o bundle exportado do
     # student anterior não corresponde mais ao que se pediu.
     "export": ("model", "student", "target_params", "platform", "compression",
-               "compute_precision", "max_context_length"),
+               "compute_precision", "max_context_length", "compression_config"),
 }
 
 
 def fingerprint(opts: RunOptions, stage: str) -> str:
     """Resumo estável dos parâmetros que determinam a saída de uma etapa."""
-    campos = {k: getattr(opts, k) for k in FINGERPRINT_FIELDS[stage]}
+    from .inputs import local_identity, file_identity
+    fields = set(FINGERPRINT_FIELDS[stage])
+    if stage == "export":
+        fields.update(FINGERPRINT_FIELDS["recover"])
+    if stage != "extract":
+        fields.update(("seed", "calib_config", "calib_split", "text_column", "eval_file", "reconstruct", "max_ppl_ratio"))
+    campos = {k: getattr(opts, k) for k in fields}
+    campos["pipeline_version"] = 3
+    if stage == "export":
+        campos["export_version"] = 2  # activation calibration uses this run's training corpus
+    campos["input_contents"] = {k: local_identity(getattr(opts, k)) for k in
+                                ("model", "student", "calib_file", "eval_file", "compression_config")
+                                if k in fields}
+    if not Path(opts.model).expanduser().exists() and opts.teacher_dir.is_dir():
+        campos["downloaded_model"] = local_identity(str(opts.teacher_dir))
+    corpus = opts.out_dir / "data" / "corpus.json"
+    if stage != "extract" and corpus.is_file():
+        campos["corpus"] = file_identity(corpus)
+    if stage in {"logits", "recover", "export"}:
+        campos["temperature"] = opts.temperature
+        campos["tail_samples"] = opts.tail_samples
+    if stage in {"recover", "export"}:
+        campos["recovery_policy"] = 2  # plateau cannot discard the first corpus pass
     bruto = json.dumps(campos, sort_keys=True, default=str)
     return hashlib.sha256(bruto.encode()).hexdigest()[:16]
 
@@ -117,10 +139,18 @@ class RunOptions:
     seq_len: int = 512
     calib_dataset: str | None = None
     calib_file: str | None = None
+    calib_config: str | None = None
+    calib_split: str = "train"
+    text_column: str = "text"
+    eval_file: str | None = None
+    seed: int = 42
+    reconstruct: bool = True
+    max_ppl_ratio: float = 1.2
 
     # recuperação
     logit_batches: int = 256
     top_k: int = 128
+    tail_samples: int = 128
     epochs: int = 2
     lr: float = 3e-5
     alpha: float = 0.9
@@ -130,7 +160,8 @@ class RunOptions:
 
     # export
     platform: str = "macOS"
-    compression: str = "4bit"
+    compression: str = "auto"
+    compression_config: str | None = None
     compute_precision: str = "float16"
     max_context_length: int | None = None
     export_dry_run: bool = False
@@ -150,6 +181,22 @@ class RunOptions:
     skip_export: bool = False
     restart: bool = False
     allow_oversized: bool = False
+
+    def __post_init__(self):
+        for name in ("calib_batches", "logit_batches", "epochs", "grad_accum", "top_k"):
+            if getattr(self, name) < 1:
+                raise AguardenteError(f"{name} precisa ser positivo")
+        if self.tail_samples < 1:
+            raise AguardenteError("tail_samples precisa ser positivo para representar a cauda do teacher")
+        if self.seq_len < 2 or (self.batch_size is not None and self.batch_size < 1):
+            raise AguardenteError("seq_len precisa ser >= 2 e batch_size >= 1")
+        for name in ("lr", "temperature", "max_ppl_ratio"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise AguardenteError(f"{name} precisa ser finito e positivo")
+        if not 0 <= self.alpha <= 1:
+            raise AguardenteError("alpha precisa estar entre 0 e 1")
+        if not self.skip_export and (self.platform != "macOS" or self.compute_precision not in {"float16", "float32"}):
+            raise AguardenteError("exportação local validada exige macOS e compute_precision float16 ou float32")
 
     @property
     def teacher_dir(self) -> Path:
@@ -188,6 +235,7 @@ class Context:
     probe: ModelProbe | None = None
     plan: PrunePlan | None = None
     metrics: dict[str, float] = field(default_factory=dict)
+    corpus: Any = None
 
     def say(self, msg: str = "") -> None:
         self.report(msg)
@@ -214,7 +262,8 @@ class _Activity:
 
         self._ctx = ctx
         self._text = text
-        self._spinner = ui.Spinner(text, indent=indent) if ctx.animate else None
+        self._spinner = ui.Spinner(text, indent=indent) if ctx.animate and ui.animations_enabled() else None
+        self._last_update = 0.0
 
     def __enter__(self) -> _Activity:
         if self._spinner is not None:
@@ -227,6 +276,9 @@ class _Activity:
         self._text = text
         if self._spinner is not None:
             self._spinner.update(text)
+        elif time.monotonic() - self._last_update >= 10:
+            self._ctx.say(f"{' ' * INDENT}{text}")
+            self._last_update = time.monotonic()
 
     def __exit__(self, exc_type: object, *_: object) -> None:
         if self._spinner is not None:
@@ -271,10 +323,11 @@ def _resume(ctx: Context, name: str, *, require: tuple[str, ...] = ("dir",)) -> 
     """Decide se a etapa concluída pode ser reaproveitada, explicando a decisão."""
     fp = fingerprint(ctx.opts, name)
     gravado = ctx.state.fingerprint_of(name)
+    if ctx.state.stage(name).done and gravado is None:
+        ctx.say(f"             {name}: sem registro dos parâmetros — refazendo a etapa")
+        return False
     if ctx.state.is_done(name, require=require, fingerprint=fp):
-        if ctx.state.stage(name).done and gravado is None:
-            ctx.say(f"             {name}: concluída por uma versão anterior, "
-                    "sem registro dos parâmetros — reaproveitando")
+        ctx.metrics.update(ctx.state.stage(name).metrics)
         return True
     if ctx.state.stage(name).done and gravado not in (None, fp):
         ctx.say(f"             {name}: os parâmetros mudaram desde a última execução "
@@ -397,16 +450,8 @@ def _guard_training_ceiling(ctx: Context, params: int, teto: float, budget: Budg
 
 
 def training_dtype_bytes(device: str | None = None) -> int:
-    """Bytes por peso no treino: 2 em MPS (float16), 4 nos demais (float32).
-
-    Sem dispositivo informado, a resposta sai da plataforma: MPS é o backend do
-    Metal, presente em todo Mac Apple Silicon — que é o único alvo suportado.
-    Perguntar ao torch custaria segundos de import e centenas de MB residentes
-    num comando como o `plan`, que existe justamente para não tocar em nada.
-    """
-    if device is None:
-        return 2 if (sys.platform == "darwin" and platform.machine() == "arm64") else 4
-    return 2 if device == "mps" else 4
+    """FP32 weights, gradients and AdamW moments on every training backend."""
+    return 4
 
 
 def _training_dtype_bytes(opts: RunOptions) -> int:
@@ -432,11 +477,19 @@ def suggested_batch_size(p: ModelProbe, budget: Budget, *, seq_len: int,
     a execução não usaria — o dobro dele em qualquer máquina sem MPS, onde o
     treino cai para float32.
     """
-    return suggest_batch_size(
+    base = suggest_batch_size(
         hidden_size=p.arch.hidden_size, seq_len=seq_len,
         ram_bytes=budget.ram_bytes, dtype_bytes=dtype_bytes,
         reserved_bytes=p.text_params * dtype_bytes, training=training,
     )
+    # Include depth and full-vocabulary logits, which dominate small LLMs.
+    # Using the source size for training is conservative before a target exists.
+    static = p.text_params * (16 if training else dtype_bytes)
+    per_sample = seq_len * (p.arch.hidden_size * p.arch.num_hidden_layers *
+                           dtype_bytes * (16 if training else 8) +
+                           p.arch.vocab_size * 4 * (4 if training else 2))
+    bounded = max(1, int((budget.ram_bytes * 0.8 - static) / max(1, per_sample)))
+    return min(base, bounded)
 
 
 # --------------------------------------------------------------------- plano
@@ -456,7 +509,9 @@ def make_plan(ctx: Context) -> tuple[ModelProbe, PrunePlan | None]:
     # a pré-computação de logits carregam o modelo original, sem gradientes,
     # mas ainda assim como pesos completos. Um alvo pequeno não ajuda aqui —
     # é o tamanho do modelo de origem que decide, não o de destino.
-    pesos_teacher = p.text_params * dtype_bytes
+    teacher_dtype_bytes = 2 if (opts.device == "mps" or
+        (opts.device is None and sys.platform == "darwin" and platform.machine() == "arm64")) else 4
+    pesos_teacher = p.text_params * teacher_dtype_bytes
     if pesos_teacher > budget.ram_bytes:
         aviso_teacher = (f"o modelo original ({pesos_teacher/GB:.1f} GB carregado) não "
                          f"cabe na RAM disponível ({budget.ram_bytes/GB:.1f} GB)")
@@ -522,8 +577,7 @@ def make_plan(ctx: Context) -> tuple[ModelProbe, PrunePlan | None]:
             )
 
     if dtype_bytes == 4 and not opts.skip_recover:
-        ctx.say("aviso        sem MPS o treino usa float32: o consumo de memória dobra "
-                "em relação ao cálculo padrão")
+        ctx.say("treino       pesos, gradientes e momentos AdamW em float32 (16 bytes/parâmetro)")
 
     poda = ({"id": "prune", "title": "Student externo",
              "rationale": "Baixa o student informado no lugar da poda estruturada."}
@@ -580,12 +634,14 @@ def stage_fetch(ctx: Context) -> Path:
         state.save()
         return local
 
-    if state.is_done("fetch", require=("dir",)):
-        ctx.say(f"fetch        já concluído: {dest}")
+    fp = plan_fetch(opts.model, dest)
+    if state.is_done("fetch", require=("dir",)) and not fp.missing():
+        fetch(fp)  # persist the manifest even when upgrading an older download
+        ctx.say(f"fetch        integridade conferida: {dest}")
         return dest
 
-    require_aria2()
-    fp = plan_fetch(opts.model, dest)
+    if fp.missing():
+        require_aria2()
     pending = fp.pending_bytes
     _ensure_disk(ctx, pending, "o download do modelo")
     if pending == 0:
@@ -623,7 +679,6 @@ def stage_extract(ctx: Context, teacher_dir: Path) -> Path:
     import json
 
     from . import textonly
-    from .arch import text_config
 
     opts, state = ctx.opts, ctx.state
     p = ctx.probe
@@ -694,9 +749,9 @@ def stage_extract(ctx: Context, teacher_dir: Path) -> Path:
 def _conferir_exportador(ctx: Context, model_dir: Path) -> None:
     """Valida a configuração de exportação logo após extrair.
 
-    Custa segundos e descobre no início o que só apareceria na última etapa,
-    depois de horas de poda e treino. Falha aqui é aviso, não interrupção: o
-    diagnóstico pode ser de ambiente, e o resto do pipeline ainda tem valor.
+    Custa segundos e descobre incompatibilidades antes de gerar logits e treinar.
+    Uma exportação solicitada exige configuração aceita; --skip-export dispensa
+    esta etapa explicitamente.
     """
     from .export import available, build_command, run_export, staged_repo
 
@@ -706,19 +761,18 @@ def _conferir_exportador(ctx: Context, model_dir: Path) -> None:
     try:
         with staged_repo(model_dir) as (ref, ambiente):
             cmd = build_command(ref, ctx.opts.out_dir / "dry-run",
-                                platform=ctx.opts.platform, compression=ctx.opts.compression,
+                                platform=ctx.opts.platform, compression="4bit" if ctx.opts.compression == "auto" else ctx.opts.compression,
+                                compression_config=ctx.opts.compression_config,
                                 compute_precision=ctx.opts.compute_precision,
                                 max_context_length=ctx.opts.max_context_length, dry_run=True)
             codigo = run_export(cmd, on_line=linhas.append, env=ambiente)
-    except Exception as e:  # noqa: BLE001 — a conferência não pode derrubar a etapa
-        ctx.say(f"             aviso: não foi possível validar a exportação: {e}")
-        return
+    except Exception as e:
+        raise AguardenteError(f"não foi possível validar a configuração de exportação: {e}") from e
     if codigo == 0:
-        ctx.say("             exportação validada (--dry-run)")
+        ctx.say("             configuração de exportação aceita (--dry-run)")
         return
-    ctx.say(f"             aviso: o exportador recusou o modelo extraído (código {codigo})")
-    for linha in linhas[-3:]:
-        ctx.say(f"             {linha}")
+    raise AguardenteError(f"configuração de exportação recusada (código {codigo})",
+                          hint="\n".join(linhas[-3:]) or "Consulte o exportador ou use --skip-export para executar somente poda/destilação.")
 
 
 def _stage_fetch_student(ctx: Context) -> Path:
@@ -789,9 +843,24 @@ def _stage_fetch_student(ctx: Context) -> Path:
     return out
 
 
+def _corpus(ctx: Context, tokenizer):
+    if ctx.corpus is None:
+        from .corpus import prepare_corpus
+        ctx.corpus = prepare_corpus(ctx.opts, tokenizer)
+    return ctx.corpus
+
+
+def _evaluate(ctx: Context, model, tokenizer, *, device, split="validation"):
+    from .verify import perplexity
+    corpus = _corpus(ctx, tokenizer)
+    text = "\n\n".join(getattr(corpus, split))[:20_000]
+    length = min(512, int(getattr(model.config, "max_position_embeddings", 512)))
+    return perplexity(model, tokenizer, text, max_length=length, stride=max(1, length // 2), device=device)
+
+
 def stage_prune(ctx: Context, teacher_dir: Path) -> Path:
     """Etapa 2: Avaliação de importância e poda estruturada."""
-    from .calibration import load_texts, load_texts_from_file, make_batches
+    from .calibration import make_packed_batches
     from .loading import load_causal_lm, pick_device, save_pruned
     from .prune import prune_model, score_model
 
@@ -823,11 +892,9 @@ def stage_prune(ctx: Context, teacher_dir: Path) -> Path:
 
     amostras = opts.calib_batches * LOTE_DE_REFERENCIA
     lotes = _lotes_para(amostras, opts.batch_size)
-    n_texts = _textos_para(lotes, opts.batch_size, folga=8)
-    texts = (load_texts_from_file(opts.calib_file, limit=n_texts) if opts.calib_file
-             else load_texts(dataset=opts.calib_dataset, limit=n_texts))
-    batches = make_batches(tokenizer, texts, batch_size=opts.batch_size,
-                           seq_len=opts.seq_len, device=device)
+    texts = _corpus(ctx, tokenizer).train
+    batches = make_packed_batches(tokenizer, texts, batch_size=opts.batch_size,
+                                  seq_len=opts.seq_len, max_samples=amostras, device=device)
 
     try:
         with _Activity(ctx, f"medindo importância em {amostras} amostras "
@@ -835,19 +902,44 @@ def stage_prune(ctx: Context, teacher_dir: Path) -> Path:
             scores = score_model(model, batches, max_batches=lotes)
         t = ctx.plan.target
         keep_layers = scores.keep_layers(t.num_hidden_layers)
+        keep_ffn = scores.top_ffn(t.intermediate_size)
+        keep_groups = scores.top_kv_groups(t.num_key_value_heads)
+        fits = []
+        if opts.reconstruct:
+            from .prune.reconstruct import fit_projections
+            with _Activity(ctx, "reconstruindo projeções com dados de calibração"):
+                fits = fit_projections(model, ctx.plan, keep_ffn, keep_groups, keep_layers,
+                    lambda: make_packed_batches(tokenizer, texts, batch_size=opts.batch_size,
+                        seq_len=opts.seq_len, max_samples=amostras, device=device), max_batches=lotes)
         report = prune_model(
             model, ctx.plan,
-            keep_ffn=scores.top_ffn(t.intermediate_size),
-            keep_groups=scores.top_kv_groups(t.num_key_value_heads),
+            keep_ffn=keep_ffn,
+            keep_groups=keep_groups,
             keep_layers=keep_layers,
         )
         ctx.say(f"             {report.params_before/1e9:.2f} B → "
                 f"{report.params_after/1e9:.2f} B ({report.ratio:.2f}× menor)")
 
         import torch
+        if fits:
+            from .prune.reconstruct import apply_projections
+            sliced_ppl = _evaluate(ctx, model, tokenizer, device=device).value
+            originals = apply_projections(model, fits, keep_layers)
+            fitted_ppl = _evaluate(ctx, model, tokenizer, device=device).value
+            accepted = math.isfinite(fitted_ppl) and fitted_ppl < sliced_ppl
+            if not accepted:
+                with torch.no_grad():
+                    for module, weight in originals:
+                        module.weight.copy_(weight.to(module.weight))
+            ctx.say(f"             reconstrução: PPL validação {sliced_ppl:.3f} → {fitted_ppl:.3f}; "
+                    f"{'mantida' if accepted else 'poda simples selecionada'}")
+            (opts.out_dir / "reconstruction.json").write_text(json.dumps(
+                {"sliced_validation_ppl": sliced_ppl, "fitted_validation_ppl": fitted_ppl,
+                 "accepted": accepted, "projections": len(fits)}, indent=2))
+            del fits, originals
         with torch.no_grad():
-            ids = torch.randint(0, model.config.vocab_size, (1, 16), device=device)
-            logits = model(input_ids=ids).logits
+            sample = next(make_packed_batches(tokenizer, texts, batch_size=1, seq_len=16, max_samples=1, device=device))
+            logits = model(**sample).logits
         if not torch.isfinite(logits).all():
             raise AguardenteError(
                 "o modelo podado produz NaN ou Inf",
@@ -872,11 +964,10 @@ def stage_prune(ctx: Context, teacher_dir: Path) -> Path:
 
 def stage_logits(ctx: Context, teacher_dir: Path) -> Path | None:
     """Etapa 3: Pré-computação dos top-k logits do modelo original."""
-    from .calibration import load_texts, load_texts_from_file, make_batches
+    from .calibration import make_packed_batches
     from .distill import precompute_logits
     from .distill.teacher import estimate_logit_bytes
     from .loading import load_causal_lm, pick_device
-    from .verify import perplexity_on_wikitext
 
     opts, state = ctx.opts, ctx.state
     out = opts.logits_dir
@@ -891,9 +982,9 @@ def stage_logits(ctx: Context, teacher_dir: Path) -> Path | None:
 
     n = opts.logit_batches * LOTE_DE_REFERENCIA
     lotes = _lotes_para(n, opts.batch_size)
-    size, _ = estimate_logit_bytes(n, opts.seq_len, top_k=opts.top_k)
+    size, _ = estimate_logit_bytes(n, opts.seq_len, top_k=opts.top_k, tail_samples=opts.tail_samples)
     ctx.say(f"logits       top-{opts.top_k} · {n} amostras em {lotes} lote(s) "
-            f"≈ {size/GB:.2f} GB em disco")
+            f"· {opts.tail_samples} amostras da cauda/token ≈ {size/GB:.2f} GB em disco")
     # Descartar antes de medir: shards de outra configuração ainda ocupam disco
     # aqui, e cobrá-los do orçamento reprovaria uma etapa que caberia depois da
     # limpeza que vem logo a seguir.
@@ -908,23 +999,28 @@ def stage_logits(ctx: Context, teacher_dir: Path) -> Path | None:
     teacher, tokenizer = load_causal_lm(str(teacher_dir), device=device)
 
     try:
-        if opts.measure:
-            ppl = perplexity_on_wikitext(teacher, tokenizer, device=device)
-            ctx.metrics["ppl_teacher"] = ppl.value
-            ctx.say(f"             perplexidade do teacher: {ppl.value:.2f}")
+        ppl = _evaluate(ctx, teacher, tokenizer, device=device, split="test")
+        ctx.metrics["ppl_teacher"] = ppl.value
+        ctx.metrics["ppl_teacher_validation"] = _evaluate(ctx, teacher, tokenizer, device=device).value
+        ctx.say(f"             perplexidade do teacher: {ppl.value:.2f}")
 
-        n_texts = _textos_para(lotes, opts.batch_size, folga=16)
-        texts = (load_texts_from_file(opts.calib_file, limit=n_texts) if opts.calib_file
-                 else load_texts(dataset=opts.calib_dataset, limit=n_texts))
-        batches = make_batches(tokenizer, texts, batch_size=opts.batch_size,
-                               seq_len=opts.seq_len, device=device)
+        texts = _corpus(ctx, tokenizer).train
+        batches = make_packed_batches(tokenizer, texts, batch_size=opts.batch_size,
+                                      seq_len=opts.seq_len, max_samples=n, device=device)
         barra = _Progress(ctx, lotes, label="pré-computando", sid="logits")
         result = precompute_logits(
             teacher, batches, out, top_k=opts.top_k,
+            temperature=opts.temperature,
+            cache_key=fingerprint(opts, "logits"), tail_samples=opts.tail_samples, seed=opts.seed,
             max_batches=lotes,
             on_progress=lambda k: barra.update(k, suffix=f"shard {k}"),
         )
         barra.done(suffix=f"{result.shards} shards")
+        manifest = json.loads((out / "manifest.json").read_text())
+        mass = manifest.get("topk_probability_mass")
+        if mass is not None:
+            ctx.say(f"             top-k cobre {mass:.1%} da probabilidade; a cauda é representada por amostragem")
+        ctx.say(f"             {manifest.get('valid_tokens', 0):,} transições causais distintas")
     except Exception as e:
         state.fail("logits", str(e))
         raise
@@ -934,7 +1030,7 @@ def stage_logits(ctx: Context, teacher_dir: Path) -> Path | None:
 
     dt = time.perf_counter() - t0
     state.finish("logits", outputs={"dir": out, FINGERPRINT: fingerprint(opts, "logits")},
-                 metrics={"seconds": dt})
+                 metrics={"seconds": dt, **ctx.metrics})
     ctx.events.stage_end("logits", True, int(dt * 1000))
     return out
 
@@ -944,7 +1040,7 @@ def stage_recover(ctx: Context, pruned_dir: Path, logits_dir: Path | None) -> Pa
     from .distill import RecoveryConfig, recover
     from .distill.teacher import TeacherLogits
     from .loading import load_causal_lm, pick_device, save_pruned
-    from .verify import perplexity_on_wikitext, recovery_fraction
+    from .verify import recovery_fraction
 
     opts, state = ctx.opts, ctx.state
     out = opts.student_dir
@@ -966,26 +1062,26 @@ def stage_recover(ctx: Context, pruned_dir: Path, logits_dir: Path | None) -> Pa
     t0 = time.perf_counter()
 
     device = pick_device(opts.device)
-    student, tokenizer = load_causal_lm(str(pruned_dir), device=device)
+    import torch
+    student, tokenizer = load_causal_lm(str(pruned_dir), device=device, dtype=torch.float32)
     logits = TeacherLogits.load(logits_dir)
 
     try:
-        if opts.measure:
-            ppl = perplexity_on_wikitext(student, tokenizer, device=device)
-            ctx.metrics["ppl_pruned"] = ppl.value
-            ctx.say(f"             perplexidade pós-poda: {ppl.value:.2f}")
+        student.float()
+        ppl = _evaluate(ctx, student, tokenizer, device=device, split="test")
+        ctx.metrics["ppl_pruned"] = ppl.value
+        baseline = "inicial do student" if opts.student else "pós-poda"
+        ctx.say(f"             perplexidade {baseline}: {ppl.value:.2f}")
 
         cfg = RecoveryConfig(
-            epochs=opts.epochs, learning_rate=opts.lr, alpha=opts.alpha,
+            epochs=opts.epochs, learning_rate=opts.lr, alpha=opts.alpha, seed=opts.seed,
             temperature=opts.temperature, grad_accum=opts.grad_accum,
             gradient_checkpointing=not opts.no_checkpointing,
         )
         ctx.say(f"             {cfg.epochs} época(s) · lr {cfg.learning_rate:g} "
                 f"· alpha {cfg.alpha} · T {cfg.temperature}")
 
-        evaluate = None
-        if opts.measure:
-            evaluate = lambda: perplexity_on_wikitext(student, tokenizer, device=device).value
+        evaluate = lambda model=student: _evaluate(ctx, model, tokenizer, device=device).value
 
         # Cada checkpoint retomável guarda os pesos e o estado do AdamW — dois
         # momentos em float32 por parâmetro treinável. Com o `.tmp` da troca
@@ -1013,26 +1109,36 @@ def stage_recover(ctx: Context, pruned_dir: Path, logits_dir: Path | None) -> Pa
 
             res = recover(student, logits, cfg, device=device, evaluate=evaluate,
                           checkpoint_dir=ckpt_dir, on_step=_passo)
-            atividade.update(f"{res.steps} passos em {res.seconds:.0f}s "
+            atividade.update(f"{res.steps - res.resumed_from} passos nesta sessão em {res.seconds:.0f}s "
                              f"(critério de parada: {res.stopped_by})")
         if res.resumed_from:
-            ctx.say(f"             {res.resumed_from} passo(s) já feitos antes da retomada")
+            ctx.say(f"             {res.steps} passos no total; {res.resumed_from} anteriores à retomada")
 
         save_pruned(student, tokenizer, out)
 
-        if opts.measure:
-            ppl = perplexity_on_wikitext(student, tokenizer, device=device)
-            ctx.metrics["ppl_recovered"] = ppl.value
-            if "ppl_teacher" in ctx.metrics and "ppl_pruned" in ctx.metrics:
-                frac = recovery_fraction(ctx.metrics["ppl_teacher"],
-                                         ctx.metrics["ppl_pruned"], ppl.value)
-                ctx.metrics["recovered_fraction"] = frac
-                ctx.say(f"             perplexidade recuperada: {ppl.value:.2f} "
-                        f"({frac:.1%} da queda)")
+        if res.stopped_by == "interrupted":
+            raise KeyboardInterrupt
+
+        ppl = _evaluate(ctx, student, tokenizer, device=device, split="test")
+        ctx.metrics["ppl_recovered"] = ppl.value
+        if "ppl_teacher" in ctx.metrics:
+            frac = recovery_fraction(ctx.metrics["ppl_teacher"], ctx.metrics["ppl_pruned"], ppl.value)
+            ctx.metrics["recovered_fraction"] = frac
+            ctx.say(f"             perplexidade recuperada: {ppl.value:.2f} ({frac:.1%} da queda)")
+            quality = {"teacher": ctx.metrics["ppl_teacher"], "pruned": ctx.metrics["ppl_pruned"],
+                       "student": ppl.value, "tokens": ppl.tokens, "max_ratio": opts.max_ppl_ratio,
+                       "ratio": ppl.value / ctx.metrics["ppl_teacher"], "split": "test",
+                       "corpus": _corpus(ctx, tokenizer).fingerprint,
+                       "best_step": res.best_step, "training_tokens_seen": res.tokens_seen}
+            quality["passed"] = quality["ratio"] <= opts.max_ppl_ratio
+            (opts.out_dir / "quality.json").write_text(json.dumps(quality, indent=2))
+            ctx.say(f"             qualidade: {'aprovada' if quality['passed'] else 'reprovada'} "
+                    f"(razão de perplexidade {quality['ratio']:.3f}, limite {opts.max_ppl_ratio:.3f})")
     except Exception as e:
         state.fail("recover", str(e))
         raise
     finally:
+        evaluate = None  # release the callback's model reference before freeing MPS
         del student
         _free(device)
 
@@ -1045,62 +1151,67 @@ def stage_recover(ctx: Context, pruned_dir: Path, logits_dir: Path | None) -> Pa
 
 
 def stage_export(ctx: Context, model_dir: Path) -> Path | None:
-    """Etapa 5: Exportação para o formato .aimodel."""
-    from .export import build_command, find_bundle, run_export, staged_repo
-
+    """Export isolated candidates, select on validation, then test the winner."""
+    from .export import build_command, find_bundle, run_export
     opts, state = ctx.opts, ctx.state
-    out = opts.bundle_dir
-
     if opts.skip_export:
-        ctx.say("export       desativado")
         state.skip("export", "desativado por opção")
         return None
-
     if _resume(ctx, "export"):
-        ctx.say(f"export       já concluído: {out}")
-        return out
-
-    # O exportador só entende um identificador do Hub; o modelo local é
-    # apresentado como um repositório em cache, resolvido offline.
-    with staged_repo(model_dir) as (ref, ambiente):
-        cmd = build_command(
-            ref, out, platform=opts.platform, compression=opts.compression,
-            compute_precision=opts.compute_precision,
-            max_context_length=opts.max_context_length,
-            dry_run=opts.export_dry_run,
-        )
-        ctx.say(f"export       {' '.join(cmd)}")
-
-        state.begin("export")
-        ctx.events.stage_start("export", 6, len(STAGES),
-                               rationale="Converte e quantiza o modelo para execução acelerada via Apple Core AI no Neural Engine / GPU.")
-        t0 = time.perf_counter()
-        code = run_export(cmd, on_line=lambda line: ctx.say(f"             {line}"),
-                          env=ambiente)
-        dt = time.perf_counter() - t0
-
-    if code != 0:
-        state.fail("export", f"exportador saiu com código {code}")
-        raise AguardenteError(
-            f"coreai.llm.export falhou (código {code})",
-            hint="Rode com --export-dry-run para validar a configuração sem converter.",
-        )
-
-    if opts.export_dry_run:
-        state.finish("export", outputs={"dry_run": "true"})
-        return None
-
-    result = find_bundle(out)
-    ctx.say(f"             {result.bundle_dir}")
-    if result.aimodel:
-        ctx.say(f"             {result.aimodel.name} ({result.size_bytes/GB:.2f} GB)")
-        ctx.metrics["bundle_bytes"] = float(result.size_bytes)
-    state.finish("export",
-                 outputs={"dir": out, "aimodel": result.aimodel or "",
-                          FINGERPRINT: fingerprint(opts, "export")},
-                 metrics={"seconds": dt, "bytes": float(result.size_bytes)})
-    ctx.events.stage_end("export", True, int(dt * 1000))
-    return out
+        return Path(state.output("export", "dir"))
+    root = opts.bundle_dir / fingerprint(opts, "export")
+    automatic = opts.compression == "auto" and not opts.compression_config
+    choices = ["4bit", "8bit", "none"] if automatic else [opts.compression]
+    state.begin("export")
+    ctx.events.stage_start("export", 6, len(STAGES), rationale="Converte e valida a qualidade do modelo no Core AI.")
+    started = time.perf_counter()
+    attempts = []
+    try:
+        for compression in choices:
+            label = Path(opts.compression_config).stem if opts.compression_config else compression
+            if not __import__("re").fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", label):
+                raise AguardenteError(f"nome de receita inválido: {label!r}")
+            out = root / label
+            # A previous interrupted export is not a valid candidate. Only the
+            # exact directory owned by this fingerprint/candidate is replaced.
+            if out.exists():
+                shutil.rmtree(out)
+            command = build_command(model_dir, out, platform=opts.platform,
+                compression=compression, compression_config=opts.compression_config,
+                compute_precision=opts.compute_precision,
+                max_context_length=opts.max_context_length, dry_run=opts.export_dry_run,
+                calibration_corpus=opts.out_dir / "data/corpus.json" if ctx.corpus is not None else None,
+                calibration_samples=opts.calib_batches * LOTE_DE_REFERENCIA)
+            ctx.say(f"export       candidato {label}")
+            code = run_export(command, on_line=lambda line: ctx.say(f"             {line}"))
+            if code:
+                raise AguardenteError(f"exportador falhou no candidato {label} (código {code})")
+            if opts.export_dry_run:
+                state.finish("export", outputs={"dry_run": "true"})
+                return None
+            result = find_bundle(out)
+            if result.aimodel is None:
+                raise AguardenteError("exportador não produziu um .aimodel")
+            report = out / "validation.json"
+            code, diagnostics = _runtime_result(ctx, model_dir, result.aimodel, label, report, split="validation")
+            attempts.append({"compression": label, "report": str(report), "bytes": result.size_bytes,
+                             "passed": code == 0, "failures": diagnostics.get("failures", [])})
+            (root / "selection.json").write_text(json.dumps(attempts, indent=2))
+            if code:
+                if diagnostics.get("failure_kind") == "runtime_error" or not automatic:
+                    raise AguardenteError(f"validação de {label} falhou; consulte {report}")
+                ctx.say(f"             {label} reprovado por qualidade: {diagnostics.get('failures')}")
+                continue
+            ctx.say(f"             selecionado {label}: {result.size_bytes / 1024**2:.2f} MiB")
+            state.finish("export", outputs={"dir": out, "aimodel": result.aimodel,
+                "compression": label, FINGERPRINT: fingerprint(opts, "export")},
+                metrics={"seconds": time.perf_counter() - started, "bytes": result.size_bytes})
+            ctx.events.stage_end("export", True, int((time.perf_counter() - started) * 1000))
+            return out
+        raise AguardenteError("nenhum candidato preservou a qualidade do checkpoint")
+    except BaseException as exc:
+        state.fail("export", str(exc))
+        raise
 
 
 def _free(device: str) -> None:
@@ -1123,29 +1234,84 @@ def _free(device: str) -> None:
 def run_pipeline(opts: RunOptions, *, report: Reporter = print,
                  events: EventLog | None = None, animate: bool = True) -> Context:
     """Executa o pipeline completo com suporte a retomada."""
-    state = RunState.load_or_create(opts.out_dir, model=opts.model,
-                                    target_params=opts.target_params,
-                                    restart=opts.restart)
-    ctx = Context(opts=opts, state=state, report=report,
-                  events=events or null_log(), animate=animate)
-
     # O lock impede que duas execuções sobre o mesmo -o intercalem etapas e
-    # sobrescrevam o estado uma da outra.
+    # sobrescrevam o estado uma da outra, inclusive durante --restart.
     with run_lock(opts.out_dir):
+        from .state import discard_run_artifacts
+        removed = discard_run_artifacts(opts.out_dir) if opts.restart else []
+        state = RunState.load_or_create(opts.out_dir, model=opts.model,
+                                        target_params=opts.target_params, restart=opts.restart)
+        ctx = Context(opts=opts, state=state, report=report,
+                      events=events or null_log(), animate=animate)
+        if removed:
+            ctx.say(f"--restart descartou: {', '.join(removed)}")
         make_plan(ctx)
 
         if not opts.skip_export:
             from .export import available
             if not available():
-                ctx.say("aviso        coreai.llm.export não está disponível no ambiente")
-                ctx.say("             instale via: aguardente install")
-                ctx.say("             ou use --skip-export para desativar a exportação")
-                ctx.say()
+                raise AguardenteError("coreai.llm.export não está disponível no ambiente",
+                                      hint="Instale via aguardente install ou use --skip-export para executar somente poda/destilação.")
 
         teacher = stage_fetch(ctx)
         texto = stage_extract(ctx, teacher)
+        if not opts.skip_recover:
+            from transformers import AutoTokenizer
+            from .inputs import require_same_tokenizer
+            tokenizer = AutoTokenizer.from_pretrained(str(texto), local_files_only=True)
+            _corpus(ctx, tokenizer)
+            if opts.student:
+                candidate = AutoTokenizer.from_pretrained(opts.student)
+                require_same_tokenizer(tokenizer, candidate)
         pruned = stage_prune(ctx, texto)
+        _conferir_exportador(ctx, pruned)
         logits = stage_logits(ctx, texto)
         student = stage_recover(ctx, pruned, logits)
-        stage_export(ctx, student)
+        quality_path = opts.out_dir / "quality.json"
+        if not opts.skip_recover:
+            if not quality_path.is_file():
+                raise AguardenteError("relatório de qualidade ausente; não é possível aprovar o student",
+                                      hint="Use um novo diretório de execução para gerar e avaliar os artefatos.")
+            quality = json.loads(quality_path.read_text())
+            if not quality["passed"]:
+                raise AguardenteError("student reprovado no limite de qualidade; pesos e métricas foram preservados",
+                                      hint="Aumente dados/effort ou reduza o corte. Consulte quality.json; não há exportação aprovada de um student reprovado.")
+        bundle = stage_export(ctx, student)
+        if bundle is not None:
+            validate_export(ctx, student, bundle)
     return ctx
+
+
+def _runtime_result(ctx, student, asset, compression, report, *, split="test"):
+    from .export import run_export
+    command = [sys.executable, "-m", "aguardente.runtime_check", str(student), str(asset),
+               "--compression", compression, "--precision", ctx.opts.compute_precision,
+               "--report", str(report)]
+    if ctx.corpus is not None:
+        text_path = ctx.opts.out_dir / "data" / f"runtime-{split}.txt"
+        text_path.write_text("\n\n".join(getattr(ctx.corpus, split)))
+        command += ["--test-text-file", str(text_path)]
+    report.unlink(missing_ok=True)
+    code = run_export(command, on_line=lambda line: ctx.say(f"             {line}"))
+    diagnostics = json.loads(report.read_text()) if report.is_file() else {
+        "passed": False, "failure_kind": "runtime_error", "failures": [f"runtime exited {code} without a report"]}
+    if not code and not diagnostics.get("passed"):
+        code = 1
+    return code, diagnostics
+
+
+def validate_export(ctx: Context, student: Path, bundle: Path) -> None:
+    from .export import find_bundle
+    result = find_bundle(bundle)
+    if result.aimodel is None:
+        raise AguardenteError("o bundle não contém um .aimodel")
+    report = ctx.opts.out_dir / "runtime-validation.json"
+    compression = ctx.state.stage("export").outputs.get("compression") or ctx.opts.compression
+    ctx.say("runtime      comparação final com PyTorch no teste separado")
+    code, _ = _runtime_result(ctx, student, result.aimodel, compression, report)
+    if code:
+        ctx.state.fail("export", f"a validação no runtime falhou (código {code})")
+        raise AguardenteError("o .aimodel foi exportado, mas falhou na validação no runtime",
+                              hint=f"Consulte {report}.")
+    ctx.state.stage("export").outputs["runtime_validation"] = str(report)
+    ctx.state.save()

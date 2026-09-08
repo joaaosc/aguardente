@@ -88,8 +88,8 @@ def _get_json(url: str) -> dict[str, Any]:
             raise ProbeError(
                 f"acesso negado a {url}",
                 hint="Confira o identificador. Se o repositório existir e for "
-                     "gated, aceite a licença na página do modelo e rode "
-                     "`hf auth login`.",
+                     "gated, baixe o modelo autorizado com o cliente HF e use "
+                     "o diretório local.",
             ) from e
         if e.code == 404:
             raise ProbeError(f"não encontrado: {url}", hint="Confira o identificador informado.") from e
@@ -159,6 +159,14 @@ def _analisar(cfg: dict[str, Any],
     — sondagem que só alcançou os metadados da API —, resta o config sozinho.
     """
     sub, _ = text_config(cfg)
+    architectures = sub.get("architectures", cfg.get("architectures", []))
+    if architectures and all(name.endswith("Model") or "Classification" in name
+                             for name in architectures):
+        raise ProbeError(
+            f"checkpoint não causal: {architectures}",
+            hint="Use um modelo treinado para geração (ForCausalLM). "
+                 "Um encoder de embeddings não fornece logits causais treinados.",
+        )
     tipo = str(sub.get("model_type") or cfg.get("model_type") or "")
     if not headers:
         return None, Arch.from_hf_config(cfg), tipo

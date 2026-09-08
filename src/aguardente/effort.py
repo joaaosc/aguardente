@@ -21,7 +21,7 @@ from .errors import AguardenteError
 # Opções que o nível de esforço define. `batch_size` fica de fora de propósito:
 # é restrição de memória da máquina, não escolha de qualidade.
 CONTROLLED = ("calib_batches", "seq_len", "logit_batches", "top_k",
-              "epochs", "lr", "alpha", "temperature", "grad_accum")
+              "epochs", "lr", "alpha", "temperature", "grad_accum", "tail_samples")
 
 DEFAULT = "medium"
 
@@ -56,6 +56,7 @@ class Effort:
     alpha: float
     temperature: float
     grad_accum: int
+    tail_samples: int = 128
 
     def values(self) -> dict[str, Any]:
         return {campo: getattr(self, campo) for campo in CONTROLLED}
@@ -75,7 +76,7 @@ class Effort:
         from .distill.teacher import estimate_logit_bytes
 
         return estimate_logit_bytes(self.logit_samples, self.seq_len,
-                                    top_k=self.top_k)[0]
+                                    top_k=self.top_k, tail_samples=self.tail_samples)[0]
 
     @property
     def work(self) -> float:
@@ -98,12 +99,12 @@ LEVELS: tuple[Effort, ...] = (
         when="Para testar o pipeline, o ambiente ou um modelo novo antes de gastar horas.",
         calib_batches=8, seq_len=256,
         logit_batches=64, top_k=64,
-        epochs=1, lr=5e-5, alpha=0.8, temperature=2.0, grad_accum=2,
+        epochs=1, lr=5e-5, alpha=0.8, temperature=2.0, grad_accum=2, tail_samples=64,
     ),
     Effort(
         name="medium", label="equilibrado",
-        summary="Configuração de referência: recupera boa parte da queda a um custo previsível.",
-        when="O padrão. Serve à maioria das conversões de modelos de 1 B a 4 B.",
+        summary="Configuração de referência; a recuperação de qualidade precisa ser medida.",
+        when="Ponto de partida experimental, sem garantia de qualidade por tamanho de modelo.",
         calib_batches=32, seq_len=512,
         logit_batches=256, top_k=128,
         epochs=2, lr=3e-5, alpha=0.9, temperature=2.0, grad_accum=4,
@@ -114,7 +115,7 @@ LEVELS: tuple[Effort, ...] = (
         when="Quando o resultado vai ser usado de verdade e há tempo de máquina disponível.",
         calib_batches=64, seq_len=768,
         logit_batches=512, top_k=192,
-        epochs=3, lr=2e-5, alpha=0.9, temperature=2.0, grad_accum=8,
+        epochs=3, lr=2e-5, alpha=0.9, temperature=2.0, grad_accum=8, tail_samples=256,
     ),
     Effort(
         name="max", label="exaustivo",
@@ -122,7 +123,7 @@ LEVELS: tuple[Effort, ...] = (
         when="Poda agressiva que perdeu muita qualidade, ou entrega final sem pressa.",
         calib_batches=128, seq_len=1024,
         logit_batches=1024, top_k=256,
-        epochs=4, lr=1.5e-5, alpha=0.95, temperature=2.0, grad_accum=8,
+        epochs=4, lr=1.5e-5, alpha=0.95, temperature=2.0, grad_accum=8, tail_samples=512,
     ),
 )
 
@@ -191,6 +192,7 @@ def describe(effort: Effort) -> list[tuple[str, str]]:
         ("comprimento de sequência", f"{effort.seq_len} tokens"),
         ("lotes de logits", f"{effort.logit_batches}"),
         ("profundidade top-k", f"{effort.top_k}"),
+        ("amostras da cauda", f"{effort.tail_samples}"),
         ("épocas", f"{effort.epochs}"),
         ("taxa de aprendizado", f"{effort.lr:g}"),
         ("peso da destilação (alpha)", f"{effort.alpha}"),

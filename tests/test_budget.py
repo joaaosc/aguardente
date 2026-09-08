@@ -50,3 +50,11 @@ def test_respeita_o_intervalo_pedido(minimo, maximo):
     lote = suggest_batch_size(hidden_size=2560, seq_len=512, ram_bytes=1000 * GB,
                               minimum=minimo, maximum=maximo)
     assert minimo <= lote <= maximo
+
+
+def test_unknown_ram_is_not_a_zero_gigabyte_training_budget():
+    from aguardente.budget import Budget, Machine
+    from aguardente.errors import InsufficientResources
+
+    with pytest.raises(InsufficientResources, match="não foi possível medir a RAM"):
+        Budget.for_machine(Machine(0, 100 * GB, 1, True))

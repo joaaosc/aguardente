@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Iterator
+import random
 
 if TYPE_CHECKING:  # pragma: no cover
     import torch
@@ -14,18 +15,23 @@ DEFAULT_CONFIG = "wikitext-2-raw-v1"
 _FALLBACKS: tuple[tuple[str, str | None], ...] = (
     ("Salesforce/wikitext", "wikitext-2-raw-v1"),
     ("wikitext", "wikitext-2-raw-v1"),
-    ("mindchain/wikitext2", None),
 )
 
 
 def _stream_texts(dataset: str, config: str | None, split: str,
-                  limit: int, min_chars: int) -> list[str]:
+                  limit: int, min_chars: int, seed: int | None = None,
+                  text_column: str = "text") -> list[str]:
     from datasets import load_dataset
 
     ds = load_dataset(dataset, config, split=split, streaming=True)
+    if seed is not None:
+        ds = ds.shuffle(seed=seed, buffer_size=4096)
     out: list[str] = []
     for row in ds:
-        text = (row.get("text") or "").strip()
+        text = row.get(text_column)
+        if not isinstance(text, str):
+            raise ValueError(f"dataset sem coluna textual {text_column!r}")
+        text = text.strip()
         if len(text) >= min_chars:
             out.append(text)
             if len(out) >= limit:
@@ -40,6 +46,8 @@ def load_texts(
     split: str = "train",
     limit: int = 256,
     min_chars: int = 200,
+    seed: int | None = None,
+    text_column: str = "text",
 ) -> list[str]:
     """Carrega amostras de texto não vazias para calibração."""
     from .errors import AguardenteError
@@ -48,7 +56,7 @@ def load_texts(
     errors: list[str] = []
     for name, cfg in attempts:
         try:
-            out = _stream_texts(name, cfg, split, limit, min_chars)
+            out = _stream_texts(name, cfg, split, limit, min_chars, seed, text_column)
         except Exception as e:  # noqa: BLE001
             errors.append(f"{name}: {type(e).__name__}: {e}")
             continue
@@ -63,7 +71,8 @@ def load_texts(
     )
 
 
-def load_texts_from_file(path: str, *, limit: int = 256, min_chars: int = 200) -> list[str]:
+def load_texts_from_file(path: str, *, limit: int = 256, min_chars: int = 200,
+                         seed: int | None = None, tokenizer: Any = None) -> list[str]:
     """Carrega amostras de calibração a partir de um arquivo de texto local."""
     from pathlib import Path
 
@@ -76,9 +85,32 @@ def load_texts_from_file(path: str, *, limit: int = 256, min_chars: int = 200) -
             hint="Verifique o caminho informado em --calib-file.",
         )
 
-    raw = p.read_text(encoding="utf-8", errors="replace")
-    out = [par.strip() for par in raw.split("\n\n") if len(par.strip()) >= min_chars][:limit]
-    if not out:
+    raw = p.read_text(encoding="utf-8")
+    if p.suffix == ".jsonl":
+        import json
+        paragraphs = []
+        for number, line in enumerate(raw.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise AguardenteError(f"JSONL inválido em {path}:{number}: {error.msg}") from error
+            if not isinstance(row, dict):
+                raise AguardenteError(f"JSONL exige um objeto por linha em {path}:{number}")
+            if isinstance(row.get("text"), str):
+                paragraphs.append(row["text"])
+            elif "messages" in row and tokenizer is not None and tokenizer.chat_template:
+                paragraphs.append(tokenizer.apply_chat_template(row["messages"], tokenize=False,
+                                                               add_generation_prompt=False))
+            else:
+                raise AguardenteError("JSONL exige text ou messages com chat_template do tokenizer")
+    else:
+        paragraphs = raw.split("\n\n")
+    if seed is not None:
+        random.Random(seed).shuffle(paragraphs)
+    out = [par.strip() for par in paragraphs if len(par.strip()) >= min_chars][:limit]
+    if not out and p.suffix != ".jsonl":
         # Fallback: agrupa linhas contínuas quando o arquivo não usar quebras duplas
         lines = [line.strip() for line in raw.splitlines() if line.strip()]
         current: list[str] = []
@@ -111,7 +143,6 @@ def make_batches(
     device: str | None = None,
 ) -> Iterator[dict[str, "torch.Tensor"]]:
     """Tokeniza e agrupa as amostras em batches de tamanho fixo."""
-    import torch
 
     ensure_pad_token(tokenizer)
     for i in range(0, len(texts), batch_size):
@@ -133,3 +164,54 @@ def ensure_pad_token(tokenizer: Any) -> Any:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
+
+
+def make_packed_batches(tokenizer: Any, texts: list[str], *, batch_size: int = 2,
+                        seq_len: int = 512, max_samples: int | None = None,
+                        device: str | None = None) -> Iterator[dict[str, "torch.Tensor"]]:
+    """Pack complete documents with EOS boundaries; never truncate long documents.
+
+    One token overlaps adjacent windows, so a boundary does not lose a causal
+    target. Only the final window is padded, and its mask retains real EOS.
+    """
+    import torch
+    if batch_size < 1 or seq_len < 2:
+        raise ValueError("batch_size >= 1 and seq_len >= 2 required")
+    ensure_pad_token(tokenizer)
+    eos = tokenizer.eos_token_id
+    if eos is None or tokenizer.pad_token_id is None:
+        raise ValueError("packing requires a trained EOS and a padding token")
+    buffer: list[int] = []
+    rows: list[list[int]] = []
+    emitted = 0
+
+    def emit():
+        ids = torch.full((len(rows), seq_len), tokenizer.pad_token_id, dtype=torch.long)
+        mask = torch.zeros_like(ids)
+        for i, row in enumerate(rows):
+            ids[i, :len(row)] = torch.tensor(row)
+            mask[i, :len(row)] = 1
+        return {"input_ids": ids.to(device), "attention_mask": mask.to(device)}
+
+    for text in texts:
+        tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
+        if not tokens:
+            continue
+        buffer.extend(tokens)
+        if buffer[-1] != eos:
+            buffer.append(eos)
+        offset = 0
+        while len(buffer) - offset >= seq_len:
+            rows.append(buffer[offset:offset + seq_len])
+            offset += seq_len - 1
+            emitted += 1
+            if len(rows) == batch_size or emitted == max_samples:
+                yield emit()
+                rows = []
+            if emitted == max_samples:
+                return
+        buffer = buffer[offset:]
+    if len(buffer) >= 2:
+        rows.append(buffer)
+    if rows:
+        yield emit()

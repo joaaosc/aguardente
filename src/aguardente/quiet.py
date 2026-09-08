@@ -66,3 +66,6 @@ def silenced() -> Iterator[Captured]:
             os.close(salvo_err)
             buf.seek(0)
             saida.text = buf.read().decode("utf-8", "replace")
+            if saida.text.strip():
+                # Keep diagnostics visible even when the import succeeds.
+                sys.stderr.write(saida.text)

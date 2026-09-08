@@ -92,30 +92,18 @@ def test_missing_exporter_error_warns_about_pypi_squat(monkeypatch):
 # ------------------------------------------- diretório local como repositório
 
 
-def test_diretorio_local_vira_repositorio_em_cache(tmp_path):
-    """O exportador só aceita identificador do Hub: o caminho local é montado
-    como snapshot em um cache offline, sem copiar nem publicar nada."""
-    from pathlib import Path
-
+def test_local_export_uses_real_directory_without_hub_cache(tmp_path):
     from aguardente.export import staged_repo
-
-    modelo = tmp_path / "student"
-    modelo.mkdir()
-    (modelo / "config.json").write_text("{}")
-    (modelo / "model.safetensors").write_bytes(b"pesos")
-
-    with staged_repo(modelo) as (ref, env):
-        assert ref == "aguardente/student"
-        assert env["HF_HUB_OFFLINE"] == "1"
-        cache = Path(env["HF_HUB_CACHE"])
-        raiz = cache / "models--aguardente--student"
-        revisao = (raiz / "refs" / "main").read_text()
-        snapshot = raiz / "snapshots" / revisao
-        assert (snapshot / "config.json").read_text() == "{}"
-        assert (snapshot / "model.safetensors").read_bytes() == b"pesos"
-
-    # O cache é temporário e não sobrevive ao bloco.
-    assert not cache.exists()
+    import sys
+    model = tmp_path / "student"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    with staged_repo(model) as (ref, env):
+        assert ref == str(model.resolve())
+        assert env == {}
+        command = build_command(ref, tmp_path / "out")
+        assert command[:3] == [sys.executable, "-m", "aguardente.local_export"]
+        assert command[3] == ref
 
 
 def test_identificador_do_hub_passa_intacto(tmp_path):
@@ -126,15 +114,12 @@ def test_identificador_do_hub_passa_intacto(tmp_path):
         assert env == {}
 
 
-def test_nome_do_repositorio_e_saneado(tmp_path):
+def test_local_path_with_spaces_is_preserved(tmp_path):
     from aguardente.export import staged_repo
-
-    modelo = tmp_path / "meu modelo:v2"
-    modelo.mkdir()
-    with staged_repo(modelo) as (ref, _):
-        namespace, _, nome = ref.partition("/")
-        assert namespace == "aguardente"
-        assert all(c.isalnum() or c in "._-" for c in nome)
+    model = tmp_path / "meu modelo:v2"
+    model.mkdir()
+    with staged_repo(model) as (ref, _):
+        assert ref == str(model.resolve())
 
 
 def test_exportador_e_procurado_ao_lado_do_interpretador(tmp_path, monkeypatch):

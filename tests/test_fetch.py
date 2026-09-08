@@ -129,3 +129,69 @@ def test_tamanho_divergente_conta_como_incompleto(tmp_path):
 
     assert [f.path for f in plano.missing()] == ["model.safetensors"]
     assert plano.pending_bytes == 100
+
+
+def test_checksum_detects_corruption_with_same_size(tmp_path):
+    import hashlib
+    good = b"original weights"
+    file = RemoteFile("model.safetensors", len(good), hashlib.sha256(good).hexdigest())
+    plan = FetchPlan("org/m", "main", tmp_path, (file,))
+    (tmp_path / file.path).write_bytes(b"X" * len(good))
+    assert plan.missing() == (file,)
+    (tmp_path / file.path).write_bytes(good)
+    assert not plan.missing()
+
+
+def test_model_tree_follows_pagination_without_dropping_weight_shards(monkeypatch):
+    import io
+    import json
+    from aguardente import fetch as module
+    base = "https://huggingface.co/api/models/org/model/tree/main?recursive=1"
+
+    class Response(io.BytesIO):
+        def __init__(self, entries, link=""):
+            super().__init__(json.dumps(entries).encode())
+            self.headers = {"Link": link}
+
+    responses = iter([
+        Response([{"type": "file", "path": "config.json", "size": 2}], f'<{base}&cursor=2>; rel="next"'),
+        Response([{"type": "file", "path": "model.safetensors", "size": 128}]),
+    ])
+    requested = []
+
+    def get(url, **kwargs):
+        requested.append(url)
+        return next(responses)
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", get)
+    assert [f.path for f in module.list_files("org/model")] == ["config.json", "model.safetensors"]
+    assert requested == [base, base + "&cursor=2"]
+
+
+def test_model_tree_rejects_pagination_to_a_different_repository(monkeypatch):
+    import io
+    from aguardente import fetch as module
+
+    class Response(io.BytesIO):
+        headers = {"Link": '<https://huggingface.co/api/models/other/model/tree/main>; rel="next"'}
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *a, **kw: Response(b"[]"))
+    with pytest.raises(AguardenteError, match="origem ou revisão"):
+        module.list_files("org/model")
+
+
+def test_download_pins_revision_and_resume_reuses_the_commit(tmp_path, monkeypatch):
+    import io
+    import json
+    from aguardente import fetch as module
+    commit = "a" * 40
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *a, **kw: io.BytesIO(json.dumps({"sha": commit}).encode()))
+    revisions = []
+    monkeypatch.setattr(module, "list_files", lambda model, rev: revisions.append(rev) or ())
+    monkeypatch.setattr(module, "require_aria2", lambda: "aria2c")
+    plan = module.plan_fetch("org/model", tmp_path)
+    module.fetch(plan)
+    assert plan.revision == commit
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *a, **kw: pytest.fail("must reuse pinned revision"))
+    assert module.plan_fetch("org/model", tmp_path).revision == commit
+    assert revisions == [commit]  # persisted file manifest permits offline resume

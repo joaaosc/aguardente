@@ -5,11 +5,12 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
-import tempfile
+import queue
+import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,8 +54,8 @@ def _resolve(name: str) -> list[str] | None:
         return [direct]
 
     import importlib.util
-    if importlib.util.find_spec("coreai_models") is not None and shutil.which("uv"):
-        return ["uv", "run", name]
+    if importlib.util.find_spec("coreai_models") is not None:
+        return [sys.executable, "-m", "coreai_models.llm.export"]
     return None
 
 
@@ -77,9 +78,12 @@ def build_command(
     experimental: bool = True,
     overwrite: bool = False,
     dry_run: bool = False,
+    calibration_corpus: str | Path | None = None,
+    calibration_samples: int = 16,
 ) -> list[str]:
     """Monta a lista de argumentos para invocação do coreai.llm.export."""
-    base = _resolve("coreai.llm.export")
+    base = ([sys.executable, "-m", "aguardente.local_export"]
+            if Path(model_dir).is_dir() else _resolve("coreai.llm.export"))
     if base is None:
         raise AguardenteError(
             "coreai.llm.export não encontrado — o exportador da Apple não está instalado",
@@ -110,91 +114,91 @@ def build_command(
         cmd.append("--overwrite")
     if dry_run:
         cmd.append("--dry-run")
+    if calibration_corpus is not None:
+        if not Path(model_dir).is_dir():
+            raise AguardenteError("calibração por corpus persistido exige exportação de checkpoint local")
+        cmd += ["--calibration-corpus", str(calibration_corpus),
+                "--calibration-samples", str(calibration_samples)]
     return cmd
-
-
-STAGED_NAMESPACE = "aguardente"
-_STAGED_REVISION = "0" * 40
-
-
-def _staged_name(model_dir: Path) -> str:
-    """Nome de repositório derivado do diretório, aceito por `validate_repo_id`."""
-    limpo = re.sub(r"[^A-Za-z0-9._-]+", "-", model_dir.name).strip("-.") or "modelo"
-    return limpo[:96]
 
 
 @contextlib.contextmanager
 def staged_repo(model_dir: str | Path) -> Iterator[tuple[str, dict[str, str]]]:
-    """Apresenta um diretório local ao exportador como repositório do Hub.
-
-    O `coreai.llm.export` só aceita um nome curto do registro da Apple ou um
-    identificador do Hugging Face: o caminho recebido vai direto para
-    `snapshot_download`, que o rejeita por não ter a forma `namespace/nome`. Um
-    modelo podado e destilado aqui não existe no Hub, e publicá-lo só para
-    convertê-lo seria absurdo.
-
-    A saída é montar um cache do Hub num diretório temporário, com os arquivos
-    do modelo ligados por symlink na posição que um snapshot ocuparia, e rodar
-    o exportador em modo offline apontado para esse cache. Nada é copiado, nada
-    sai da máquina, e o exportador resolve o identificador sem tocar na rede.
-
-    Para uma referência que não é diretório — um identificador do Hub de
-    verdade — nada é montado e a referência passa intacta.
-    """
-    origem = Path(model_dir)
-    if not origem.is_dir():
-        yield str(model_dir), {}
-        return
-
-    repo = f"{STAGED_NAMESPACE}/{_staged_name(origem)}"
-    with tempfile.TemporaryDirectory(prefix="aguardente-hub-") as tmp:
-        cache = Path(tmp)
-        raiz = cache / f"models--{STAGED_NAMESPACE}--{_staged_name(origem)}"
-        snapshot = raiz / "snapshots" / _STAGED_REVISION
-        snapshot.mkdir(parents=True)
-        (raiz / "refs").mkdir()
-        (raiz / "refs" / "main").write_text(_STAGED_REVISION)
-        for arquivo in origem.iterdir():
-            if arquivo.is_file():
-                (snapshot / arquivo.name).symlink_to(arquivo.resolve())
-        yield repo, {"HF_HUB_CACHE": str(cache), "HF_HUB_OFFLINE": "1"}
+    """Compatibility context: resolve local paths without inventing Hub caches."""
+    path = Path(model_dir)
+    yield str(path.resolve()) if path.is_dir() else str(model_dir), {}
 
 
 def run_export(cmd: list[str], *, on_line: Callable[[str], None] | None = None,
                timeout: float | None = None,
                env: Mapping[str, str] | None = None) -> int:
     """Executa o comando de exportação repassando as linhas de saída."""
-    ambiente = {**os.environ, **env} if env else None
+    ambiente = {**os.environ, **(env or {})}
+    ambiente["PYTHONPATH"] = str(Path(__file__).resolve().parents[1]) + os.pathsep + ambiente.get("PYTHONPATH", "")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1, env=ambiente)
+    lines: queue.Queue[str | None] = queue.Queue()
+    def read_lines():
+        try:
+            for line in proc.stdout:
+                lines.put(line)
+        finally:
+            lines.put(None)
+    reader = threading.Thread(target=read_lines, daemon=True)
+    reader.start()
+    deadline = time.monotonic() + timeout if timeout is not None else None
+
+    def remaining():
+        if deadline is None:
+            return None
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        return value
+
     try:
-        assert proc.stdout is not None
-        for line in proc.stdout:
+        while True:
+            try:
+                line = lines.get(timeout=remaining())
+            except queue.Empty:
+                raise subprocess.TimeoutExpired(cmd, timeout) from None
+            if line is None:
+                break
             if on_line:
                 on_line(line.rstrip("\n"))
-        return proc.wait(timeout=timeout)
+        return proc.wait(timeout=remaining())
     except KeyboardInterrupt:
         proc.terminate()
         raise
     finally:
         if proc.poll() is None:
             proc.kill()
+        proc.wait()
+        reader.join(timeout=2)
+        proc.stdout.close()
 
 
 def find_bundle(out_dir: str | Path) -> ExportResult:
     """Localiza o bundle gerado e carrega o arquivo metadata.json."""
     out = Path(out_dir)
-    candidates = sorted(out.glob("**/metadata.json"), key=lambda p: p.stat().st_mtime)
+    candidates = [p for p in out.glob("**/metadata.json")
+                  if not any(parent.suffix == ".aimodel" for parent in p.parents)]
+    if len(candidates) > 1:
+        raise AguardenteError(f"mais de um bundle em {out}; informe o diretório exato do artefato")
     if not candidates:
         aimodels = sorted(out.glob("**/*.aimodel"))
         if not aimodels:
             raise AguardenteError(f"nenhum bundle encontrado em {out}")
-        return ExportResult(bundle_dir=aimodels[-1].parent, aimodel=aimodels[-1], metadata={})
+        if len(aimodels) > 1:
+            raise AguardenteError(f"mais de um .aimodel em {out}; informe o artefato exato")
+        return ExportResult(bundle_dir=aimodels[0].parent, aimodel=aimodels[0], metadata={})
 
     meta_path = candidates[-1]
     meta = json.loads(meta_path.read_text())
     bundle = meta_path.parent
     aimodels = sorted(bundle.glob("*.aimodel"))
+    if len(aimodels) > 1:
+        raise AguardenteError(f"mais de um .aimodel em {bundle}; informe o artefato exato")
     return ExportResult(bundle_dir=bundle, aimodel=aimodels[0] if aimodels else None,
                         metadata=meta)
 
@@ -208,7 +212,8 @@ COMPILE_SECONDS_PER_GB = 1200
 def _compile_timeout(aimodel: Path) -> int:
     """Limite de tempo proporcional ao tamanho do artefato a compilar."""
     try:
-        size = aimodel.stat().st_size
+        size = (sum(p.stat().st_size for p in aimodel.rglob("*") if p.is_file())
+                if aimodel.is_dir() else aimodel.stat().st_size)
     except OSError:
         return COMPILE_TIMEOUT_MIN
     return int(max(COMPILE_TIMEOUT_MIN, size / (1024 ** 3) * COMPILE_SECONDS_PER_GB))

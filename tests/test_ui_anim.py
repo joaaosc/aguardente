@@ -161,12 +161,15 @@ def contexto(tmp_path, *, animate):
     return Context(opts=o, state=st, report=linhas.append, animate=animate), linhas
 
 
-def test_atividade_sem_animacao_reporta_uma_vez(tmp_path):
-    """Sob --json a linha animada viraria lixo no meio do NDJSON."""
-    ctx, linhas = contexto(tmp_path, animate=False)
+@pytest.mark.parametrize("animate", [False, True])
+def test_atividade_sem_animacao_reporta_progresso_com_limite(tmp_path, monkeypatch, animate):
+    """Log de treino também avança sem TTY; atualizações rápidas são agrupadas."""
+    monkeypatch.setattr(pl.time, "monotonic", lambda: 100.0)
+    ctx, linhas = contexto(tmp_path, animate=animate)
     with pl._Activity(ctx, "carregando") as a:
         a.update("medindo")
-    assert linhas == [" " * pl.INDENT + "carregando"]
+        a.update("medindo novamente")
+    assert linhas == [" " * pl.INDENT + text for text in ("carregando", "medindo")]
 
 
 def test_progresso_sem_animacao_ainda_emite_eventos(tmp_path):

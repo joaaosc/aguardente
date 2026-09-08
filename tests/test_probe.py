@@ -42,3 +42,11 @@ def test_404_e_nao_encontrado(monkeypatch):
         _get_json("https://huggingface.co/api/models/org/repo")
 
     assert "não encontrado" in e.value.message
+
+
+@pytest.mark.parametrize("architecture", ["Qwen3Model", "BertModel", "LlamaForSequenceClassification"])
+def test_checkpoint_sem_cabeca_causal_e_recusado(architecture):
+    from aguardente.probe import _analisar
+
+    with pytest.raises(ProbeError, match="checkpoint não causal"):
+        _analisar({"architectures": [architecture], "hidden_size": 16}, {})

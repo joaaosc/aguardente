@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from importlib.metadata import PackageNotFoundError, requires
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from .pipeline import (DISK_MARGIN, RunOptions, run_pipeline, suggested_batch_si
 from .preflight import Status, blocking, check_pipeline_deps, check_python, run_all
 from .probe import probe
 from .source import resolve_source
+from .state import ARTIFACT_DIRS as ARTIFACT_DIRS, discard_run_artifacts, run_lock
 from . import ui
 from .ui import StageState
 
@@ -44,10 +46,6 @@ _STATE_MAP = {
 
 # Variável de ambiente que libera o traceback completo nas falhas inesperadas.
 DEBUG_ENV = "AGUARDENTE_DEBUG"
-
-# Subdiretórios derivados de uma execução, descartados por --restart.
-ARTIFACT_DIRS = ("teacher", "pruned", "logits", "student", "bundle", "ckpt")
-
 
 # ----------------------------------------------------------------- install
 
@@ -229,12 +227,15 @@ def cmd_plan(args: argparse.Namespace) -> int:
     ui.header("Modelo")
     ui.field("arquitetura", p.model_type or "desconhecida",
              note=f"{len(p.weight_files)} arquivo(s) de peso")
-    ui.field("parâmetros", _fmt_params(p.stored_params), note=f"{p.stored_params:,}")
+    ui.field("parâmetros do decoder", _fmt_params(b.total), note=f"{b.total:,}")
+    if p.stored_params != b.total:
+        ui.field("parâmetros em arquivo", _fmt_params(p.stored_params),
+                 note="inclui cópias de pesos compartilhados e componentes extras")
     ui.field("tamanho original", _fmt_bytes(weights_bytes(p.stored_params, BPW_FP16)))
     if p.gated:
         ui.blank()
         ui.warn("modelo de acesso restrito",
-                "Aceite a licença na página do modelo e execute `hf auth login`.")
+                "Baixe o modelo autorizado com o cliente HF e use o diretório local.")
 
     from .textonly import emitted_model_type
     try:
@@ -369,16 +370,16 @@ def cmd_plan(args: argparse.Namespace) -> int:
          ("comprimido (~4,5 bits)", _fmt_bytes(weights_bytes(final_params, BPW_INT4_EMBED_FP16))),
          ("memória por 2.048 tokens", _fmt_bytes(kv_cache_bytes(final, 2048))),
          ("memória por 8.192 tokens", _fmt_bytes(kv_cache_bytes(final, 8192))),
-         ("RAM estimada no treino", _fmt_bytes(training_bytes(final_params))),
+         ("RAM estática estimada no treino", _fmt_bytes(training_bytes(final_params, dtype_bytes=dtype_bytes))),
          (f"logits em disco (--effort {nivel.name})", _fmt_bytes(nivel.logit_bytes()))],
         align_right=(1,),
     )
 
     _effort_panel(nivel, [], animate=not getattr(args, "no_anim", False))
 
-    if plan and training_bytes(final_params) > budget.ram_bytes:
+    if plan and training_bytes(final_params, dtype_bytes=dtype_bytes) > budget.ram_bytes:
         ui.warn("o treino pode exceder a memória disponível",
-                "Considere usar --grad-accum 8 e --seq-len 256, ou aumentar o alvo de parâmetros.")
+                "Reduza o alvo de parâmetros ou execute a recuperação em uma máquina com mais RAM.")
 
     ui.blank()
     ui.rule()
@@ -471,13 +472,14 @@ def _effort_panel(nivel, sobrescritos, *, animate: bool = True) -> None:
     ui.meter_line(effort.index(nivel), total=len(effort.LEVELS),
                   label=f"{ui.bold(nivel.name)}  {ui.dim('· ' + nivel.label)}",
                   animate=animate)
-    ui.explain(nivel.summary)
+    ui.explain("Valores efetivos para esta execução." if sobrescritos else nivel.summary)
     ui.blank()
     ui.field("custo relativo", f"{effort.relative_cost(nivel):.2f}× do nível "
                                f"{effort.DEFAULT}")
     ui.field("logits em disco", _fmt_bytes(nivel.logit_bytes()))
     ui.field("épocas de recuperação", str(nivel.epochs))
     ui.field("profundidade top-k", str(nivel.top_k))
+    ui.field("amostras da cauda", str(nivel.tail_samples))
     if sobrescritos:
         ui.blank()
         ui.note(f"informado na linha de comando, com precedência sobre o preset: "
@@ -673,12 +675,16 @@ def _options_from(args: argparse.Namespace) -> RunOptions:
         batch_size=args.batch_size,
         calib_dataset=args.calib_dataset,
         calib_file=args.calib_file,
+        calib_config=args.calib_config, calib_split=args.calib_split,
+        text_column=args.text_column, eval_file=args.eval_file, seed=args.seed,
+        reconstruct=not args.no_reconstruction, max_ppl_ratio=args.max_ppl_ratio,
         effort=nivel.name,
         no_checkpointing=args.no_checkpointing,
         discard_source_weights=getattr(args, "discard_source_weights", False),
         **valores,
         platform=args.platform,
         compression=args.compression,
+        compression_config=args.compression_config,
         compute_precision=args.compute_precision,
         max_context_length=args.max_context_length,
         export_dry_run=args.export_dry_run,
@@ -693,18 +699,8 @@ def _options_from(args: argparse.Namespace) -> RunOptions:
 
 def _discard_run_dir(out_dir: Path) -> list[str]:
     """Remove o estado e os artefatos de uma execução anterior, listando o descartado."""
-    removidos = []
-    for nome in ("state.json", "run.lock"):
-        alvo = out_dir / nome
-        if alvo.exists():
-            alvo.unlink()
-            removidos.append(nome)
-    for nome in ARTIFACT_DIRS:
-        alvo = out_dir / nome
-        if alvo.is_dir():
-            shutil.rmtree(alvo)
-            removidos.append(f"{nome}/")
-    return removidos
+    with run_lock(out_dir):
+        return discard_run_artifacts(out_dir)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -716,6 +712,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     args.model = resolve_source(args.model,
                                 report=(avisos.append if not is_json else (lambda _m: None)))
     opts = _options_from(args)
+    effective_effort = replace(args.effort_level, **{k: getattr(opts, k) for k in effort.CONTROLLED})
     event_log = stdout_log() if is_json else None
 
     if not is_json:
@@ -723,13 +720,6 @@ def cmd_run(args: argparse.Namespace) -> int:
                  "Poda estruturada, destilação e conversão para Core AI")
         for aviso in avisos:
             ui.step(aviso)
-
-    if args.restart and opts.out_dir.is_dir():
-        removidos = _discard_run_dir(opts.out_dir)
-        if removidos and not is_json:
-            ui.blank()
-            ui.warn(f"--restart descartou: {', '.join(removidos)}",
-                    "Todas as etapas serão refeitas do zero.")
 
     if not args.skip_checks:
         # A stack do pipeline é informativa no `doctor` e requisito aqui: sem
@@ -761,12 +751,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         if opts.target_params:
             ui.field("alvo", _fmt_params(opts.target_params))
         if not opts.skip_recover:
-            _effort_panel(args.effort_level, args.effort_overrides)
+            _effort_panel(effective_effort, args.effort_overrides)
         ui.blank()
         ui.rule()
 
     if is_json:
-        nivel = args.effort_level
+        nivel = effective_effort
         event_log.emit("effort", name=nivel.name, label=nivel.label,
                        summary=nivel.summary, cost=effort.relative_cost(nivel),
                        overrides=args.effort_overrides, values=nivel.values())
@@ -815,8 +805,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     if bundle:
         ui.done("pipeline concluído", hint=str(bundle))
         ui.blank()
-        ui.command(f'swift run -c release llm-runner --model {bundle} --prompt "Olá"',
-                   label="para testar o modelo gerado")
+        validation = ctx.state.output("export", "runtime_validation")
+        if validation:
+            ui.field("validação no runtime", str(validation))
+        else:
+            ui.field("runtime", "relatório de validação ausente")
     else:
         ui.done(f"pipeline concluído em {_fmt_seconds(total)}",
                 hint=str(opts.out_dir))
@@ -828,7 +821,8 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     """Exibe o estado de uma execução existente."""
-    from .state import RunState
+    from .state import RunState, run_is_active
+    import json
 
     d = Path(args.out).expanduser()
     if not (d / "state.json").is_file():
@@ -838,7 +832,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                         "`aguardente run <modelo> -o <diretório>`.")
         return 1
 
-    st = RunState.load_or_create(d)
+    active = run_is_active(d)
+    st = RunState.load_or_create(d, reset_interrupted=not active)
     ui.title("Estado da execução", str(d))
     ui.blank()
     ui.field("modelo", st.model or "—")
@@ -854,11 +849,17 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     pendentes = [n for n, s, _ in st.summary() if s.value not in ("ok", "skipped")]
     ui.blank()
-    if pendentes:
+    quality_path = d / "quality.json"
+    if active:
+        ui.note("há uma execução usando este diretório")
+    elif quality_path.is_file() and not json.loads(quality_path.read_text()).get("passed"):
+        ui.error("student reprovado no limite de qualidade", action=f"Consulte {quality_path}.")
+        return 1
+    elif pendentes:
         ui.note(f"etapas pendentes: {', '.join(pendentes)}")
-        ui.command(f"aguardente run {st.model} -o {d}", label="para retomar")
+        ui.note("para retomar, repita o comando original com as mesmas opções")
     else:
-        ui.done("todas as etapas foram concluídas")
+        ui.done("etapas registradas concluídas")
     return 0
 
 
@@ -882,7 +883,7 @@ def _add_pipeline_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--student",
                    help="usa este modelo pronto como student, em vez de podar o "
                         "teacher — identificador do Hugging Face ou diretório local. "
-                        "Precisa ter o mesmo vocab_size do teacher")
+                        "Precisa usar tokenizer equivalente ao do teacher")
     p.add_argument("--connections", type=int, default=8,
                    help="número de conexões por servidor no aria2c")
     p.add_argument("--concurrent", type=int, default=4,
@@ -893,9 +894,18 @@ def _add_pipeline_args(p: argparse.ArgumentParser) -> None:
                         "Padrão: calculado pela RAM disponível")
     p.add_argument("--seq-len", type=int, help=PRESET)
     p.add_argument("--calib-dataset", help="dataset de calibração (namespace/name)")
-    p.add_argument("--calib-file", help="arquivo .txt local com amostras separadas por linha em branco")
+    p.add_argument("--calib-file", help="TXT com documentos separados por linha em branco, ou JSONL com text/messages")
+    p.add_argument("--calib-config", help="configuração do dataset Hugging Face")
+    p.add_argument("--calib-split", default="train")
+    p.add_argument("--text-column", default="text")
+    p.add_argument("--eval-file", help="TXT/JSONL de validação separado do treino")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--no-reconstruction", action="store_true", help="desativa ajuste local das projeções após poda")
+    p.add_argument("--max-ppl-ratio", type=float, default=1.2,
+                   help="limite explícito de perplexidade student/teacher no teste (padrão 1.2)")
     p.add_argument("--logit-batches", type=int, help=PRESET)
     p.add_argument("--top-k", type=int, help=PRESET)
+    p.add_argument("--tail-samples", type=int, help="amostras da cauda por token; padrão definido por effort")
     p.add_argument("--epochs", type=int, help=PRESET)
     p.add_argument("--lr", type=float, help=PRESET)
     p.add_argument("--alpha", type=float, help=PRESET)
@@ -904,14 +914,16 @@ def _add_pipeline_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-checkpointing", action="store_true")
     p.add_argument("--platform", default="macOS",
                    choices=["macOS", "iOS", "watchOS", "visionOS", "tvOS"])
-    p.add_argument("--compression", default="4bit")
+    compression = p.add_mutually_exclusive_group()
+    compression.add_argument("--compression", default="auto", help="auto compara int4, int8 e sem quantização; ou escolha uma receita explícita")
+    compression.add_argument("--compression-config", help="receita YAML do coreai-opt")
     p.add_argument("--compute-precision", default="float16")
     p.add_argument("--max-context-length", type=int)
     p.add_argument("--export-dry-run", action="store_true",
                    help="valida argumentos de exportação sem converter o modelo")
     p.add_argument("--device", help="dispositivo de execução (mps, cpu)")
     p.add_argument("--measure", action="store_true",
-                   help="avalia a perplexidade durante as etapas do pipeline")
+                   help="mantida por compatibilidade; qualidade e runtime são sempre validados")
     p.add_argument("--skip-recover", action="store_true")
     p.add_argument("--skip-export", action="store_true")
     p.add_argument("--json", action="store_true",

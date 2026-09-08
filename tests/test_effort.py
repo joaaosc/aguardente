@@ -6,12 +6,11 @@ from aguardente import cli, effort
 from aguardente.distill.teacher import estimate_logit_bytes
 from aguardente.errors import AguardenteError
 
-# Padrões que a CLI usava antes de existir o sistema de esforço. O nível médio
-# precisa reproduzi-los: quem nunca informar --effort não pode ver o
-# comportamento mudar por causa de um recurso que não pediu.
+# Hiperparâmetros de referência; a cauda amostrada passa a fazer parte do
+# objetivo de destilação e do orçamento explícito de armazenamento.
 PADROES_ANTERIORES = dict(calib_batches=32, seq_len=512, logit_batches=256,
                           top_k=128, epochs=2, lr=3e-5, alpha=0.9,
-                          temperature=2.0, grad_accum=4)
+                          temperature=2.0, grad_accum=4, tail_samples=128)
 
 
 # ------------------------------------------------------------------ presets
@@ -75,7 +74,7 @@ def test_nome_aceita_espaco_e_maiuscula():
 def test_disco_dos_logits_bate_com_a_estimativa_do_teacher():
     nivel = effort.get("high")
     esperado, _ = estimate_logit_bytes(nivel.logit_samples, nivel.seq_len,
-                                       top_k=nivel.top_k)
+                                       top_k=nivel.top_k, tail_samples=nivel.tail_samples)
     assert nivel.logit_bytes() == esperado
 
 

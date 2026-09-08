@@ -10,7 +10,7 @@
 
 ---
 
-`aguardente` reduz o tamanho de modelos de linguagem (LLMs) por **poda estruturada** (pruning) e recupera qualidade via **destilação**, gerando pacotes `.aimodel` prontos para execução no framework Core AI da Apple.
+`aguardente` reduz o tamanho de modelos de linguagem (LLMs) por **poda estruturada** e treina os pesos restantes via **destilação**, gerando pacotes `.aimodel` para o Core AI da Apple. É um pipeline experimental: treinamento e exportação bem-sucedidos não garantem qualidade. A [auditoria com execução real no M1 de 8 GB](docs/pipeline-audit.md) documenta as correções, os resultados e as limitações.
 
 ---
 
@@ -43,10 +43,12 @@ aguardente install
 Execução completa do pipeline:
 
 ```bash
-aguardente run Qwen/Qwen3-4B -o run/qwen3 --target-params 1.0e9 --effort high --measure
+aguardente run HuggingFaceTB/SmolLM2-135M -o run/smollm --target-params 125e6 \
+  --effort high --batch-size 1 --seq-len 256 --logit-batches 256 --calib-batches 64 \
+  --epochs 2 --grad-accum 4 --lr 0.0001 --max-context-length 512
 ```
 
-O comando executa todas as etapas e retoma do ponto onde parou caso seja interrompido.
+O comando executa poda, reconstrução das projeções e destilação, com seleção do melhor checkpoint em validação. A exportação só prossegue se a perplexidade no teste ficar até 20% acima do teacher. O padrão `--compression auto` compara int4, int8 e FP16 sem quantização, seleciona a primeira receita que preserva numericamente o student em validação e verifica novamente no teste. Os limites são critérios de engenharia, não garantia de capacidade linguística. Veja as [melhorias e os experimentos de recuperação](docs/recovery-improvements.md).
 
 Em vez do identificador `namespace/nome`, também é aceita a URL copiada do navegador — do Hugging Face diretamente, ou do GitHub, quando o autor publica lá sob o mesmo nome:
 
@@ -82,11 +84,11 @@ fetch  →  prune  →  logits  →  recover  →  export
 
 | Etapa | Descrição |
 |---|---|
-| **fetch** | Download dos arquivos necessários via `aria2c` com suporte a retomada. |
-| **prune** | Avaliação de importância e poda estruturada de MLP, cabeças de atenção e camadas. |
-| **logits** | Pré-computação dos top-k logits do modelo original (teacher) para o conjunto de calibração. |
-| **recover** | Treinamento de destilação para recuperação de qualidade do modelo podado. |
-| **export** | Conversão para o formato `.aimodel` compatível com Core AI. |
+| **fetch** | Download retomável, revisão fixada e SHA-256 dos pesos LFS. |
+| **prune** | Poda por importância e reconstrução das projeções, selecionada por perplexidade em validação. |
+| **logits** | Top-k e amostras da cauda do teacher sobre documentos empacotados com EOS. |
+| **recover** | Destilação FP32, melhor checkpoint em validação e limite de qualidade no teste. |
+| **export** | Seleção de compressão e execução real de `.aimodel`, com comparação numérica e perplexidade. |
 
 ### Estratégia de poda
 
@@ -100,7 +102,7 @@ A dimensão `hidden_size` é mantida inalterada para preservar a consistência d
 
 ### Modelos multimodais
 
-Um modelo de visão e linguagem carrega, no mesmo checkpoint, um decoder causal de texto, uma torre de visão e um projetor entre os dois. O aguardente extrai o decoder e descarta o resto: **o modelo convertido não enxerga imagens.** O que ele preserva é a capacidade de texto, que é o que o Core AI executa.
+Um modelo de visão e linguagem carrega, no mesmo checkpoint, um decoder causal de texto, uma torre de visão e um projetor entre os dois. O aguardente extrai o decoder e descarta o resto: **o modelo convertido não enxerga imagens.** A preservação das capacidades de texto precisa ser avaliada para cada decoder extraído.
 
 A extração acontece entre o download e a poda, e o restante do pipeline continua vendo um decoder causal comum.
 
@@ -130,14 +132,14 @@ O `plan` também confere se o exportador da Apple aceita a arquitetura de destin
 
 `--effort` define **quanto trabalho** se investe para recuperar a qualidade perdida na poda. É um eixo ortogonal ao alvo: `--target-params` decide o tamanho do resultado, `--effort` decide o cuidado com que se chega nele. Um alvo agressivo com esforço baixo é o caminho mais curto para um modelo pequeno e ruim.
 
-| Nível | | Épocas | top-k | Sequência | Logits em disco | Custo |
-|---|---|---:|---:|---:|---:|---:|
-| `low` | ▁··· rápido | 1 | 64 | 256 | 12 MB | 0,07× |
-| `medium` | ▁▃·· equilibrado | 2 | 128 | 512 | 192 MB | 1,00× |
-| `high` | ▁▃▅· cuidadoso | 3 | 192 | 768 | 864 MB | 4,26× |
-| `max` | ▁▃▅▇ exaustivo | 4 | 256 | 1.024 | 3,0 GB | 14,74× |
+| Nível | | Épocas | top-k | Amostras da cauda | Sequência | Logits em disco | Custo |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `low` | ▁··· rápido | 1 | 64 | 64 | 256 | 32,1 MiB | 0,07× |
+| `medium` | ▁▃·· equilibrado | 2 | 128 | 128 | 512 | 513 MiB | 1,00× |
+| `high` | ▁▃▅· cuidadoso | 3 | 192 | 256 | 768 | 2.691 MiB | 4,26× |
+| `max` | ▁▃▅▇ exaustivo | 4 | 256 | 512 | 1.024 | 12.296 MiB | 14,74× |
 
-O custo é o tempo relativo ao nível `medium`, calculado pelos tokens processados em cada etapa; o disco assume `--batch-size 2`. O nível `medium` é o padrão e reproduz exatamente a configuração usada antes de a escala existir.
+O custo é um índice de trabalho relativo ao nível `medium`, calculado pelos tokens previstos em cada etapa, não uma medição de tempo. O disco estima valores FP32, índices int32 e normalizadores antes do overhead de serialização. O número de exemplos usa lote de referência 2 e não cresce com o lote físico. Nenhum preset garante recuperação de qualidade.
 
 Cada nível ajusta lotes de calibração, comprimento de sequência, lotes e profundidade dos logits do teacher, épocas, taxa de aprendizado, peso da destilação e acumulação de gradiente. `--batch-size` fica de fora de propósito: é restrição de memória da máquina, não escolha de qualidade.
 
@@ -149,19 +151,22 @@ aguardente effort          # compara os níveis, sem tocar em nenhum modelo
 
 ---
 
-## Exemplo de dimensionamento
+## Resultado medido e dimensionamento
 
-Exemplo de redução do Qwen3-4B para alvo de 1,0 B parâmetros, dimensionado para caber no treino de uma máquina de 24 GB:
+Ensaio completo do SmolLM2-135M no M1 de 8 GB, em 7/9/2026, com a configuração acima:
 
-|  | Original | Podado | Recuperado + int4 |
+|  | Original | Podado | Recuperado |
 |---|---|---|---|
-| Parâmetros | 4,02 B | 0,99 B | 0,99 B |
-| Tamanho em disco | 7,49 GB | 1,85 GB | **0,53 GB** |
-| Redução | — | 4,1× | **14,2×** |
+| Parâmetros | 134,52 M | 121,24 M | 121,24 M |
+| Perplexidade¹ | 17,954 | 22,544 | 20,221 |
 
-O alvo não é livre: a etapa de recuperação precisa manter pesos, gradientes e os dois momentos do AdamW em memória, o que dá 12 bytes por parâmetro. Em 24 GB de RAM o orçamento é de 18 GB e o teto de treino fica em 1,21 B parâmetros — por isso o exemplo usa 1,0 B, e não um valor maior. `aguardente plan` calcula esse teto para a máquina local, e `aguardente run` recusa alvos acima dele.
+¹ WikiText test, primeiros 20.000 caracteres, janela 512 e stride 256. A recuperação devolveu 50,6% da diferença de perplexidade entre poda/reconstrução e teacher. O `.aimodel` int8 tem **123,23 MiB** e passou nos testes de logits, perplexidade e KV cache. Int4 foi reprovado. Os ensaios com corte maior, para 114,61 M, ficaram acima do limite de qualidade.
 
-A flag `--measure` avalia a perplexidade no conjunto de teste antes da poda, após a poda e após a recuperação.
+Isso ainda não demonstra qualidade geral de linguagem: houve repetição e erros factuais nas gerações. O teacher apenas quantizado em int8 ocupa 136,67 MiB e teve perplexidade melhor; neste modelo já pequeno, a economia de 9,8% no asset não justifica por si só destilar. Resultados, protocolos separados e revisão por etapa estão no [relatório de recuperação](docs/recovery-improvements.md); a [auditoria inicial](docs/pipeline-audit.md) preserva as medições anteriores.
+
+A recuperação usa pesos, gradientes e dois momentos do AdamW em FP32: **16 bytes por parâmetro**, além de ativações e temporários. Com as margens atuais, o teto estático é aproximadamente 201 M parâmetros em 8 GiB de RAM e 906 M em 24 GiB; não é garantia de ausência de pressão de memória. O teacher inteiro também precisa caber antes da poda. Preparar modelos grandes pode exigir uma máquina maior que a de execução final.
+
+A avaliação de recuperação e de runtime é obrigatória no pipeline completo; `--measure` permanece por compatibilidade. `--max-ppl-ratio` explicita o limite student/teacher (padrão 1,2). `quality.json` registra o resultado, e um student reprovado fica salvo para análise, sem seguir para exportação. A conversão admite até 5% de aumento adicional de perplexidade contra o student FP32, além dos testes de logits, prefill e KV cache.
 
 ---
 
@@ -171,8 +176,8 @@ A flag `--measure` avalia a perplexidade no conjunto de teste antes da poda, ap�
 |---|---|
 | Sistema | macOS 27+ com Apple Silicon |
 | Xcode | Xcode 27+ com Metal Toolchain |
-| Memória | 24 GB de RAM para modelos de ~4 B; 16 GB para modelos menores |
-| Armazenamento | ~30 GB de espaço livre |
+| Memória | Ensaio de 135 M validado em 8 GB; use `plan` para os limites estimados de teacher e student |
+| Armazenamento | Depende dos pesos, logits, checkpoints e bundles; o pipeline estima o espaço necessário |
 
 Execute `aguardente doctor` para validar o ambiente.
 
@@ -192,12 +197,13 @@ Levantamento do estado atual do projeto. Itens ~~tachados com ✅~~ já foram co
 
 ### Em aberto
 
-- O orçamento de treino cobre pesos, gradientes e estados do otimizador (12 bytes por parâmetro), sem termo para as ativações, que dependem de lote, comprimento de sequência e profundidade. A fração `train_fraction = 0,75` funciona como margem implícita, mas não foi calibrada contra medição: a folga real entre o teto e um alvo próximo dele pode ser menor que a aparente.
+- O orçamento estático de treino cobre 16 bytes por parâmetro. O lote automático inclui uma estimativa de ativações, mas nem ela nem a margem `train_fraction = 0,75` foram calibradas contra picos reais de memória.
+- A qualidade depende do modelo, do corte e dos dados. Tokenizer externo, seleção do checkpoint, packing e quantização foram reforçados; os [novos experimentos](docs/recovery-improvements.md) distinguem melhoria medida de generalização ainda não demonstrada. A validação de cache cobre até 1.024 tokens, sem comprovar contextos maiores.
 - O macOS não falha imediatamente sob pressão de memória, ele pagina. Uma execução acima do orçamento tende a ficar ordens de grandeza mais lenta em vez de abortar, e o sintoma é difícil de atribuir ao alvo escolhido.
 - Um download interrompido de `xcodebuild -downloadComponent MetalToolchain` pode deixar `xcrun --find coreai-build` bem-sucedido com o componente incompleto. O diagnóstico aprovaria o ambiente e a falha só apareceria na compilação.
 - A verificação de versão do Xcode aceita qualquer `27.x`, incluindo betas em que o Metal Toolchain ainda não está disponível. Na prática a verificação de `coreai-build` cobre o caso, mas o diagnóstico de versão sozinho não distingue.
-- A integridade dos arquivos baixados é conferida por tamanho, não por checksum. O índice do Hugging Face publica o SHA-256 dos arquivos LFS; confrontá-lo detectaria uma corrupção que coincida com o tamanho esperado.
-- `probe.py` decide se um modelo é aceito e como seus parâmetros são contados, e tem a cobertura de testes mais fina do projeto (dois casos). Um config inesperado tende a falhar tarde, já dentro da execução.
+- Os pesos LFS têm SHA-256 conferido; arquivos pequenos sem digest publicado continuam verificados por tamanho. A revisão do modelo é fixada, mas não há pin da revisão remota do dataset; os documentos efetivamente usados são preservados com hash.
+- `probe.py` rejeita arquiteturas explicitamente não causais, mas sua cobertura de configurações desconhecidas continua limitada. Um config inesperado pode falhar tarde, já dentro da execução.
 - Não foi executada uma conversão completa pela interface gráfica. O caminho CLI → NDJSON → interface está coberto por testes dos dois lados, mas nenhuma execução real de ponta a ponta foi observada.
 
 ### Corrigidos
@@ -212,12 +218,12 @@ Levantamento do estado atual do projeto. Itens ~~tachados com ✅~~ já foram co
 - ~~Reutilizar um diretório de execução com outro modelo ou outro alvo era silenciosamente ignorado: `RunState.load_or_create` dava precedência ao valor gravado sobre o argumento recebido, e `fetch` permanecia marcado como concluído. O pipeline seguia com os pesos do modelo anterior sem qualquer aviso.~~ ✅ divergência aborta a execução; `--restart` descarta estado e artefatos de forma explícita
 - ~~Os logits pré-computados eram reaproveitados na retomada apenas pela existência do diretório. Alterar `--top-k`, `--seq-len` ou o lote entre execuções reutilizava logits incompatíveis com a nova configuração.~~ ✅ cada etapa grava a impressão digital dos parâmetros que a geraram e é refeita quando eles mudam
 - ~~`--target-params` não era validado contra `Budget.max_params_for_training()`. Um alvo acima do teto da máquina era aceito, e a falta de memória só aparecia na etapa `recover`, depois do download e da pré-computação dos logits.~~ ✅ recusado no plano, com `--allow-oversized` para assumir o risco deliberadamente
-- ~~O exemplo de dimensionamento deste README (Qwen3-4B para 1,4 B) excedia o teto de treino da configuração declarada em *Requisitos*.~~ ✅ refeito com alvo de 1,0 B e o cálculo do teto explicado
+- ~~O exemplo de dimensionamento deste README excedia o teto de treino declarado.~~ ✅ substituído por ensaio medido e limites FP32 explícitos
 - ~~A verificação de espaço em disco nunca disparava: `run_all()` era sempre chamado sem `required_disk_bytes`. `stage_logits` estimava os GB necessários e informava, mas não confrontava o valor com o espaço livre nem abortava.~~ ✅ verificação antes de baixar e antes de pré-computar, com piso mínimo no `doctor`
 - ~~`stack do pipeline` era classificado como aviso, não como falha. `aguardente run` prosseguia sem `torch` instalado e terminava em `ModuleNotFoundError` cru, já dentro da execução.~~ ✅ aviso no `doctor`, bloqueio no `run`
 - ~~`Machine.detect()` media sempre o volume `/`. Com `-o` apontando para disco externo, o espaço reportado não correspondia ao destino real.~~ ✅ mede o volume do destino, mesmo que o diretório ainda não exista
 - ~~`SYSTEM_HEADROOM_BYTES` era fixo em 6 GB. Em um Mac de 8 GB isso deixava 2 GB de orçamento, valor irreal para qualquer etapa.~~ ✅ margem proporcional (25% da RAM, entre 4 GB e 12 GB), preservando os 6 GB da máquina de referência de 24 GB
-- ~~Sem MPS disponível, `loading.pick_dtype` seleciona `float32`, dobrando o consumo de memória em relação ao orçamento, que assume 2 bytes por parâmetro.~~ ✅ o teto de treino acompanha o dtype do dispositivo e a queda é anunciada
+- ~~O dtype real do treino divergia do orçamento de memória.~~ ✅ recuperação e teto agora usam FP32 em todos os dispositivos
 - ~~Não havia exclusão mútua sobre o diretório de execução: duas instâncias apontadas para o mesmo `-o` sobrescreviam o estado uma da outra.~~ ✅ lock consultivo com recuperação de lock órfão
 - ~~Exceções fora de `AguardenteError` — incluindo falta de memória, disco cheio e dependência ausente — chegavam ao usuário como traceback.~~ ✅ mensagens próprias por família; traceback sob `AGUARDENTE_DEBUG=1`
 - ~~`arch._present` considerava presente qualquer valor diferente de `None`. Um config denso que declarasse `num_experts: 0` seria recusado como MoE.~~ ✅

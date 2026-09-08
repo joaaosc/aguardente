@@ -60,16 +60,16 @@ aguardente doctor
 
 ## Execução de teste
 
-Para validar o fluxo completo e as dependências em poucos minutos usando um modelo leve:
+Execução com modelo leve e seleção automática de compressão:
 
 ```bash
-aguardente run HuggingFaceTB/SmolLM2-135M-Instruct \
-    -o ensaio --target-params 90e6 \
-    --calib-batches 4 --logit-batches 8 --epochs 1 \
-    --export-dry-run
+aguardente run HuggingFaceTB/SmolLM2-135M \
+    -o ensaio --target-params 125e6 --effort high \
+    --batch-size 1 --seq-len 256 --calib-batches 64 --logit-batches 256 \
+    --epochs 2 --grad-accum 4 --lr 0.0001 --max-context-length 512
 ```
 
-A opção `--export-dry-run` valida os argumentos e a configuração de conversão sem executar o empacotamento completo.
+As [medições de recuperação](docs/recovery-improvements.md) registram os resultados e limites de cada rodada. `--export-dry-run` valida configuração, arquitetura e contexto; não demonstra conversão nem execução. Receitas explícitas, como `--compression-config docs/recipes/smollm2-int8.yaml`, nunca são substituídas automaticamente.
 
 ---
 
@@ -164,13 +164,20 @@ aguardente run <modelo> -o <diretório> [opções]
 | Esforço | `--effort low\|medium\|high\|max` |
 | Alvo | `--target-params 1.0e9` `--allow-oversized` |
 | Download | `--connections 8` `--concurrent 4` |
-| Calibração | `--calib-batches 32` `--batch-size 2` `--seq-len 512` `--calib-dataset` `--calib-file` |
-| Logits | `--logit-batches 256` `--top-k 128` |
-| Recuperação | `--epochs 2` `--lr 3e-5` `--alpha 0.9` `--temperature 2.0` `--grad-accum 4` |
-| Exportação | `--platform macOS` `--compression 4bit` `--max-context-length` `--export-dry-run` |
+| Calibração | `--calib-batches 32` `--batch-size 2` `--seq-len 512` `--calib-dataset` `--calib-config` `--calib-split train` `--text-column text` `--calib-file` |
+| Dados e reconstrução | `--seed 42` `--eval-file` `--no-reconstruction` |
+| Logits | `--logit-batches 256` `--top-k 128` `--tail-samples 128` |
+| Recuperação | `--epochs 2` `--lr 3e-5` `--alpha 0.9` `--temperature 2.0` `--grad-accum 4` `--max-ppl-ratio 1.2` |
+| Exportação | `--platform macOS` `--compression auto` ou `--compression-config receita.yaml` `--max-context-length` `--export-dry-run` |
 | Controle | `--device` `--measure` `--skip-recover` `--skip-export` `--skip-checks` `--restart` |
 
-A opção `--measure` calcula a perplexidade no início, pós-poda e após a recuperação para quantificar a fração recuperada.
+A perplexidade é sempre calculada antes e depois da recuperação. O melhor checkpoint vem do split de validação; o split de teste decide a aprovação com `PPL_student / PPL_teacher <= --max-ppl-ratio`. O padrão é 1,2. Reprovar preserva os pesos e `quality.json`, e impede exportação. Não aumente o limite para apresentar um resultado ruim como recuperado: ele representa uma exigência de qualidade a ser definida para o uso pretendido.
+
+Depois de exportar, o pipeline compara logits, prefill, decode e perplexidade no Core AI nativo contra o checkpoint FP32. `auto` tenta int4, int8 e sem quantização, nessa ordem, e seleciona em validação a primeira opção dentro das tolerâncias numéricas e de 5% de aumento de perplexidade. Crash ou erro de runtime interrompe a execução. Uma receita selecionada passa por teste separado, registrado em `runtime-validation.json`. `--measure` é mantida por compatibilidade; sua ausência não desliga essas verificações.
+
+Por padrão, os dados vêm dos splits oficiais de WikiText-2. Para outro domínio, forneça um dataset textual ou `--calib-file`: TXT com documentos separados por linha em branco, ou JSONL com `{"text": "..."}`. JSONL com `messages` usa o chat template treinado do tokenizer; sem esse template, a entrada é recusada. Dataset customizado pode selecionar config, split e coluna textual. Arquivos/datasets customizados exigem pelo menos 20 documentos distintos e usam separação 80/10/10 por documento. `--eval-file` substitui a validação; o teste continua separado. Duplicatas exatas entre splits são removidas. Isso não detecta paráfrases ou vazamento semântico.
+
+O corpus efetivamente usado é preservado em `data/corpus.json`, com hashes e semente. Documentos são embaralhados e empacotados com separadores EOS: textos longos atravessam janelas, sem truncamento por documento, até o orçamento de amostras. O manifesto dos logits informa o número real de transições válidas. Mais épocas repetem os mesmos dados; aumentar o corpus representativo é uma decisão diferente.
 
 O alvo é validado contra o teto de treino da máquina antes de qualquer download. `--allow-oversized` aceita um alvo acima do teto, assumindo o risco de esgotar a memória na recuperação.
 
@@ -188,14 +195,16 @@ aguardente effort
 
 Compara os quatro níveis sem tocar em nenhum modelo: o que cada um muda, quando usar, quanto ocupa em disco e quanto custa em tempo relativo.
 
-| Nível | Perfil | Épocas | top-k | Sequência | Logits em disco | Custo |
-|---|---|---:|---:|---:|---:|---:|
-| `low` | rápido | 1 | 64 | 256 | 12 MB | 0,07× |
-| `medium` | equilibrado | 2 | 128 | 512 | 192 MB | 1,00× |
-| `high` | cuidadoso | 3 | 192 | 768 | 864 MB | 4,26× |
-| `max` | exaustivo | 4 | 256 | 1.024 | 3,0 GB | 14,74× |
+| Nível | Perfil | Épocas | top-k | Amostras da cauda | Sequência | Logits em disco | Custo |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `low` | rápido | 1 | 64 | 64 | 256 | 32,1 MiB | 0,07× |
+| `medium` | equilibrado | 2 | 128 | 128 | 512 | 513 MiB | 1,00× |
+| `high` | cuidadoso | 3 | 192 | 256 | 768 | 2.691 MiB | 4,26× |
+| `max` | exaustivo | 4 | 256 | 512 | 1.024 | 12.296 MiB | 14,74× |
 
-O nível define `--calib-batches`, `--seq-len`, `--logit-batches`, `--top-k`, `--epochs`, `--lr`, `--alpha`, `--temperature` e `--grad-accum`. Qualquer uma dessas opções informada explicitamente tem precedência sobre o preset, e o painel de esforço lista as que foram sobrescritas.
+Disco estimado antes do overhead de serialização; custo é um índice de trabalho, não tempo medido. Os nomes dos presets não garantem recuperação de qualidade.
+
+O nível define `--calib-batches`, `--seq-len`, `--logit-batches`, `--top-k`, `--tail-samples`, `--epochs`, `--lr`, `--alpha`, `--temperature` e `--grad-accum`. Qualquer uma dessas opções informada explicitamente tem precedência sobre o preset, e o painel de esforço lista as que foram sobrescritas.
 
 `--batch-size` não entra na escala: é restrição de memória da máquina, não escolha de qualidade.
 
@@ -215,7 +224,7 @@ Exibe o estado das etapas registradas em `state.json`.
 
 ### 1. fetch
 
-Baixa os arquivos do modelo original via `aria2c`.
+Baixa os arquivos do modelo original via `aria2c`, fixando o commit do Hub em `.aguardente-source.json`. Pesos LFS são verificados pelo SHA-256 publicado, inclusive arquivos já presentes com o tamanho correto. Retomadas usam o mesmo commit.
 
 ### 2. extract
 
@@ -229,10 +238,10 @@ Carrega o modelo, avalia a importância estrutural com base em amostras reais de
 
 **Um student pronto.** `--student <modelo>` substitui essa cirurgia por um modelo já existente — um identificador do Hugging Face ou um diretório local. Nesse caso não há alvo de parâmetros a calcular: a etapa `prune` baixa (ou copia) o modelo indicado no lugar de podar, e a recuperação treina esse student contra os logits do teacher, exatamente como faria com o resultado da poda.
 
-A única exigência é o `vocab_size` do student bater com o do teacher, checada antes de qualquer download: a destilação por logits compara probabilidade token a token, e um índice que aponta para palavras diferentes em cada tokenizer invalida a divergência KL. Vocabulário igual não garante o mesmo tokenizer — é uma condição necessária, verificável sem baixar peso algum, não uma prova completa de compatibilidade.
+A destilação por logits exige tokenizers equivalentes: mapeamento de tokens/IDs, normalização, segmentação, tokens especiais e chat template. O pipeline compara as definições dos tokenizers fast antes de baixar os pesos do student. Mesmo `vocab_size` ou mesmo nome de família não é prova suficiente; tokenizers diferentes exigem outra estratégia de destilação, ainda não implementada.
 
 ```bash
-aguardente run Qwen/Qwen3-4B -o run/custom --student Qwen/Qwen2.5-1.5B-Instruct --skip-recover
+aguardente run ./teacher -o run/custom --student ./student-com-tokenizer-equivalente
 ```
 
 ### 4. logits
@@ -245,7 +254,7 @@ Treina o modelo podado para minimizar a divergência KL em relação aos logits 
 
 ### 6. export
 
-Gera o pacote `.aimodel` chamando `coreai.llm.export` com a configuração de plataforma e compressão selecionadas.
+Gera o pacote `.aimodel` usando as APIs de carregamento, quantização e exportação da implementação Apple, com um adaptador para checkpoints locais. O caminho local validado é macOS.
 
 ---
 
@@ -260,7 +269,7 @@ A seção anterior descreve o que cada etapa faz. Esta descreve como — o algor
 Duas grandezas decidem se um alvo é alcançável:
 
 - **Piso de poda** — o menor tamanho que a arquitetura ainda aceita, aplicando `shrink(arch, t=1.0)`: reduz `intermediate_size` até uma fração mínima da MLP, depois os grupos KV até uma fração mínima da atenção, depois `num_hidden_layers` até uma fração mínima de camadas. As três reduções são sequenciais, não simultâneas — a MLP encolhe primeiro porque concentra a maior parte dos parâmetros; só depois de esgotada a margem ali é que atenção e profundidade entram.
-- **Teto de treino** — quanto a máquina aguenta treinar sem estourar RAM: `ram_utilizável × 0,75 ÷ bytes_por_parâmetro`, em que `bytes_por_parâmetro` cobre pesos e gradientes no dtype do dispositivo (2 bytes em MPS, 4 em CPU) mais os dois momentos do AdamW (+8 bytes). Os 0,75 são a margem que sobra para ativações, que dependem do lote e do comprimento de sequência e por isso não entram na conta fixa.
+- **Teto de treino** — estimativa `ram_utilizável × 0,75 ÷ 16`: pesos, gradientes e dois momentos AdamW em FP32, também em MPS. O fator 0,75 reserva margem para ativações; o lote automático considera profundidade e logits, mas continua sendo estimativa sem medição de pico real.
 
 Entre o piso e o teto sem alvo explícito, `plan_for_target` busca por bisseção (64 iterações) o fator `t ∈ [0, 1]` que aproxima mais o alvo pedido, alinhando `intermediate_size` a blocos de 128 — o tamanho de bloco que a quantização per-block do exportador espera.
 
@@ -270,35 +279,39 @@ A cirurgia de `prune` aplica as dimensões que `plan` calculou diretamente sobre
 
 A escolha de **quais** linhas cortar vem de `prune/scoring.py`, medida num forward real sobre lotes de calibração, via hooks:
 
-- **Neurônios da MLP** — RMS da ativação na entrada de `down_proj`; neurônios com sinal fraco em dados reais são os primeiros a sair.
+- **Neurônios da MLP** — RMS da ativação na entrada de `down_proj` multiplicado pela norma dos pesos de saída, calculado separadamente para cada camada.
 - **Grupos de atenção** — RMS da saída de `v_proj`, agregada por grupo KV.
 - **Camadas** — *block influence*: `1 − similaridade_de_cosseno(entrada, saída)` do bloco transformer inteiro. Uma camada quase-identidade (entrada ≈ saída, influência ≈ 0) contribui pouco e é candidata a sair primeiro; a primeira e a última camada ficam sempre protegidas.
 
-Todos os três scores são médias sobre os lotes de calibração processados, não um cálculo analítico — por isso a qualidade do corte depende de os lotes serem representativos do uso real do modelo.
+Os scores excluem padding e são ponderados pelos tokens ativos. MLP e grupos KV têm índices próprios por camada. São heurísticas medidas sobre dados de calibração; a qualidade do corte depende de os exemplos serem representativos do uso real.
+
+Antes do corte, a reconstrução ajusta por mínimos quadrados regularizados as colunas mantidas de `down_proj` e `o_proj` para aproximar a saída original. As estatísticas são coletadas com o teacher intacto; a solução é calculada em FP64 na CPU. O pipeline compara poda simples e reconstruída em validação e preserva a melhor. `reconstruction.json` registra a decisão. Essa compensação local não reconstrói capacidade arbitrariamente removida, nem ajusta camadas inteiras descartadas. O limite de memória das estatísticas é explícito; `--no-reconstruction` desativa a etapa quando solicitado.
 
 ### distill (`logits` + `recover`)
 
-A etapa `logits` roda o modelo original (teacher) uma vez sobre o conjunto de calibração e grava, para cada posição, só os `top_k` valores de logit e seus índices no vocabulário — não a distribuição completa. Isso reduz o custo de armazenamento de `vocab_size` para `top_k` valores por token (6 bytes por entrada: 2 do valor em fp16, 4 do índice), e é o que faz caber em disco o suficiente para calibrar sem manter o teacher inteiro em memória durante o treino.
+A etapa `logits` grava os top-k logits FP32, índices int32, `logsumexp(logits / T)` sobre o vocabulário inteiro e N amostras da distribuição condicional fora do top-k, com reposição. São `8 × (top_k + tail_samples) + 4` bytes por posição, além dos tokens, máscaras e overhead. O manifesto registra versão, temperatura, semente via assinatura, tokens válidos e massa média coberta pelo top-k. Cada shard identifica teacher e configuração; arquivos ilegíveis são regenerados com o teacher, com diagnóstico. O teacher é liberado antes do treino do student.
 
-A etapa `recover` treina o student contra esses logits com `kd_loss` (`distill/loss.py`), a combinação clássica de Hinton para destilação:
+A etapa `recover` combina entropia cruzada causal com uma estimativa da KL do vocabulário inteiro. Para p do teacher, q do student, conjunto K e amostras z da cauda:
 
 ```
-loss = α · KL(softmax(student_topk / T) ‖ softmax(teacher_topk / T)) · T²  +  (1 − α) · cross_entropy(student, próximo_token)
+KL_est = Σ[i ∈ K] p(i) log(p(i)/q(i))
+         + p(cauda) · média[z ~ p(.|cauda)] log(p(z)/q(z))
+loss = α · T² · KL_est + (1 − α) · cross_entropy(student, próximo_token)
 ```
 
-`T` (temperatura) suaviza as duas distribuições antes da divergência — sem isso o gradiente vem quase só dos tokens de maior probabilidade. O termo `T²` compensa a escala do gradiente que a temperatura reduz. `α` (padrão 0,9) pesa a imitação do teacher contra o aprendizado direto do próximo token; o `student_logits` é indexado pelos mesmos índices de vocabulário do teacher via `gather`, por isso o `vocab_size` dos dois precisa bater.
+As probabilidades usam normalização sobre o vocabulário inteiro. O gradiente é não enviesado em relação à amostragem; o cache fixa uma realização e a reutiliza nas épocas, introduzindo erro de Monte Carlo. Isso não equivale a guardar a KL completa. A estimativa pode ser negativa numa amostra finita e não é truncada em zero, o que enviesaria seu gradiente. A API conserva a aproximação K+1 para shards sem amostras da cauda; novas execuções da CLI exigem N positivo. Máscara e deslocamento causal excluem padding. `T²` compensa a temperatura e `α` pesa KD contra entropia cruzada.
 
-O laço de treino usa AdamW, taxa de aprendizado com warmup linear seguido de decaimento por cosseno, acumulação de gradiente, `clip_grad_norm_`, avaliação periódica de perplexidade com parada antecipada por platô, e checkpoint automático — pesos, estado do otimizador e a posição exata no fluxo de lotes, retomável sem repetir trabalho.
+O treino usa AdamW, warmup/cosseno com piso e clipping. A acumulação é ponderada por transições válidas, inclusive lotes residuais e com padding desigual. Todo mínimo de perplexidade é salvo, independentemente do limiar de paciência; o checkpoint inicial participa da seleção. Plateau só encerra depois de consumir ao menos uma época completa, para não descartar parte do corpus antes de treiná-la. A retomada restaura otimizador, posição, ordem por semente e estados RNG de Python/PyTorch/MPS/CUDA. Ctrl-C durante acumulação descarta e repete a janela não confirmada; durante o passo AdamW, o sinal é adiado até concluir a atualização. Testes em CPU com dropout verificam equivalência exata da retomada. Isso não promete determinismo entre dispositivos/versões, nem checkpoint do instante de uma queda de energia.
 
-Em MPS os pesos ficam em `bfloat16`, não em `float16`: o treino atualiza os pesos no próprio dtype do modelo e o AdamW divide pela raiz do segundo momento, que em `float16` subborda para zero e manda todos os pesos para infinito no primeiro passo. A perda é conferida a cada lote e os pesos são conferidos ao final do treino: um student com infinito ou NaN aborta a etapa em vez de seguir para a exportação.
+Na recuperação, pesos, gradientes e momentos AdamW são FP32. BF16 evita o overflow de FP16, mas pode perder atualizações pequenas quando os pesos são atualizados diretamente nesse dtype. Finitude de loss, gradientes e pesos é conferida; valores inválidos abortam o treino. A inferência do teacher em MPS continua usando BF16.
 
 ### export
 
-`export` chama o exportador oficial da Apple, `coreai.llm.export`, como subprocesso — procurado primeiro no diretório do interpretador em execução (instalado como ferramenta `uv`, o exportador divide o ambiente com o `aguardente` sem aparecer no PATH do usuário), depois no PATH e, por último, via `uv run coreai.llm.export`. Os argumentos controlam plataforma (`macOS`), compressão (`4bit` por padrão: int4 por bloco de 32 valores, ~4,50 bits por peso), precisão de computação (`float16`) e comprimento máximo de contexto; `--export-dry-run` valida esses argumentos sem gravar o bundle.
+Checkpoints locais passam por `aguardente.local_export`, no mesmo Python da CLI, usando as APIs de `coreai-models`. `--compression` e `--compression-config` são mutuamente exclusivas. O padrão `auto` seleciona entre int4, int8 e sem quantização em validação; a avaliação final usa teste separado. Candidatos e resultados ficam isolados por assinatura da execução, e `selection.json` registra inclusive reprovações. Nenhum bundle é escolhido pela data de modificação. Uma receita explícita é aprovada ou reprovada, sem substituição.
 
-O exportador aceita apenas um nome curto do registro da Apple ou um identificador do Hugging Face — o caminho de um diretório vai direto para `snapshot_download`, que o rejeita. Um modelo podado e destilado aqui não existe no Hub, então a etapa monta um cache do Hub num diretório temporário, com os arquivos do modelo ligados por symlink na posição de um snapshot, e roda o exportador em modo offline apontado para esse cache. Nada é copiado e nada sai da máquina.
+O caminho local não simula cache do Hugging Face. Para Llama, um diretório temporário com configuração canônica e links para os pesos permite usar o adaptador Mistral da Apple; a equivalência foi testada numericamente no SmolLM2. O adaptador local atual recusa iOS explicitamente e carrega os pesos inteiros, portanto seu pico de memória precisa ser considerado.
 
-O resultado é um diretório com `metadata.json` e o pacote `.aimodel`. A partir dele, `xcrun coreai-build inspect` examina o modelo exportado e `xcrun coreai-build compile` gera a versão compilada AOT (`.aimodelc`) para execução no dispositivo — passos fora do `aguardente`, já no toolchain da Apple.
+O resultado contém metadata, tokenizer e `.aimodel`. A validação obrigatória usa uma ponte Swift com o framework CoreAI do sistema, preferência GPU e `SpecializationOptions.expectFrequentReshapes = true`, necessário para o caminho dinâmico validado neste SDK. Há timeout por resposta e liberação dos estados KV. A comparação com PyTorch inclui prefill em blocos e decode até o menor de 1.024 tokens, texto disponível e contexto declarado menos um. `xcrun coreai-build inspect` e `compile` inspecionam e geram AOT separadamente.
 
 ---
 
@@ -315,6 +328,10 @@ Estrutura de arquivos gerada:
 ```
 run/qwen3/
 ├── state.json      # estado e métricas das etapas
+├── data/           # documentos exatos de treino/validação/teste e hashes
+├── quality.json    # aprovação/reprovação da recuperação
+├── reconstruction.json # comparação de reconstrução em validação
+├── runtime-validation.json # comparação final do .aimodel com PyTorch
 ├── teacher/        # arquivos do modelo original
 ├── pruned/         # pesos e configs após poda estruturada
 ├── logits/         # shards de logits pré-computados
@@ -331,7 +348,7 @@ Se o treinamento exceder a capacidade de memória da máquina, considere as segu
 
 | Opção | Impacto |
 |---|---|
-| `--grad-accum 8` | Mantém o tamanho efetivo de batch reduzindo a memória por passo |
+| `--batch-size 1 --grad-accum 8` | Lote físico menor reduz ativações; acumulação compensa o lote efetivo. Aumentar somente acumulação não reduz memória |
 | `--seq-len 256` | Reduz o volume de ativações durante o backward pass |
 | `--batch-size 1` | Menor consumo de memória por lote |
 | `--target-params <menor>` | Gera um modelo menor, exigindo menos memória no treino |
@@ -382,9 +399,9 @@ Se o treinamento exceder a capacidade de memória da máquina, considere as segu
 | `o modelo podado produz NaN ou Inf` | Poda excessiva desestabilizou o modelo | Aumente o valor de `--target-params`. |
 | `alvo é menor que o piso de poda` | Alvo abaixo do limite estrutural | Escolha um modelo base menor ou eleve `--target-params`. |
 | `num_attention_heads não é múltiplo de num_key_value_heads` | Arquitetura não padrão | Incompatível com o corte em grupos GQA. |
-| `MPS backend out of memory` | Memória de GPU esgotada | Use `--grad-accum 8` e `--seq-len 256`. |
+| `MPS backend out of memory` | Memória de GPU esgotada | Reduza `--batch-size`/`--seq-len` ou o tamanho treinado. Aumentar só acumulação não reduz memória. |
 | `a perda de destilação divergiu` | Taxa de aprendizado alta demais para o modelo | Reduza `--lr`, aumente `--grad-accum`, ou use um nível de esforço mais conservador. |
-| `a recuperação produziu pesos não finitos` | Divergência no passo final do treino | Reduza `--lr`; em `--device cpu` o treino roda em float32, com mais margem numérica. |
+| `a recuperação produziu pesos não finitos` | Divergência no passo final do treino | Reduza `--lr` e investigue dados/gradientes; o treino já usa FP32 em todos os dispositivos. |
 | `excede o teto de treino desta máquina` | Alvo maior do que a RAM comporta no treino | Reduza `--target-params`, use `--skip-recover`, ou `--allow-oversized` para assumir o risco. |
 | `memória insuficiente para concluir a etapa` | Falta de memória durante a execução | Reduza o alvo, o lote ou o comprimento de sequência, e aumente `--grad-accum`. |
 | `pesos pré-quantizados não suportados` | Repositório distribui pesos GPTQ, AWQ ou FP8 | Use o repositório com os pesos originais em float16. |
@@ -403,7 +420,7 @@ Se o treinamento exceder a capacidade de memória da máquina, considere as segu
 
 Etapas longas exibem indicadores que se atualizam no lugar: um medidor de nível ao apresentar o esforço, um spinner durante o carregamento do modelo e a medição de importância, e barras de progresso com estimativa de término no download e na pré-computação dos logits.
 
-A animação só acontece em terminal interativo. Sob `--json`, em pipe ou em arquivo de log, a saída degrada para marcos textuais a cada 10%, sem sequências de escape. Para desligar num terminal, defina `AGUARDENTE_NO_ANIM=1`.
+A animação só acontece em terminal interativo. Em pipe ou arquivo, barras emitem marcos de 10% e o treino emite atualizações limitadas a uma por dez segundos. `--json` mantém os eventos estruturados. Para desligar animações num terminal, defina `AGUARDENTE_NO_ANIM=1`.
 
 ### Depuração
 
@@ -421,7 +438,7 @@ AGUARDENTE_DEBUG=1 aguardente run <modelo> -o run/
 A quantização reduz a precisão dos pesos (por exemplo, de 16 bits para 4 bits), reduzindo o tamanho em disco e a memória de inferência sem alterar a contagem de parâmetros. A poda remove parâmetros estruturalmente (linhas e colunas de matrizes e camadas inteiras). O pipeline combina poda estruturada com quantização final para maximizar a redução.
 
 **Por que a perplexidade sobe imediatamente após a poda?**
-A remoção de parâmetros afeta temporariamente a capacidade de representação do modelo. A etapa de destilação subsequente ajusta os pesos restantes para restaurar a qualidade.
+A remoção de parâmetros reduz a capacidade de representação. Reconstrução e destilação ajustam os pesos restantes para recuperar parte da qualidade, mas a perda pode ser permanente. Um corte estruturalmente válido pode continuar reprovado mesmo com mais treino.
 
 **A execução pode ser interrompida?**
 Sim. Ao interromper com `Ctrl-C`, o estado atual é salvo em `state.json` e checkpoints de treinamento são persistidos para retomada posterior.

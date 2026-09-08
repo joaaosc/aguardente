@@ -7,9 +7,10 @@ import re
 import shutil
 import subprocess
 import urllib.request
-from dataclasses import dataclass
+import urllib.parse
+from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Sequence
+from typing import Any, Callable
 
 from .errors import AguardenteError
 
@@ -84,9 +85,14 @@ class RemoteFile:
 
     path: str
     size: int
+    sha256: str | None = None
 
     def __post_init__(self) -> None:
         safe_join(Path("/__validacao__"), self.path)
+        if self.size < 0:
+            raise AguardenteError(f"tamanho negativo para {self.path}")
+        if self.sha256 is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", self.sha256):
+            raise AguardenteError(f"checksum SHA-256 inválido para {self.path}")
 
     def url(self, model_id: str, revision: str = "main") -> str:
         return f"{_HF}/{model_id}/resolve/{revision}/{self.path}"
@@ -98,6 +104,7 @@ class FetchPlan:
     revision: str
     dest: Path
     files: tuple[RemoteFile, ...]
+    requested_revision: str = "main"
 
     @property
     def total_bytes(self) -> int:
@@ -125,6 +132,10 @@ class FetchPlan:
                     out.append(f)
             elif tamanho_local == 0:
                 out.append(f)
+            if f.sha256 and f not in out:
+                from .inputs import file_identity
+                if file_identity(local).lower() != f.sha256.lower():
+                    out.append(f)
         return tuple(out)
 
     @property
@@ -150,15 +161,34 @@ def list_files(model_id: str, revision: str = "main") -> tuple[RemoteFile, ...]:
     """Lista os arquivos necessários do repositório no Hugging Face."""
     validate_model_id(model_id)
     url = f"{_HF}/api/models/{model_id}/tree/{revision}?recursive=1"
+    origin = urllib.parse.urlsplit(url)
+    visited: set[str] = set()
+    entries = []
+    received = 0
     try:
-        with urllib.request.urlopen(url, timeout=_TIMEOUT) as r:
-            bruto = r.read(_MAX_INDEX_BYTES + 1)
-            if len(bruto) > _MAX_INDEX_BYTES:
-                raise AguardenteError(
-                    f"índice de {model_id} excede {_MAX_INDEX_BYTES // 1024 // 1024} MB",
-                    hint="Resposta do índice excedeu o tamanho máximo permitido.",
-                )
-            entries = json.loads(bruto)
+        while url:
+            if url in visited or len(visited) >= 100:
+                raise AguardenteError(f"paginação inválida ou excessiva no índice de {model_id}")
+            visited.add(url)
+            with urllib.request.urlopen(url, timeout=_TIMEOUT) as r:
+                bruto = r.read(_MAX_INDEX_BYTES - received + 1)
+                received += len(bruto)
+                if received > _MAX_INDEX_BYTES:
+                    raise AguardenteError(
+                        f"índice de {model_id} excede {_MAX_INDEX_BYTES // 1024 // 1024} MB",
+                        hint="Resposta do índice excedeu o tamanho máximo permitido.",
+                    )
+                page = json.loads(bruto)
+                if not isinstance(page, list):
+                    raise AguardenteError(f"índice de {model_id} tem formato inesperado")
+                entries.extend(page)
+                link = r.headers.get("Link", "")
+            following = re.search(r'<([^>]+)>\s*;\s*rel="?next"?', link)
+            url = urllib.parse.urljoin(url, following.group(1)) if following else ""
+            if url:
+                next_origin = urllib.parse.urlsplit(url)
+                if (next_origin.scheme, next_origin.netloc, next_origin.path) != (origin.scheme, origin.netloc, origin.path):
+                    raise AguardenteError("paginação do Hub mudou a origem ou revisão do índice")
     except urllib.error.HTTPError as e:
         if e.code == 401:
             # Este endpoint lista a árvore de arquivos, e devolve 200 mesmo
@@ -175,21 +205,17 @@ def list_files(model_id: str, revision: str = "main") -> tuple[RemoteFile, ...]:
     except json.JSONDecodeError as e:
         raise AguardenteError(f"índice de {model_id} não é JSON válido: {e}") from e
 
-    if not isinstance(entries, list):
-        raise AguardenteError(f"índice de {model_id} tem formato inesperado")
-
     files = []
     for e in entries:
+        if not isinstance(e, dict):
+            raise AguardenteError(f"entrada inválida no índice de {model_id}")
         caminho = e.get("path")
         if not isinstance(caminho, str) or e.get("type") != "file":
             continue
         if not _wanted(caminho):
             continue
         size = e.get("size") or (e.get("lfs") or {}).get("size") or 0
-        try:
-            files.append(RemoteFile(path=caminho, size=int(size)))
-        except AguardenteError:
-            continue
+        files.append(RemoteFile(path=caminho, size=int(size), sha256=(e.get("lfs") or {}).get("oid")))
 
     if not any(f.path.endswith(".safetensors") for f in files):
         raise AguardenteError(
@@ -200,8 +226,30 @@ def list_files(model_id: str, revision: str = "main") -> tuple[RemoteFile, ...]:
 
 
 def plan_fetch(model_id: str, dest: str | Path, *, revision: str = "main") -> FetchPlan:
-    return FetchPlan(model_id=model_id, revision=revision,
-                     dest=Path(dest).expanduser(), files=list_files(model_id, revision))
+    validate_model_id(model_id)
+    dest = Path(dest).expanduser()
+    provenance = dest / ".aguardente-source.json"
+    saved_files = None
+    if provenance.is_file():
+        saved = json.loads(provenance.read_text())
+        if saved["model"] != model_id or saved["requested_revision"] != revision:
+            raise AguardenteError("diretório de download pertence a outro modelo/revisão",
+                                  hint="Use outro destino para preservar os arquivos existentes.")
+        commit = saved["commit"]
+        saved_files = saved.get("files")
+    else:
+        url = f"{_HF}/api/models/{model_id}/revision/{urllib.parse.quote(revision, safe='')}"
+        try:
+            with urllib.request.urlopen(url, timeout=_TIMEOUT) as response:
+                info = json.loads(response.read(_MAX_INDEX_BYTES))
+            commit = info["sha"]
+        except (urllib.error.URLError, TimeoutError, ValueError, KeyError) as exc:
+            raise AguardenteError(f"não foi possível fixar a revisão de {model_id}: {exc}") from exc
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise AguardenteError("Hugging Face não retornou um commit imutável válido")
+    return FetchPlan(model_id=model_id, revision=commit, requested_revision=revision,
+                     dest=dest, files=tuple(RemoteFile(**file) for file in saved_files)
+                     if saved_files is not None else list_files(model_id, commit))
 
 
 def require_aria2() -> str:
@@ -234,12 +282,19 @@ def fetch(
         raise AguardenteError(
             f"retry_wait precisa ser um inteiro entre 0 e 600 (recebido: {retry_wait!r})")
 
-    exe = require_aria2()
     pending = plan.missing()
+    plan.dest.mkdir(parents=True, exist_ok=True)
+    provenance = plan.dest / ".aguardente-source.json"
+    temporary = provenance.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"model": plan.model_id, "commit": plan.revision,
+                                      "requested_revision": plan.requested_revision,
+                                      "files": [asdict(file) for file in plan.files],
+                                      "sha256": {f.path: f.sha256 for f in plan.files if f.sha256}}, indent=2))
+    temporary.replace(provenance)
     if not pending:
         return plan.dest
 
-    plan.dest.mkdir(parents=True, exist_ok=True)
+    exe = require_aria2()
 
     lines: list[str] = []
     for f in pending:
@@ -247,6 +302,8 @@ def fetch(
         lines.append(f.url(plan.model_id, plan.revision))
         lines.append(f"  dir={target.parent}")
         lines.append(f"  out={target.name}")
+        if f.sha256:
+            lines.append(f"  checksum=sha-256={f.sha256}")
     input_file = plan.dest / ".aguardente-fetch.txt"
     input_file.write_text("\n".join(lines) + "\n")
     input_file.chmod(0o600)
@@ -255,6 +312,7 @@ def fetch(
         exe,
         "--input-file", str(input_file),
         "--continue=true",
+        "--check-integrity=true",
         f"--max-connection-per-server={connections}",
         f"--split={connections}",
         f"--max-concurrent-downloads={concurrent}",

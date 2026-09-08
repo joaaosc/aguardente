@@ -20,15 +20,11 @@ def pick_device(prefer: str | None = None) -> str:
 
 
 def pick_dtype(device: str) -> Any:
-    """Seleciona o tipo de precisão para o dispositivo (bfloat16 em MPS, float32 na CPU).
+    """Precisão de carregamento/inferência: BF16 em MPS, FP32 em CPU.
 
-    Em MPS a escolha é `bfloat16`, não `float16`: o treino de recuperação
-    atualiza os pesos no próprio dtype do modelo, sem cópia mestra em float32,
-    e o AdamW divide pela raiz do segundo momento. Um gradiente da ordem de
-    1e-4 tem quadrado 1e-8, abaixo do menor subnormal de float16 — o
-    denominador vira zero e a primeira atualização manda todos os pesos para
-    infinito. `bfloat16` ocupa os mesmos 2 bytes por peso, com o expoente de
-    float32, e não sofre esse estouro.
+    A recuperação promove os pesos para FP32 antes de criar o AdamW, para
+    preservar atualizações pequenas e momentos. Esta escolha não é a precisão
+    de treino nem a precisão do grafo Core AI exportado.
     """
     import torch
 
@@ -45,9 +41,12 @@ def load_causal_lm(ref: str, *, device: str | None = None, dtype: Any = None) ->
     dt = dtype if dtype is not None else pick_dtype(dev)
 
     try:
-        model = AutoModelForCausalLM.from_pretrained(
+        model, info = AutoModelForCausalLM.from_pretrained(
             ref, dtype=dt, low_cpu_mem_usage=True,
+            output_loading_info=True,
         )
+        if info.get("missing_keys") or info.get("mismatched_keys"):
+            raise ValueError(f"checkpoint incompleto: {info}")
         tokenizer = ensure_pad_token(AutoTokenizer.from_pretrained(ref))
     except Exception as e:  # noqa: BLE001
         raise AguardenteError(

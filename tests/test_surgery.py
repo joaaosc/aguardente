@@ -117,12 +117,13 @@ def test_pruned_model_round_trips_through_disk(tmp_path):
 def test_scoring_shapes_and_ordering():
     m = tiny_model()
     scores = score_model(m, batches(), max_batches=3)
-    assert scores.ffn.shape == (256,)
-    assert scores.kv_groups.shape == (4,)
+    assert scores.ffn.shape == (6, 256)
+    assert scores.kv_groups.shape == (6, 4)
     assert scores.layers.shape == (6,)
     assert torch.isfinite(scores.ffn).all()
-    assert len(scores.top_ffn(64)) == 64
-    assert scores.top_ffn(64).tolist() == sorted(scores.top_ffn(64).tolist())
+    assert scores.top_ffn(64).shape == (6, 64)
+    for row in scores.top_ffn(64).tolist():
+        assert row == sorted(row)
 
 
 def test_keep_layers_protects_boundaries():

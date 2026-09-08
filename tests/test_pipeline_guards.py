@@ -25,6 +25,55 @@ def contexto(tmp_path, **kw):
     return Context(opts=o, state=st, report=lambda *_: None)
 
 
+def test_completed_fetch_repairs_weights_corrupted_after_previous_run(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    from aguardente import fetch as downloader
+    from aguardente.fetch import RemoteFile
+    from dataclasses import asdict
+    ctx = contexto(tmp_path)
+    dest = ctx.opts.teacher_dir
+    dest.mkdir(parents=True)
+    original = b"original weights"
+    entry = RemoteFile("model.safetensors", len(original), hashlib.sha256(original).hexdigest())
+    (dest / entry.path).write_bytes(b"X" * len(original))
+    (dest / ".aguardente-source.json").write_text(json.dumps({
+        "model": ctx.opts.model, "requested_revision": "main", "commit": "a" * 40,
+        "files": [asdict(entry)]}))
+    ctx.state.finish("fetch", outputs={"dir": dest})
+    calls = []
+
+    def repair(plan, **kwargs):
+        calls.extend(plan.missing())
+        (dest / entry.path).write_bytes(original)
+
+    monkeypatch.setattr(downloader, "fetch", repair)
+    monkeypatch.setattr(downloader, "require_aria2", lambda: "aria2c")
+    assert pl.stage_fetch(ctx) == dest
+    assert calls == [entry]
+    assert (dest / entry.path).read_bytes() == original
+
+
+def test_unavailable_required_exporter_stops_before_download(tmp_path, monkeypatch):
+    from aguardente import export
+    ctx = contexto(tmp_path)
+    monkeypatch.setattr(pl, "make_plan", lambda ctx: None)
+    monkeypatch.setattr(export, "available", lambda: False)
+    monkeypatch.setattr(pl, "stage_fetch", lambda ctx: pytest.fail("must stop before downloading"))
+    with pytest.raises(AguardenteError, match="não está disponível"):
+        pl.run_pipeline(ctx.opts)
+
+
+def test_export_config_failure_is_not_downgraded_to_warning(tmp_path, monkeypatch):
+    from aguardente import export
+    ctx = contexto(tmp_path)
+    monkeypatch.setattr(export, "available", lambda: True)
+    monkeypatch.setattr(export, "build_command", lambda *a, **kw: ["export"])
+    monkeypatch.setattr(export, "run_export", lambda *a, **kw: 1)
+    with pytest.raises(AguardenteError, match="configuração de exportação recusada"):
+        pl._conferir_exportador(ctx, tmp_path / "model")
+
+
 def maquina(monkeypatch, *, ram_gb=24, disco_gb=500, mps=True):
     monkeypatch.setattr(Machine, "detect",
                         classmethod(lambda cls, path="/": Machine(ram_gb * GB,
@@ -70,12 +119,12 @@ def test_resume_recusa_etapa_com_parametros_divergentes(tmp_path):
     assert any("parâmetros mudaram" in l for l in linhas)
 
 
-def test_resume_avisa_ao_aproveitar_estado_sem_impressao_digital(tmp_path):
+def test_resume_refaz_estado_sem_impressao_digital(tmp_path):
     ctx = contexto(tmp_path)
     ctx.state.finish("logits", outputs={"dir": str(tmp_path)})
     linhas = []
     ctx.report = linhas.append
-    assert pl._resume(ctx, "logits")
+    assert not pl._resume(ctx, "logits")
     assert any("sem registro dos parâmetros" in l for l in linhas)
 
 
@@ -451,7 +500,7 @@ def test_dtype_de_treino_nao_importa_torch():
 
 
 def test_dtype_de_treino_respeita_o_dispositivo_informado():
-    assert pl.training_dtype_bytes("mps") == 2
+    assert pl.training_dtype_bytes("mps") == 4
     assert pl.training_dtype_bytes("cpu") == 4
 
 
@@ -501,3 +550,17 @@ def test_todo_atributo_lido_de_opts_existe_em_run_options():
         )
     }
     assert not (lidos - campos)
+
+
+def test_exportado_nao_significa_validado_no_runtime(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from aguardente import export
+
+    ctx = contexto(tmp_path, measure=True)
+    ctx.state.finish("export", outputs={"dir": str(tmp_path)})
+    monkeypatch.setattr(export, "find_bundle", lambda _: SimpleNamespace(aimodel=tmp_path / "model.aimodel"))
+    monkeypatch.setattr(export, "run_export", lambda *a, **kw: 1)
+    with pytest.raises(AguardenteError, match="falhou na validação no runtime"):
+        pl.validate_export(ctx, tmp_path / "student", tmp_path / "bundle")
+    assert ctx.state.stage("export").status != "ok"
+    assert ctx.state.output("export", "runtime_validation") is None

@@ -19,7 +19,7 @@ class PruneReport:
     params_before: int
     params_after: int
     kept_layers: tuple[int, ...]
-    kept_kv_groups: tuple[int, ...]
+    kept_kv_groups: tuple[int | tuple[int, ...], ...]
     kept_ffn_count: int
 
     @property
@@ -139,9 +139,10 @@ def prune_model(
         keep_layers = _default_layer_selection(src.num_hidden_layers, dst.num_hidden_layers)
 
     keep_ffn = torch.as_tensor(keep_ffn, dtype=torch.long)
-    if len(keep_ffn) != dst.intermediate_size:
+    if keep_ffn.shape[-1] != dst.intermediate_size:
         raise ValueError(f"keep_ffn tem {len(keep_ffn)} índices, plano pede {dst.intermediate_size}")
-    if len(keep_groups) != dst.num_key_value_heads:
+    per_layer_groups = bool(keep_groups) and isinstance(keep_groups[0], (list, tuple))
+    if len(keep_groups[0] if per_layer_groups else keep_groups) != dst.num_key_value_heads:
         raise ValueError(f"keep_groups tem {len(keep_groups)}, plano pede {dst.num_key_value_heads}")
     if len(keep_layers) != dst.num_hidden_layers:
         raise ValueError(f"keep_layers tem {len(keep_layers)}, plano pede {dst.num_hidden_layers}")
@@ -149,9 +150,9 @@ def prune_model(
     for idx in keep_layers:
         layer = layers[idx]
         if dst.intermediate_size != src.intermediate_size:
-            _prune_mlp(layer, keep_ffn)
+            _prune_mlp(layer, keep_ffn[idx] if keep_ffn.ndim == 2 else keep_ffn)
         if dst.num_key_value_heads != src.num_key_value_heads:
-            _prune_attention(layer, keep_groups, src, dst)
+            _prune_attention(layer, keep_groups[idx] if per_layer_groups else keep_groups, src, dst)
 
     if dst.num_hidden_layers != src.num_hidden_layers:
         from torch import nn
@@ -169,8 +170,9 @@ def prune_model(
         params_before=before,
         params_after=sum(p.numel() for p in model.parameters()),
         kept_layers=tuple(keep_layers),
-        kept_kv_groups=tuple(keep_groups),
-        kept_ffn_count=len(keep_ffn),
+        kept_kv_groups=(tuple(tuple(row) for row in keep_groups) if per_layer_groups
+                        else tuple(keep_groups)),
+        kept_ffn_count=keep_ffn.shape[-1],
     )
 
 
@@ -211,8 +213,10 @@ def _resize_per_layer_lists(cfg: Any, keep_layers: Sequence[int], src_layers: in
     if src_layers <= 0:
         return []
     ajustados = []
-    for nome, valor in list(vars(cfg).items()):
-        if nome.startswith("_") or not isinstance(valor, (list, tuple)):
+    # Schema fields, never infer semantics from coincidental list length.
+    for nome in ("layer_types", "attention_types"):
+        valor = getattr(cfg, nome, None)
+        if not isinstance(valor, (list, tuple)):
             continue
         if len(valor) != src_layers:
             continue
