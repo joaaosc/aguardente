@@ -12,6 +12,8 @@
 
 `aguardente` reduz o tamanho de modelos de linguagem (LLMs) por **poda estruturada** e treina os pesos restantes via **destilação**, gerando pacotes `.aimodel` para o Core AI da Apple. É um pipeline experimental: treinamento e exportação bem-sucedidos não garantem qualidade. A [auditoria com execução real no M1 de 8 GB](docs/pipeline-audit.md) documenta as correções, os resultados e as limitações.
 
+O [plano de compressão por qualidade e dispositivo](docs/compression-plan.md) propõe quantização calibrada, recuperação com menor consumo de memória e outras estratégias, separando a máquina de preparação do destino. As etapas desse plano ainda não estão implementadas.
+
 ---
 
 ## Instalação
