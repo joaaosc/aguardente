@@ -38,14 +38,20 @@ WANTED_EXACT = frozenset({
     "tokenizer_config.json",
     "tokenizer.model",
     "vocab.json",
+    "vocab.txt",
+    "spiece.model",
+    "sentencepiece.bpe.model",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "model_index.json",
     "merges.txt",
     "special_tokens_map.json",
     "added_tokens.json",
     "chat_template.jinja",
     "model.safetensors.index.json",
-    "preprocessor_config.json",
 })
 WANTED_SUFFIX = (".safetensors",)
+FILE_SELECTION_VERSION = 2
 
 # Subdiretórios ou variantes excluídos do download
 EXCLUDE_PARTS = ("onnx/", "openvino/", "coreml/", "gguf/", "/consolidated")
@@ -236,7 +242,7 @@ def plan_fetch(model_id: str, dest: str | Path, *, revision: str = "main") -> Fe
             raise AguardenteError("diretório de download pertence a outro modelo/revisão",
                                   hint="Use outro destino para preservar os arquivos existentes.")
         commit = saved["commit"]
-        saved_files = saved.get("files")
+        saved_files = saved.get("files") if saved.get("file_selection_version") == FILE_SELECTION_VERSION else None
     else:
         url = f"{_HF}/api/models/{model_id}/revision/{urllib.parse.quote(revision, safe='')}"
         try:
@@ -288,6 +294,7 @@ def fetch(
     temporary = provenance.with_suffix(".tmp")
     temporary.write_text(json.dumps({"model": plan.model_id, "commit": plan.revision,
                                       "requested_revision": plan.requested_revision,
+                                      "file_selection_version": FILE_SELECTION_VERSION,
                                       "files": [asdict(file) for file in plan.files],
                                       "sha256": {f.path: f.sha256 for f in plan.files if f.sha256}}, indent=2))
     temporary.replace(provenance)

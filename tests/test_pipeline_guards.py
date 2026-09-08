@@ -39,6 +39,7 @@ def test_completed_fetch_repairs_weights_corrupted_after_previous_run(tmp_path, 
     (dest / entry.path).write_bytes(b"X" * len(original))
     (dest / ".aguardente-source.json").write_text(json.dumps({
         "model": ctx.opts.model, "requested_revision": "main", "commit": "a" * 40,
+        "file_selection_version": downloader.FILE_SELECTION_VERSION,
         "files": [asdict(entry)]}))
     ctx.state.finish("fetch", outputs={"dir": dest})
     calls = []

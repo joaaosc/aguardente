@@ -195,3 +195,23 @@ def test_download_pins_revision_and_resume_reuses_the_commit(tmp_path, monkeypat
     monkeypatch.setattr(module.urllib.request, "urlopen", lambda *a, **kw: pytest.fail("must reuse pinned revision"))
     assert module.plan_fetch("org/model", tmp_path).revision == commit
     assert revisions == [commit]  # persisted file manifest permits offline resume
+
+
+def test_tokenizer_and_processor_assets_are_downloaded():
+    from aguardente.fetch import _wanted
+    for name in ("vocab.txt", "spiece.model", "processor_config.json", "preprocessor_config.json"):
+        assert _wanted(name)
+
+
+def test_old_selection_manifest_refreshes_files_at_original_commit(tmp_path, monkeypatch):
+    import json
+    from aguardente import fetch as module
+    commit = "b" * 40
+    (tmp_path / ".aguardente-source.json").write_text(json.dumps({
+        "model": "org/model", "requested_revision": "main", "commit": commit, "files": []}))
+    revisions = []
+    monkeypatch.setattr(module, "list_files", lambda model, rev: revisions.append(rev) or (RemoteFile("vocab.txt", 100),))
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *a, **kw: pytest.fail("must keep pinned commit"))
+    plan = module.plan_fetch("org/model", tmp_path)
+    assert revisions == [commit]
+    assert plan.files[0].path == "vocab.txt"
