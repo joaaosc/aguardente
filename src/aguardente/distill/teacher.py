@@ -133,7 +133,8 @@ def precompute_logits(
                 shard_path = out / f"{i:06d}.pt"
                 input_ids = batch["input_ids"]
                 mask = batch.get("attention_mask", torch.ones_like(input_ids))
-                valid_tokens += int((mask[:, :-1].bool() & mask[:, 1:].bool()).sum())
+                loss_mask = batch.get("loss_mask", torch.ones_like(input_ids))
+                valid_tokens += int((mask[:, :-1].bool() & mask[:, 1:].bool() & loss_mask[:, 1:].bool()).sum())
                 if reaproveita and shard_path.is_file() and shard_path.stat().st_size > 0:
                     try:
                         saved = torch.load(shard_path, weights_only=True, map_location="cpu")
@@ -143,6 +144,7 @@ def precompute_logits(
                     if ("logsumexp" in saved and "cache_tag" in saved and torch.equal(saved["cache_tag"], cache_tag)
                             and torch.equal(saved["input_ids"], input_ids.cpu())
                             and torch.equal(saved.get("attention_mask", torch.ones_like(saved["input_ids"])), mask.cpu())
+                            and torch.equal(saved.get("loss_mask", torch.ones_like(saved["input_ids"])), loss_mask.cpu())
                             and math.isclose(saved["temperature"].item(), temperature, rel_tol=1e-6)):
                         top_mass = (saved["values"] / temperature - saved["logsumexp"].unsqueeze(-1)).exp().sum(-1)
                         active = mask.cpu().bool()
@@ -155,7 +157,7 @@ def precompute_logits(
                             on_progress(shards)
                         continue
 
-                logits = teacher(**batch).logits
+                logits = teacher(**{k: v for k, v in batch.items() if k != "loss_mask"}).logits
                 k = min(top_k, logits.size(-1))
                 values, indices = logits.topk(k, dim=-1)
                 # A cauda também participa do normalizador. -Inf fora do top-k
@@ -169,6 +171,7 @@ def precompute_logits(
                 payload = {
                     "cache_tag": cache_tag,
                     "input_ids": input_ids.detach().cpu(),
+                    "loss_mask": loss_mask.detach().to(torch.int8).cpu(),
                     "values": values.detach().float().cpu(),
                     "logsumexp": torch.logsumexp(logits.float() / temperature, dim=-1).cpu(),
                     "temperature": torch.tensor(temperature),

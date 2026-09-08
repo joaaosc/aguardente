@@ -81,6 +81,34 @@ def perplexity(
                       tokens=counted, windows=windows)
 
 
+def response_perplexity(model, tokenizer, texts, loss_masks, *, max_length=512, device=None):
+    """Score only supplied assistant targets; padding and prompt tokens stay excluded."""
+    import math
+    import torch
+    from .calibration import make_packed_batches
+    dev = device or next(model.parameters()).device
+    total = 0.0
+    tokens = windows = 0
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            for batch in make_packed_batches(tokenizer, texts, seq_len=max_length,
+                    batch_size=1, device=dev, loss_masks=loss_masks):
+                active = batch["attention_mask"][:, 1:].bool() & batch["attention_mask"][:, :-1].bool() & batch["loss_mask"][:, 1:].bool()
+                target = batch["input_ids"][:, 1:].masked_fill(~active, -100)
+                logits = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).logits[:, :-1]
+                total += torch.nn.functional.cross_entropy(logits.float().reshape(-1, logits.shape[-1]),
+                    target.reshape(-1), ignore_index=-100, reduction="sum").item()
+                tokens += int(active.sum())
+                windows += 1
+    finally:
+        model.train(was_training)
+    if not tokens:
+        raise ValueError("no assistant targets for evaluation")
+    return Perplexity(math.exp(total / tokens), tokens, windows)
+
+
 def perplexity_on_wikitext(
     model: Any, tokenizer: Any, *, max_chars: int = 20_000, split: str = "test", **kw: Any
 ) -> Perplexity:

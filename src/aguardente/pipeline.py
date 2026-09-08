@@ -63,7 +63,9 @@ def fingerprint(opts: RunOptions, stage: str) -> str:
     if stage == "export":
         fields.update(FINGERPRINT_FIELDS["recover"])
     if stage != "extract":
-        fields.update(("seed", "calib_config", "calib_split", "text_column", "eval_file", "reconstruct", "max_ppl_ratio"))
+        fields.update(("seed", "calib_config", "calib_split", "text_column", "eval_file", "reconstruct", "max_ppl_ratio", "assistant_only"))
+    if stage in {"prune", "recover", "export"}:
+        fields.update(("recovery", "lora_rank", "lora_alpha", "lora_targets"))
     campos = {k: getattr(opts, k) for k in fields}
     campos["pipeline_version"] = 3
     if stage == "export":
@@ -143,6 +145,7 @@ class RunOptions:
     calib_split: str = "train"
     text_column: str = "text"
     eval_file: str | None = None
+    assistant_only: bool = False
     seed: int = 42
     reconstruct: bool = True
     max_ppl_ratio: float = 1.2
@@ -157,6 +160,10 @@ class RunOptions:
     temperature: float = 2.0
     grad_accum: int = 4
     no_checkpointing: bool = False
+    recovery: str = "full"
+    lora_rank: int = 8
+    lora_alpha: float = 16.0
+    lora_targets: tuple[str, ...] = ()
 
     # export
     platform: str = "macOS"
@@ -183,6 +190,10 @@ class RunOptions:
     allow_oversized: bool = False
 
     def __post_init__(self):
+        if self.recovery not in {"full", "lora"}:
+            raise AguardenteError("recovery precisa ser full ou lora")
+        if self.lora_rank < 1 or not math.isfinite(self.lora_alpha) or self.lora_alpha <= 0:
+            raise AguardenteError("rank e alpha LoRA precisam ser positivos e finitos")
         for name in ("calib_batches", "logit_batches", "epochs", "grad_accum", "top_k"):
             if getattr(self, name) < 1:
                 raise AguardenteError(f"{name} precisa ser positivo")
@@ -440,7 +451,7 @@ def _guard_training_ceiling(ctx: Context, params: int, teto: float, budget: Budg
     deixa de valer; com `--allow-oversized` o usuário assume o risco e o
     programa só avisa.
     """
-    if params <= teto or ctx.opts.skip_recover:
+    if params <= teto or ctx.opts.skip_recover or ctx.opts.recovery == "lora":
         return
     aviso = (f"{descricao} excede o teto de treino desta máquina "
              f"({teto/1e9:.2f} B para {budget.ram_bytes/GB:.0f} GB de orçamento)")
@@ -452,6 +463,24 @@ def _guard_training_ceiling(ctx: Context, params: int, teto: float, budget: Budg
 def training_dtype_bytes(device: str | None = None) -> int:
     """FP32 weights, gradients and AdamW moments on every training backend."""
     return 4
+
+
+def _guard_lora_budget(ctx: Context, arch, budget: Budget) -> None:
+    """Estimate dense projection adapters before generating teacher targets."""
+    opts = ctx.opts
+    if opts.recovery != "lora" or opts.skip_recover:
+        return
+    q, kv = arch.num_attention_heads * arch.head_dim, arch.num_key_value_heads * arch.head_dim
+    # All attention and MLP projections, including bias in the frozen count.
+    trainable = opts.lora_rank * arch.num_hidden_layers * (
+        7 * arch.hidden_size + 2 * q + 2 * kv + 3 * arch.intermediate_size)
+    on_mps = opts.device == "mps" or (opts.device is None and sys.platform == "darwin" and platform.machine() == "arm64")
+    frozen_bytes = count_params(arch).total * (2 if on_mps else 4)
+    estimate = frozen_bytes + trainable * 16
+    if estimate > budget.ram_bytes * budget.train_fraction:
+        raise InsufficientResources(
+            f"base congelada e adaptadores exigem aproximadamente {estimate/GB:.2f} GiB estáticos",
+            hint="Reduza o modelo/rank ou prepare em uma máquina com mais RAM. O orçamento ainda reserva ativações.")
 
 
 def _training_dtype_bytes(opts: RunOptions) -> int:
@@ -564,7 +593,7 @@ def make_plan(ctx: Context) -> tuple[ModelProbe, PrunePlan | None]:
     else:
         target = opts.target_params
         if target is None:
-            target = teto
+            target = count_params(p.arch).total if opts.recovery == "lora" else teto
             ctx.say(f"alvo         sugerido pela RAM: {target/1e9:.2f} B parâmetros")
         else:
             _guard_training_ceiling(
@@ -576,7 +605,9 @@ def make_plan(ctx: Context) -> tuple[ModelProbe, PrunePlan | None]:
                                  "recuperação.",
             )
 
-    if dtype_bytes == 4 and not opts.skip_recover:
+    if opts.recovery == "lora" and not opts.skip_recover:
+        ctx.say("treino       base congelada; orçamento dos adaptadores conferido antes do otimizador")
+    elif dtype_bytes == 4 and not opts.skip_recover:
         ctx.say("treino       pesos, gradientes e momentos AdamW em float32 (16 bytes/parâmetro)")
 
     poda = ({"id": "prune", "title": "Student externo",
@@ -598,16 +629,19 @@ def make_plan(ctx: Context) -> tuple[ModelProbe, PrunePlan | None]:
                 f"projetor serão descartados")
 
     if student_probe is not None:
+        _guard_lora_budget(ctx, student_probe.arch, budget)
         ctx.plan = None
         return p, None
 
     total = count_params(p.arch).total
     if total <= target:
+        _guard_lora_budget(ctx, p.arch, budget)
         ctx.say(f"plano        modelo atende ao alvo de {target/1e9:.2f} B — sem poda necessária")
         ctx.plan = None
         return p, None
 
     plan = plan_for_target(p.arch, target)
+    _guard_lora_budget(ctx, plan.target, budget)
     ctx.plan = plan
     ctx.say(f"plano        {total/1e9:.2f} B → {plan.target_params/1e9:.2f} B "
             f"({plan.ratio:.2f}× menor)")
@@ -855,6 +889,10 @@ def _evaluate(ctx: Context, model, tokenizer, *, device, split="validation"):
     corpus = _corpus(ctx, tokenizer)
     text = "\n\n".join(getattr(corpus, split))[:20_000]
     length = min(512, int(getattr(model.config, "max_position_embeddings", 512)))
+    if corpus.loss_masks is not None:
+        from .verify import response_perplexity
+        return response_perplexity(model, tokenizer, getattr(corpus, split), corpus.loss_masks,
+                                   max_length=length, device=device)
     return perplexity(model, tokenizer, text, max_length=length, stride=max(1, length // 2), device=device)
 
 
@@ -1004,9 +1042,11 @@ def stage_logits(ctx: Context, teacher_dir: Path) -> Path | None:
         ctx.metrics["ppl_teacher_validation"] = _evaluate(ctx, teacher, tokenizer, device=device).value
         ctx.say(f"             perplexidade do teacher: {ppl.value:.2f}")
 
-        texts = _corpus(ctx, tokenizer).train
+        corpus = _corpus(ctx, tokenizer)
+        texts = corpus.train
         batches = make_packed_batches(tokenizer, texts, batch_size=opts.batch_size,
-                                      seq_len=opts.seq_len, max_samples=n, device=device)
+                                      seq_len=opts.seq_len, max_samples=n, device=device,
+                                      loss_masks=corpus.loss_masks)
         barra = _Progress(ctx, lotes, label="pré-computando", sid="logits")
         result = precompute_logits(
             teacher, batches, out, top_k=opts.top_k,
@@ -1063,20 +1103,36 @@ def stage_recover(ctx: Context, pruned_dir: Path, logits_dir: Path | None) -> Pa
 
     device = pick_device(opts.device)
     import torch
-    student, tokenizer = load_causal_lm(str(pruned_dir), device=device, dtype=torch.float32)
+    base_dtype = torch.bfloat16 if opts.recovery == "lora" and device == "mps" else torch.float32
+    student, tokenizer = load_causal_lm(str(pruned_dir), device=device, dtype=base_dtype)
     logits = TeacherLogits.load(logits_dir)
 
     try:
-        student.float()
+        if opts.recovery == "full":
+            student.float()
         ppl = _evaluate(ctx, student, tokenizer, device=device, split="test")
         ctx.metrics["ppl_pruned"] = ppl.value
         baseline = "inicial do student" if opts.student else "pós-poda"
         ctx.say(f"             perplexidade {baseline}: {ppl.value:.2f}")
 
+        if opts.recovery == "lora":
+            from .distill.adapters import attach_lora
+            torch.manual_seed(opts.seed)
+            summary = attach_lora(student, rank=opts.lora_rank, alpha=opts.lora_alpha,
+                                  targets=opts.lora_targets)
+            budget = Budget.for_machine(Machine.detect(opts.out_dir))
+            static = sum(p.numel() * (16 if p.requires_grad else p.element_size()) for p in student.parameters())
+            if static > budget.ram_bytes * budget.train_fraction:
+                raise InsufficientResources("base e adaptadores excedem a memória de preparação, antes das ativações")
+            ctx.metrics["lora_trainable_params"] = summary["trainable_params"]
+            ctx.metrics["lora_static_bytes"] = static
+            ctx.say(f"             LoRA: {summary['trainable_params']:,} parâmetros treináveis · {static/GB:.2f} GiB estáticos")
+
         cfg = RecoveryConfig(
             epochs=opts.epochs, learning_rate=opts.lr, alpha=opts.alpha, seed=opts.seed,
             temperature=opts.temperature, grad_accum=opts.grad_accum,
             gradient_checkpointing=not opts.no_checkpointing,
+            preserve_frozen_dtype=opts.recovery == "lora",
         )
         ctx.say(f"             {cfg.epochs} época(s) · lr {cfg.learning_rate:g} "
                 f"· alpha {cfg.alpha} · T {cfg.temperature}")
@@ -1114,10 +1170,18 @@ def stage_recover(ctx: Context, pruned_dir: Path, logits_dir: Path | None) -> Pa
         if res.resumed_from:
             ctx.say(f"             {res.steps} passos no total; {res.resumed_from} anteriores à retomada")
 
-        save_pruned(student, tokenizer, out)
-
         if res.stopped_by == "interrupted":
             raise KeyboardInterrupt
+
+        if opts.recovery == "lora":
+            from .distill.adapters import merge_lora
+            before_merge = _evaluate(ctx, student, tokenizer, device=device).value
+            merge_lora(student)
+            after_merge = _evaluate(ctx, student, tokenizer, device=device).value
+            if not all(math.isfinite(v) and v > 0 for v in (before_merge, after_merge)) or after_merge > before_merge * 1.01:
+                raise AguardenteError("fusão LoRA degradou a perplexidade de validação em mais de 1%")
+            ctx.metrics["lora_merge_ppl_ratio"] = after_merge / before_merge
+        save_pruned(student, tokenizer, out)
 
         ppl = _evaluate(ctx, student, tokenizer, device=device, split="test")
         ctx.metrics["ppl_recovered"] = ppl.value
@@ -1130,6 +1194,8 @@ def stage_recover(ctx: Context, pruned_dir: Path, logits_dir: Path | None) -> Pa
                        "ratio": ppl.value / ctx.metrics["ppl_teacher"], "split": "test",
                        "corpus": _corpus(ctx, tokenizer).fingerprint,
                        "best_step": res.best_step, "training_tokens_seen": res.tokens_seen}
+            quality["objective"] = "assistant_tokens" if opts.assistant_only else "all_causal_tokens"
+            quality["recovery"] = opts.recovery
             quality["passed"] = quality["ratio"] <= opts.max_ppl_ratio
             (opts.out_dir / "quality.json").write_text(json.dumps(quality, indent=2))
             ctx.say(f"             qualidade: {'aprovada' if quality['passed'] else 'reprovada'} "
@@ -1145,7 +1211,7 @@ def stage_recover(ctx: Context, pruned_dir: Path, logits_dir: Path | None) -> Pa
     dt = time.perf_counter() - t0
     state.finish("recover",
                  outputs={"dir": out, FINGERPRINT: fingerprint(opts, "recover")},
-                 metrics={k: v for k, v in ctx.metrics.items() if k.startswith("ppl")})
+                 metrics={k: v for k, v in ctx.metrics.items() if k.startswith(("ppl", "lora_"))})
     ctx.events.stage_end("recover", True, int(dt * 1000))
     return out
 

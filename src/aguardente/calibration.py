@@ -102,7 +102,8 @@ def load_texts_from_file(path: str, *, limit: int = 256, min_chars: int = 200,
                 paragraphs.append(row["text"])
             elif "messages" in row and tokenizer is not None and tokenizer.chat_template:
                 paragraphs.append(tokenizer.apply_chat_template(row["messages"], tokenize=False,
-                                                               add_generation_prompt=False))
+                                                               add_generation_prompt=False,
+                                                               **row.get("template_kwargs", {})))
             else:
                 raise AguardenteError("JSONL exige text ou messages com chat_template do tokenizer")
     else:
@@ -168,7 +169,8 @@ def ensure_pad_token(tokenizer: Any) -> Any:
 
 def make_packed_batches(tokenizer: Any, texts: list[str], *, batch_size: int = 2,
                         seq_len: int = 512, max_samples: int | None = None,
-                        device: str | None = None) -> Iterator[dict[str, "torch.Tensor"]]:
+                        device: str | None = None,
+                        loss_masks: dict[str, list[int]] | None = None) -> Iterator[dict[str, "torch.Tensor"]]:
     """Pack complete documents with EOS boundaries; never truncate long documents.
 
     One token overlaps adjacent windows, so a boundary does not lose a causal
@@ -183,35 +185,55 @@ def make_packed_batches(tokenizer: Any, texts: list[str], *, batch_size: int = 2
         raise ValueError("packing requires a trained EOS and a padding token")
     buffer: list[int] = []
     rows: list[list[int]] = []
+    supervision: list[int] = []
+    row_masks: list[list[int]] = []
     emitted = 0
 
     def emit():
         ids = torch.full((len(rows), seq_len), tokenizer.pad_token_id, dtype=torch.long)
         mask = torch.zeros_like(ids)
+        targets = torch.zeros_like(ids)
         for i, row in enumerate(rows):
             ids[i, :len(row)] = torch.tensor(row)
             mask[i, :len(row)] = 1
-        return {"input_ids": ids.to(device), "attention_mask": mask.to(device)}
+            targets[i, :len(row)] = torch.tensor(row_masks[i])
+        batch = {"input_ids": ids.to(device), "attention_mask": mask.to(device)}
+        if loss_masks is not None:
+            batch["loss_mask"] = targets.to(device)
+        return batch
 
     for text in texts:
         tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
         if not tokens:
             continue
+        target_mask = list(loss_masks[text]) if loss_masks is not None else [1] * len(tokens)
+        if len(target_mask) != len(tokens) or any(x not in (0, 1) for x in target_mask):
+            raise ValueError("loss mask must match document tokenization")
         buffer.extend(tokens)
+        supervision.extend(target_mask)
         if buffer[-1] != eos:
             buffer.append(eos)
+            supervision.append(target_mask[-1])
         offset = 0
         while len(buffer) - offset >= seq_len:
-            rows.append(buffer[offset:offset + seq_len])
+            row = buffer[offset:offset + seq_len]
+            targets = supervision[offset:offset + seq_len]
             offset += seq_len - 1
+            if not any(targets[1:]):
+                continue
+            rows.append(row)
+            row_masks.append(targets)
             emitted += 1
             if len(rows) == batch_size or emitted == max_samples:
                 yield emit()
                 rows = []
+                row_masks = []
             if emitted == max_samples:
                 return
         buffer = buffer[offset:]
-    if len(buffer) >= 2:
+        supervision = supervision[offset:]
+    if len(buffer) >= 2 and any(supervision[1:]):
         rows.append(buffer)
+        row_masks.append(supervision)
     if rows:
         yield emit()

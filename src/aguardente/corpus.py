@@ -19,11 +19,13 @@ class Corpus:
     validation: list[str]
     test: list[str]
     fingerprint: str
+    loss_masks: dict[str, list[int]] | None = None
 
 
 def prepare_corpus(opts, tokenizer) -> Corpus:
     fields = ("calib_dataset", "calib_config", "calib_split", "text_column", "calib_file", "eval_file", "seed", "seq_len", "calib_batches", "logit_batches")
     spec = {k: getattr(opts, k) for k in fields}
+    spec["assistant_only"] = getattr(opts, "assistant_only", False)
     spec.update(version=1, files={k: local_identity(getattr(opts, k)) for k in ("calib_file", "eval_file")},
                 tokenizer=tokenizer_identity(tokenizer))
     key = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
@@ -37,6 +39,21 @@ def prepare_corpus(opts, tokenizer) -> Corpus:
                 raise AguardenteError("corpus persistido foi modificado; use um novo diretório de execução")
             return Corpus(**data, fingerprint=digest)
     limit = max(opts.calib_batches, opts.logit_batches) * 16 + 64
+    loss_masks = None
+    if spec["assistant_only"]:
+        from pathlib import Path
+        from .conversation import assistant_supervision
+        if not opts.calib_file or Path(opts.calib_file).suffix != ".jsonl":
+            raise AguardenteError("--assistant-only exige --calib-file JSONL com messages")
+        loss_masks = {}
+        for source in (opts.calib_file, opts.eval_file):
+            if not source:
+                continue
+            for line in Path(source).expanduser().read_text().splitlines():
+                if line.strip():
+                    row = json.loads(line)
+                    text, mask = assistant_supervision(tokenizer, row.get("messages"), row.get("template_kwargs"))
+                    loss_masks[text] = mask
     if opts.calib_file:
         train = load_texts_from_file(opts.calib_file, limit=limit, min_chars=1,
                                     seed=opts.seed, tokenizer=tokenizer)
@@ -66,6 +83,8 @@ def prepare_corpus(opts, tokenizer) -> Corpus:
     if not train or not test or not validation:
         raise AguardenteError("treino, validação e teste precisam de documentos distintos não vazios")
     data = dict(train=train, validation=validation, test=test)
+    if loss_masks is not None:
+        data["loss_masks"] = {t: loss_masks[t] for t in train + validation + test}
     digest = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")

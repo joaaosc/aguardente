@@ -39,6 +39,7 @@ class RecoveryConfig:
     max_seconds: float | None = None
     # Passos de otimizador entre checkpoints completos para retomada.
     checkpoint_every: int = 50
+    preserve_frozen_dtype: bool = False
 
 
 # Janela máxima de histórico de perdas mantida em memória
@@ -128,8 +129,12 @@ def recover(
         student.gradient_checkpointing_enable()
         if hasattr(student, "enable_input_require_grads"):
             student.enable_input_require_grads()
-    if hasattr(student, "float"):
+    if hasattr(student, "float") and not cfg.preserve_frozen_dtype:
         student.float()
+    elif cfg.preserve_frozen_dtype:
+        for parameter in student.parameters():
+            if parameter.requires_grad and parameter.dtype != torch.float32:
+                parameter.data = parameter.data.float()
     if logits.temperature != cfg.temperature:
         raise AguardenteError("temperatura dos logits difere da temperatura do treino; regenere os logits")
     optimizer = _build_optimizer(student, cfg)
@@ -225,14 +230,17 @@ def recover(
                     window_rng = _capture_rng()
                 mask = batch.get("attention_mask")
                 ids = batch["input_ids"]
-                tokens = int((mask[:, :-1].bool() & mask[:, 1:].bool()).sum()) if mask is not None else ids.shape[0] * (ids.shape[1] - 1)
+                valid = torch.ones_like(ids[:, 1:], dtype=torch.bool) if mask is None else mask[:, :-1].bool() & mask[:, 1:].bool()
+                if "loss_mask" in batch:
+                    valid &= batch["loss_mask"][:, 1:].bool()
+                tokens = int(valid.sum())
                 if tokens < 1:
                     raise AguardenteError("shard sem transições causais válidas")
                 if "logsumexp" not in batch:
                     raise AguardenteError("logits antigos sem massa de probabilidade; regenere a etapa logits")
                 out = student(input_ids=ids, **({"attention_mask": mask} if mask is not None else {}))
                 loss = kd_loss(out.logits, batch["values"], batch["indices"], labels=ids,
-                               mask=mask, alpha=cfg.alpha, temperature=cfg.temperature,
+                               mask=mask, loss_mask=batch.get("loss_mask"), alpha=cfg.alpha, temperature=cfg.temperature,
                                teacher_logsumexp=batch["logsumexp"],
                                teacher_tail_values=batch.get("tail_values"),
                                teacher_tail_indices=batch.get("tail_indices"))

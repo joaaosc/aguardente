@@ -15,6 +15,7 @@ def kd_loss(
     labels: "torch.Tensor | None" = None,
     *,
     mask: "torch.Tensor | None" = None,
+    loss_mask: "torch.Tensor | None" = None,
     alpha: float = 0.9,
     temperature: float = 2.0,
     teacher_logsumexp: "torch.Tensor | None" = None,
@@ -68,6 +69,12 @@ def kd_loss(
         t_idx = teacher_indices
         s_labels = None
         s_mask = mask.bool().contiguous() if mask is not None else None
+
+    if loss_mask is not None:
+        if loss_mask.shape != student_logits.shape[:2]:
+            raise ValueError("loss_mask must match the input token shape")
+        active = loss_mask[:, 1:].bool() if labels is not None else loss_mask.bool()
+        s_mask = active if s_mask is None else s_mask & active
 
     # Normalize the student over the WHOLE vocabulary. Normalizing only the
     # selected logits leaves all other tokens unconstrained, even at alpha=1.
