@@ -5,14 +5,14 @@
 <h1 align="center">aguardente</h1>
 
 <p align="center">
-  Poda estruturada e destilação de modelos de linguagem para Apple Silicon via Core AI.
+  Compressão e destilação pela CLI para Apple Silicon via Core AI.
 </p>
 
 ---
 
 `aguardente` reduz o tamanho de modelos de linguagem (LLMs) por **poda estruturada** e treina os pesos restantes via **destilação**, gerando pacotes `.aimodel` para o Core AI da Apple. É um pipeline experimental: treinamento e exportação bem-sucedidos não garantem qualidade. A [auditoria com execução real no M1 de 8 GB](docs/pipeline-audit.md) documenta as correções, os resultados e as limitações.
 
-O [plano de compressão por qualidade e dispositivo](docs/compression-plan.md) propõe quantização calibrada, recuperação com menor consumo de memória e outras estratégias, separando a máquina de preparação do destino. As etapas desse plano ainda não estão implementadas.
+O [plano de compressão por qualidade e dispositivo](docs/compression-plan.md) foi organizado em cinco milestones de CLI. A implementação inclui identificação por tarefa, adaptadores locais, busca entre receitas de quantização/paletização, avaliação nativa e recuperação LoRA. O [guia de compressão por tarefa](docs/task-compression.md) separa recursos entregues, resultados medidos e estratégias ainda experimentais ou ausentes. A cobertura não se limita ao Qwen, mas também não significa suporte automático a toda arquitetura.
 
 ---
 
@@ -41,6 +41,17 @@ aguardente install
 ---
 
 ## Uso
+
+Compressão sem exigir poda ou treinamento:
+
+```bash
+aguardente inspect HuggingFaceTB/SmolLM2-135M --target-ram-gib 8
+aguardente fetch HuggingFaceTB/SmolLM2-135M -o modelos/smollm
+aguardente compress modelos/smollm --data dados.jsonl -o run/compressao \
+  --recipes w8,w4-block32,palette6 --select size --seq-len 64
+```
+
+O arquivo de dados declara `calibration`, `validation` e `test`. Há adaptadores embutidos para linguagem causal, linguagem mascarada e classificação textual; outras tarefas usam `--adapter arquivo.py:factory`. O comando só aprova candidatos após medir a tarefa e executar o `.aimodel` nativo. Formatos de dados, restrições e inferência com `predict` estão no [guia](docs/task-compression.md).
 
 Execução completa do pipeline:
 
@@ -89,7 +100,7 @@ fetch  →  prune  →  logits  →  recover  →  export
 | **fetch** | Download retomável, revisão fixada e SHA-256 dos pesos LFS. |
 | **prune** | Poda por importância e reconstrução das projeções, selecionada por perplexidade em validação. |
 | **logits** | Top-k e amostras da cauda do teacher sobre documentos empacotados com EOS. |
-| **recover** | Destilação FP32, melhor checkpoint em validação e limite de qualidade no teste. |
+| **recover** | Destilação completa em FP32 ou LoRA com base congelada; melhor checkpoint em validação e limite de qualidade no teste. |
 | **export** | Seleção de compressão e execução real de `.aimodel`, com comparação numérica e perplexidade. |
 
 ### Estratégia de poda
@@ -166,7 +177,7 @@ Ensaio completo do SmolLM2-135M no M1 de 8 GB, em 7/9/2026, com a configuração
 
 Isso ainda não demonstra qualidade geral de linguagem: houve repetição e erros factuais nas gerações. O teacher apenas quantizado em int8 ocupa 136,67 MiB e teve perplexidade melhor; neste modelo já pequeno, a economia de 9,8% no asset não justifica por si só destilar. Resultados, protocolos separados e revisão por etapa estão no [relatório de recuperação](docs/recovery-improvements.md); a [auditoria inicial](docs/pipeline-audit.md) preserva as medições anteriores.
 
-A recuperação usa pesos, gradientes e dois momentos do AdamW em FP32: **16 bytes por parâmetro**, além de ativações e temporários. Com as margens atuais, o teto estático é aproximadamente 201 M parâmetros em 8 GiB de RAM e 906 M em 24 GiB; não é garantia de ausência de pressão de memória. O teacher inteiro também precisa caber antes da poda. Preparar modelos grandes pode exigir uma máquina maior que a de execução final.
+A recuperação completa usa pesos, gradientes e dois momentos do AdamW em FP32: **16 bytes por parâmetro**, além de ativações e temporários. Com as margens atuais, o teto estático é aproximadamente 201 M parâmetros em 8 GiB de RAM e 906 M em 24 GiB. `run --recovery lora` mantém a base congelada, com adaptadores e momentos em FP32; o orçamento conta os dois grupos separadamente. No ensaio SmolLM2 com rank 4, foram 1.221.120 parâmetros treináveis e 0,27 GiB estáticos. Nenhuma dessas estimativas garante ausência de pressão de memória; o teacher inteiro ainda precisa caber.
 
 A avaliação de recuperação e de runtime é obrigatória no pipeline completo; `--measure` permanece por compatibilidade. `--max-ppl-ratio` explicita o limite student/teacher (padrão 1,2). `quality.json` registra o resultado, e um student reprovado fica salvo para análise, sem seguir para exportação. A conversão admite até 5% de aumento adicional de perplexidade contra o student FP32, além dos testes de logits, prefill e KV cache.
 

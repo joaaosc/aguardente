@@ -1,6 +1,6 @@
 # Plano de compressão orientado ao dispositivo e à qualidade
 
-8 de setembro de 2026. **Proposta de implementação e experimentos; não descreve capacidades já entregues.** Parte das medições de [recuperação](recovery-improvements.md) e da [auditoria inicial](pipeline-audit.md). Os resultados históricos continuam válidos dentro dos respectivos protocolos.
+8 de setembro de 2026. **Plano e registro da implementação em cinco milestones de CLI.** As seções de estratégias descrevem também pesquisa futura; a seção 7 e o [guia operacional](task-compression.md) delimitam o que foi entregue e ensaiado. Parte das medições de [recuperação](recovery-improvements.md) e da [auditoria inicial](pipeline-audit.md). Os resultados históricos continuam válidos dentro dos respectivos protocolos.
 
 A direção recomendada é escolher a melhor representação executável do modelo dentro do orçamento do destino. Quantização, poda e destilação passam a ser alternativas combináveis. Uma execução pode terminar corretamente sem poda ou sem treinamento, desde que essa receita esteja explícita e cumpra os requisitos. A ferramenta deve reprovar um alvo inviável, preservar o diagnóstico e apresentar alternativas medidas.
 
@@ -22,7 +22,7 @@ Não há evidência para garantir preservação de todas as capacidades de qualq
 
 ## 2. Separar preparação e execução
 
-Hoje `budget.py` e `pipeline.make_plan()` concentram decisões em torno da máquina local e do treino completo. O novo plano terá dois perfis independentes:
+`budget.py` e `pipeline.make_plan()` estimam a preparação local por regime de treino. `target.py` e os novos comandos `inspect`/`compress` registram separadamente o destino:
 
 - **Preparação:** RAM e disco disponíveis, dispositivos de cálculo, tempo máximo, volume de dados, candidatos e modos de treinamento permitidos.
 - **Destino:** família do dispositivo, sistema/SDK mínimo, limite de memória residente, contexto, concorrência, latência e critérios de qualidade. Para o primeiro perfil: M1 Air, 8 GiB de memória total e uma sessão de conversa.
@@ -200,19 +200,19 @@ flowchart TD
     V --> F[Escolha entre candidatos aprovados]
 ```
 
-Evoluir `pipeline.py` para etapas reutilizáveis de um grafo de receitas. Implementar contratos pequenos antes de dividir o arquivo inteiro: perfil do destino, capacidade do adaptador, resultado do candidato e relatório de aceitação. Os nomes de módulos abaixo são uma proposta de responsabilidade, não interfaces já disponíveis.
+Os contratos foram introduzidos sem exigir que tarefas não causais atravessem a cirurgia de `pipeline.py`. `compress` coordena a busca por tarefa; `run` conserva o caminho causal com recuperação. Streaming por blocos, novos estados e novos backends continuam trabalho posterior.
 
-| Responsabilidade | Ponto de partida/novo módulo proposto |
+| Responsabilidade | Implementação atual |
 | --- | --- |
-| Memória de preparação e destino, custo por regime | `budget.py`, `probe.py`, futuro `target.py` |
-| Receitas concorrentes em qualidade, execução sequencial sob RAM limitada | `pipeline.py`, `effort.py`, futuro `planner.py` |
-| Capacidades por arquitetura e tarefa | `arch.py`, `loading.py`, futuro `adapters/` |
-| Mensagens, máscaras e dados reservados | `calibration.py`, `corpus.py`, `inputs.py` |
-| Adaptadores, recuperação por bloco e cache com cota | `distill/train.py`, `distill/teacher.py`, `distill/loss.py`, futuros backends de preparação |
-| Quantização calibrada e inspeção de cobertura | `export.py`, `local_export.py`, futuro `compression/` |
-| Avaliação de tarefa e seleção sob orçamento | `verify.py`, `runtime_check.py`, futuro `evaluation/` |
-| Geração residente e medição nativa | `runtime_bridge.swift`, `swift_runtime.py` |
-| Retomada e proveniência | `state.py`, fingerprints de `pipeline.py` |
+| Memória de preparação e destino, custo por regime | `budget.py`, `probe.py`, `target.py` |
+| Busca de receitas e seleção entre candidatos não dominados | `compress.py`; execução sequencial em processos isolados |
+| Capacidades por arquitetura e tarefa | `capabilities.py`, `tasks.py`; `arch.py` continua específico da poda |
+| Mensagens, máscaras e dados reservados | `conversation.py`, `calibration.py`, `corpus.py`, `inputs.py` |
+| Recuperação e adaptadores LoRA | `distill/adapters.py`, `distill/train.py`, `distill/teacher.py`, `distill/loss.py` |
+| Quantização/paletização e pesos preservados | `compress.py`; exportador causal em `export.py` e `local_export.py` |
+| Avaliação de tarefa e fidelidade | `evaluation.py`, `verify.py`, `runtime_check.py` |
+| Geração causal e execução de tarefas estáticas | `runtime_bridge.swift`, `swift_runtime.py`, `task_runtime.swift`, `task_runtime.py` |
+| Retomada e proveniência | `state.py`, fingerprints de `pipeline.py`, manifesto e recibos de `compress.py` |
 
 Preservar as correções já feitas: pesos/revisões verificáveis, tokenizers semanticamente compatíveis, dados distintos, gradientes corretos, melhor checkpoint independente da paciência, estado RNG, atualização atômica e reprovação de falhas reais. Acrescentar versões de backend, template, configuração do destino e receita efetiva à identidade do candidato.
 
@@ -224,22 +224,21 @@ O pacote de implantação deve conter `.aimodel` verdadeiro e metadados suficien
 
 ## 7. Sequência de implementação e critérios de avanço
 
-Todas as metas abaixo são propostas, não resultados obtidos. Antes de executar uma fase, fixar suas tolerâncias, dados e recursos no manifesto. O pipeline não ajustará os critérios depois de ver o teste.
+O escopo executado tem exatamente cinco milestones, todos focados na CLI. Isso entrega uma base funcional extensível e correções concretas; não representa a implementação de todas as estratégias de pesquisa da seção 4. Tolerâncias, dados e recursos são fixados antes da seleção.
 
-| Fase | Entrega concreta | Critério para avançar |
+| Milestone | Entrega e validação | Limite explícito |
 | --- | --- | --- |
-| 0 — Referências e avaliação | Perfis separados, benchmark de tarefa, contrato de conversa, teste final reservado e estimativa de disco/RAM por etapa. | Reproduzir original e referência quantizada com entradas/precisões conhecidas; distinguir falha de modelo, receita e runtime. |
-| 1 — Primeiro modelo de conversa completo | Qwen3-1.7B original convertido com uma receita conservadora; medir no M1. Sem exigir treino completo como pré-condição para exportar. | Geração com template e término corretos, paridade numérica/cache e orçamento medido. O teste pode reprovar o modelo para o uso pretendido. |
-| 2 — Compressão dos pesos | W8, W4 por blocos, precisão por camada; depois escalas/clipping calibrados e paletização. | Encontrar candidato que preserve qualidade e ofereça redução útil medida; explicar tensores não comprimidos e custos de carregamento. |
-| 3 — Recuperação viável | LoRA/base congelada, máscaras de resposta, streaming de preparação e cotas de cache; medir curva de dados versus qualidade. | Superar a alternativa somente quantizada ou habilitar um orçamento antes inviável, sem regressão inaceitável de tarefa. |
-| 4 — Novas estruturas | Ablações de poda, ranks, student pré-treinado e adaptadores adicionais. | Ganhar de referências sob o mesmo orçamento; cada família deve ter teste real completo, além de testes sintéticos. |
-| 5 — Preparação maior, destino pequeno | Executar preparação em máquina mais potente e validar pacote portátil no Air. | Evidência separada do custo de preparação e da qualidade/RAM/latência no M1, incluindo carregamento frio. |
+| 1 — Capacidades e destino | Identificação independente da poda, perfil de destino e download de assets de tokenizers não causais; testes de famílias e revisão fixada. | Identificação não certifica carregamento nem exportação. Preparação genérica ainda carrega pesos completos. |
+| 2 — Contrato de tarefa e qualidade | `ModelTask`, adaptadores HF causal/MLM/classificação, splits distintos, métricas direcionais e pisos absolutos, avaliação de respostas com referências. | Não há benchmark factual amplo nem adaptadores embutidos para todas as modalidades. |
+| 3 — Compressão e execução extensíveis | W8, W4 por blocos, mistura explícita de precisões, paletização, conversão real, teste nativo, fronteira de compromissos e retomada verificada. | Sem AWQ/GPTQ calibrado ou reconstrução quantizada. A ponte genérica é estática; RSS não mede toda a memória unificada. |
+| 4 — Recuperação com menor custo | LoRA com base congelada, fusão por blocos, orçamento dos parâmetros treináveis, máscaras de resposta preservadas no packing/cache/loss e avaliação. Ensaio real SmolLM2 completo. | LoRA não comprime a base sozinho. Não há QLoRA, streaming de pesos, nem prova de melhora factual com este treino curto. |
+| 5 — CLI e validação entre famílias | `inspect`, `compress`, `predict`, `score-answers` e opções de `run`; SmolLM2 causal e BERT MLM executados no M1. Documentação operacional e regressões. | Não foi ensaiado um modelo de bilhões de parâmetros, multimodal completo ou preparação no M5 Pro. |
 
-Primeira matriz de experimentos: Qwen3-1.7B sem alteração estrutural, int8, int4 por blocos e int4 com camadas sensíveis preservadas. Usar uma versão menor pré-treinada, como Qwen3-0.6B após confirmar compatibilidade, como referência de tamanho/qualidade; repetir depois em outra família. Fixar revisões do Hub. Rodar candidatos sequencialmente neste Air; paralelizar modelos pesados competiria pela mesma memória unificada.
+A matriz executada começou por SmolLM2-135M e `google/bert_uncased_L-2_H-128_A-2`, em tarefas distintas. O BERT W8 foi aprovado numericamente; W4 foi recusado por fidelidade e perda; paletização foi válida, mas maior. O BERT de referência e o convertido tiveram acurácia zero nas duas questões de teste: a conclusão é sobre integração e preservação, não competência factual. O Qwen permanece uma família candidata para futuros ensaios, sem ser o eixo arquitetural da ferramenta.
 
 Separar seleção e teste final. Para a primeira exploração, é razoável propor no máximo 5% de aumento de PPL contra a referência equivalente como filtro inicial de quantização. Isso não substitui limites de factualidade, instruções, loops ou recursos. Resultados inconclusivos por amostra pequena devem permanecer inconclusivos. Não comparar PPL entre tokenizers diferentes: nesse caso, usar tarefas comparáveis e, se necessário, medidas normalizadas por texto como complemento.
 
-Na seleção, excluir candidatos que excedem limites duros e destacar os que ninguém supera simultaneamente em qualidade, memória e latência. Não escolher automaticamente o primeiro arquivo que passa nem apenas o menor arquivo. Se só um modelo sem corte cumprir os limites, esse é um resultado legítimo para a receita de compressão de memória, sem declarar poda realizada.
+`compress` exclui candidatos reprovados e calcula uma fronteira usando tamanho, métricas de tarefa, fidelidade, RSS do processo nativo e mediana das chamadas medidas. `--select size|latency|fidelity` escolhe explicitamente o objetivo nessa fronteira; o padrão é tamanho. Um único teste final verifica o selecionado, sem buscar outro candidato usando esse mesmo teste. `run --compression auto` conserva a seleção causal anterior por primeira receita aprovada. Se só um modelo sem corte cumprir os limites, esse é um resultado legítimo de compressão de memória, sem declarar poda realizada.
 
 Medir carregamento frio e quente, especialização, tempo até primeiro token, prefill, tokens/s sustentados, p50/p95 por comprimento e pico de memória. Começar com contextos 512, 2.048 e 4.096 dentro da capacidade do modelo; ampliar somente se couber. Observar pressão de memória, variação de swap e estabilidade térmica em uma sessão prolongada. Não somar RSS e métricas Metal indiscriminadamente em memória unificada nem atribuir swap global inteiramente ao processo.
 

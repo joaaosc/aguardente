@@ -675,11 +675,14 @@ def _options_from(args: argparse.Namespace) -> RunOptions:
         batch_size=args.batch_size,
         calib_dataset=args.calib_dataset,
         calib_file=args.calib_file,
+        assistant_only=args.assistant_only,
         calib_config=args.calib_config, calib_split=args.calib_split,
         text_column=args.text_column, eval_file=args.eval_file, seed=args.seed,
         reconstruct=not args.no_reconstruction, max_ppl_ratio=args.max_ppl_ratio,
         effort=nivel.name,
         no_checkpointing=args.no_checkpointing,
+        recovery=args.recovery, lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha, lora_targets=tuple(args.lora_targets.split(",")) if args.lora_targets else (),
         discard_source_weights=getattr(args, "discard_source_weights", False),
         **valores,
         platform=args.platform,
@@ -912,6 +915,12 @@ def _add_pipeline_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--temperature", type=float, help=PRESET)
     p.add_argument("--grad-accum", type=int, help=PRESET)
     p.add_argument("--no-checkpointing", action="store_true")
+    p.add_argument("--recovery", choices=["full", "lora"], default="full",
+                   help="treina todos os pesos ou adaptadores de baixo posto com base congelada")
+    p.add_argument("--lora-rank", type=int, default=8)
+    p.add_argument("--assistant-only", action="store_true", help="supervisiona somente respostas em JSONL messages; exige prefixos estáveis do chat_template")
+    p.add_argument("--lora-alpha", type=float, default=16.0)
+    p.add_argument("--lora-targets", default="", help="nomes/sufixos de camadas separados por vírgula; padrão: lineares não compartilhadas")
     p.add_argument("--platform", default="macOS",
                    choices=["macOS", "iOS", "watchOS", "visionOS", "tvOS"])
     compression = p.add_mutually_exclusive_group()
@@ -927,7 +936,7 @@ def _add_pipeline_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--skip-recover", action="store_true")
     p.add_argument("--skip-export", action="store_true")
     p.add_argument("--json", action="store_true",
-                   help="emite eventos estruturados em formato NDJSON no stdout para a GUI")
+                   help="emite eventos estruturados em formato NDJSON no stdout")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -937,6 +946,50 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--version", action="version", version=f"aguardente {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
+
+    inspect_cmd = sub.add_parser("inspect", help="identifica tarefa e capacidades sem exigir decoder causal")
+    inspect_cmd.add_argument("model")
+    inspect_cmd.add_argument("--task", default="auto", help="tarefa declarada quando o config é ambíguo")
+    inspect_cmd.add_argument("--target-ram-gib", type=float, default=8)
+    inspect_cmd.add_argument("--target-reserve-gib", type=float, default=4)
+    inspect_cmd.add_argument("--context", type=int, default=2048)
+    inspect_cmd.set_defaults(func=cmd_inspect)
+
+    cp = sub.add_parser("compress", help="compara receitas e valida uma tarefa no Core AI nativo")
+    cp.add_argument("model", help="checkpoint local; qualquer arquitetura pode fornecer --adapter")
+    cp.add_argument("--data", required=True, help="dados de calibração, validação e teste")
+    cp.add_argument("-o", "--out", required=True)
+    cp.add_argument("--task", default="auto", choices=["auto", "causal-lm", "masked-lm", "classification", "custom"])
+    cp.add_argument("--adapter", help="arquivo.py:factory local e confiável que fornece ModelTask")
+    cp.add_argument("--recipes", default="w8,w4-block32,mixed4-8", help="receitas separadas por vírgula")
+    cp.add_argument("--seq-len", type=int, default=64)
+    cp.add_argument("--seed", type=int, default=42)
+    cp.add_argument("--max-relative-rmse", type=float, default=0.05)
+    cp.add_argument("--max-loss-ratio", type=float, default=1.05)
+    cp.add_argument("--max-score-drop", type=float, default=0.02)
+    cp.add_argument("--quality-policy", help="JSON com tolerâncias e pisos absolutos min_scores por tarefa")
+    cp.add_argument("--max-asset-mib", type=float, help="limite do arquivo; não é memória residente")
+    cp.add_argument("--target-ram-gib", type=float, default=8)
+    cp.add_argument("--target-reserve-gib", type=float, default=4)
+    cp.add_argument("--select", choices=["size", "latency", "fidelity"], default="size",
+                    help="objetivo entre candidatos aprovados da fronteira de compromissos")
+    cp.add_argument("--timeout", type=int, default=1800, help="limite de segundos por candidato")
+    from .compress import cmd_compress
+    cp.set_defaults(func=cmd_compress)
+
+    pred = sub.add_parser("predict", help="executa um bundle de tarefa estática no Core AI")
+    pred.add_argument("bundle", help="diretório com model.aimodel e interface.json")
+    pred.add_argument("--inputs", required=True, help="NPZ com tensores já preparados e nomeados")
+    pred.add_argument("-o", "--out", required=True, help="NPZ de saída")
+    from .task_runtime import cmd_predict
+    pred.set_defaults(func=cmd_predict)
+
+    answers = sub.add_parser("score-answers", help="avalia respostas geradas contra referências verificadas")
+    answers.add_argument("data", help="JSONL com answer e expected")
+    answers.add_argument("--min-exact-match", type=float, default=0.8)
+    answers.add_argument("--max-repetition", type=float, default=0.05)
+    from .evaluation import cmd_score_answers
+    answers.set_defaults(func=cmd_score_answers)
 
     ins = sub.add_parser("install", help="instala todas as dependências do pipeline")
     ins.set_defaults(func=cmd_install)
@@ -1004,6 +1057,19 @@ def build_parser() -> argparse.ArgumentParser:
     st.set_defaults(func=cmd_status)
 
     return p
+
+
+def cmd_inspect(args):
+    import json
+    from .capabilities import inspect_model
+    from .target import TargetProfile
+    result = inspect_model(resolve_source(args.model), task=args.task)
+    result["target"] = TargetProfile(args.target_ram_gib, args.target_reserve_gib,
+                                     args.context).to_dict()
+    machine = Machine.detect()
+    result["preparation"] = {"ram_bytes": machine.ram_bytes, "free_disk_bytes": machine.free_disk_bytes}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
 
 
 def _falha(msg: str, hint: str | None = None, *, exc: BaseException | None = None,

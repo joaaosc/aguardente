@@ -2,6 +2,8 @@
 
 Documento de referência para comandos, opções e resolução de problemas.
 
+Os comandos `inspect`, `compress`, `predict` e `score-answers`, o contrato de adaptadores por tarefa e as receitas sem poda estão documentados no [guia de compressão por tarefa](docs/task-compression.md). As seções de `plan`/`run` abaixo descrevem o caminho de poda e recuperação causal.
+
 - [Diagnóstico do ambiente](#diagnóstico-do-ambiente)
 - [Instalação do pipeline](#instalação-do-pipeline)
 - [Execução de teste](#execução-de-teste)
@@ -168,6 +170,7 @@ aguardente run <modelo> -o <diretório> [opções]
 | Dados e reconstrução | `--seed 42` `--eval-file` `--no-reconstruction` |
 | Logits | `--logit-batches 256` `--top-k 128` `--tail-samples 128` |
 | Recuperação | `--epochs 2` `--lr 3e-5` `--alpha 0.9` `--temperature 2.0` `--grad-accum 4` `--max-ppl-ratio 1.2` |
+| Memória e supervisão | `--recovery full\|lora` `--lora-rank 8` `--lora-alpha 16` `--lora-targets q_proj,v_proj` `--assistant-only` |
 | Exportação | `--platform macOS` `--compression auto` ou `--compression-config receita.yaml` `--max-context-length` `--export-dry-run` |
 | Controle | `--device` `--measure` `--skip-recover` `--skip-export` `--skip-checks` `--restart` |
 
@@ -349,6 +352,7 @@ Se o treinamento exceder a capacidade de memória da máquina, considere as segu
 | Opção | Impacto |
 |---|---|
 | `--batch-size 1 --grad-accum 8` | Lote físico menor reduz ativações; acumulação compensa o lote efetivo. Aumentar somente acumulação não reduz memória |
+| `--recovery lora` | Treina adaptadores sobre a base congelada; reduz gradientes e momentos, preservando o custo da base e das ativações |
 | `--seq-len 256` | Reduz o volume de ativações durante o backward pass |
 | `--batch-size 1` | Menor consumo de memória por lote |
 | `--target-params <menor>` | Gera um modelo menor, exigindo menos memória no treino |

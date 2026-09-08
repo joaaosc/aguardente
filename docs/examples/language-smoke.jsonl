@@ -1,0 +1,7 @@
+{"split": "calibration", "text": "The sun provides light and heat to the Earth."}
+{"split": "calibration", "text": "A computer stores information and runs programs."}
+{"split": "calibration", "text": "Water freezes when its temperature becomes low enough."}
+{"split": "validation", "text": "The capital of France is Paris, a city in Europe."}
+{"split": "validation", "text": "Plants use sunlight to help produce their food."}
+{"split": "test", "text": "A library contains books that people can read."}
+{"split": "test", "text": "O Brasil fica na América do Sul e tem muitas cidades."}
