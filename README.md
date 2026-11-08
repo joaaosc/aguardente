@@ -1,3 +1,6 @@
+# **AVISO**
+O projeto não está funcional. Ele foi escrito durante a primeira versão beta do macOS 27 e por decisões da própria Apple, o formato .aimodel não é retrocompatível - em outras palavras, o modelo resultante só pode realizar inferência e a ferramenta ser utilizada na versão original que o aplicativo foi feito compilado, a qual não possui-se mais acesso. Não há interesse no momento em portar a ferramenta para versões release do macOS 27.
+
 <p align="center">
   <img src="docs/media/icon.svg" width="128" alt="aguardente">
 </p>
